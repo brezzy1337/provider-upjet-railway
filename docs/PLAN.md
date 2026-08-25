@@ -33,4 +33,9 @@ Source provider: `terraform-community-providers/terraform-provider-railway`
 5. Then `Service` + `Variable` live; hand-written `examples/` per resource; uptest.
 6. Import support: external names are `IdentifierFromProvider`; upstream import IDs are colon-composites
    (see `config/external_name.go`) and need per-resource `GetIDFn` before `crossplane import`/adopt works.
-7. Volumes / deployments: contribute standalone resources upstream, then regenerate.
+7. **Upstream fix required** — `Read` in every resource errors on not-found instead of
+   `resp.State.RemoveResource(ctx)`; Upjet's observe therefore fails on the very first reconcile
+   (empty id) and after deletion. Patch: `internal/provider/not_found.go` (`isNotFoundError`, matches
+   GraphQL response errors containing "not found") + a check in each `Read`. Applied to `Project`
+   first; extend to all resources, open a PR upstream, and build our image from the fork until merged.
+8. Volumes / deployments: contribute standalone resources upstream, then regenerate.

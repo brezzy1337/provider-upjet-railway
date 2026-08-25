@@ -9,6 +9,28 @@ Kubernetes managed resources you `kubectl apply`.
 
 > **Status:** scaffold. Nothing is generated yet. See `docs/PLAN.md`.
 
+## Authentication
+
+The `ProviderConfig` credentials Secret holds JSON with a single key:
+
+```json
+{ "token": "<Railway workspace or account token>" }
+```
+
+The token **must be a workspace or account token** (Railway → Account Settings →
+Tokens, optionally scoped to one workspace). **Project tokens do not work**: the
+underlying Terraform provider authenticates with `Authorization: Bearer`, which
+Railway only accepts for workspace/account tokens.
+
+## Known upstream issue: not-found handling
+
+`terraform-community-providers/railway` ≤ 0.6.2 returns an error from `Read` when
+a resource no longer exists instead of removing it from state. Crossplane/Upjet
+relies on the removal to detect "does not exist yet" and "deleted", so the
+provider cannot create or finish deleting anything against a stock binary. This
+repo builds the Terraform provider from a patched fork until the fix lands
+upstream (see `docs/PLAN.md`).
+
 ## Developing
 
 This repo ships a devcontainer (Go 1.26, docker-in-docker, kubectl, kind, crossplane CLI, terraform).
