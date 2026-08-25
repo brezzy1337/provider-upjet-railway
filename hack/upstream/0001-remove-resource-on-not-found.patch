@@ -1,21 +1,45 @@
-From 698d75a89fa0da41b169c2fd2cc3fd08df801465 Mon Sep 17 00:00:00 2001
+From a622fb0e17783a5f461c9ea1a2cdb6b91e024542 Mon Sep 17 00:00:00 2001
 From: Devin Phat <devin.phat97@gmail.com>
 Date: Tue, 25 Aug 2026 19:05:24 +0000
-Subject: [PATCH] fix: remove resource from state when Railway reports not
- found
+Subject: [PATCH] fix: remove resources from state when Railway reports them
+ missing
 
 Terraform expects Read to call resp.State.RemoveResource when the remote
-object no longer exists. Returning an error instead breaks refresh after
-out-of-band deletion and tooling built on the provider (Crossplane/Upjet).
-Adds isNotFoundError (GraphQL response errors containing "not found") and
-applies it to railway_project; other resources to follow.
+object no longer exists, so that the next plan recreates it. Every resource
+in this provider returned a diagnostic error instead, which makes a refresh
+fail permanently after an out-of-band deletion and breaks tooling built on
+the provider (e.g. Crossplane/Upjet, whose observe step relies on removal
+to detect both "not created yet" and "deleted").
+
+- add isNotFoundError: true for Railway GraphQL errors whose message
+  contains "not found" (Project/Environment/Service/... not found) and for
+  helpers that wrap the new errNotFound sentinel
+- project, environment, service, variable, variable_collection,
+  shared_variable, custom_domain, service_domain, tcp_proxy: Read removes
+  the resource from state on not found instead of erroring
+- getVariable / getSharedVariable: return errNotFound when the key is
+  missing instead of silently leaving stale state
+- getVariableCollection: errNotFound when none of the variables exist
+- readCustomDomain / findServiceDomain: wrap errNotFound
+- tcp_proxy: remove from state when no proxy matches the stored id
+- unit test for isNotFoundError
 ---
- go.mod                                |  2 +-
- go.sum                                |  7 ++++++
- internal/provider/not_found.go        | 33 +++++++++++++++++++++++++++
- internal/provider/resource_project.go |  5 ++++
- 4 files changed, 46 insertions(+), 1 deletion(-)
+ go.mod                                        |  2 +-
+ go.sum                                        |  7 +++
+ internal/provider/not_found.go                | 43 +++++++++++++++++++
+ internal/provider/not_found_test.go           | 32 ++++++++++++++
+ internal/provider/resource_custom_domain.go   |  7 ++-
+ internal/provider/resource_environment.go     |  5 +++
+ internal/provider/resource_project.go         |  5 +++
+ internal/provider/resource_service.go         |  5 +++
+ internal/provider/resource_service_domain.go  |  7 ++-
+ internal/provider/resource_shared_variable.go | 20 ++++++---
+ internal/provider/resource_tcp_proxy.go       | 13 ++++++
+ internal/provider/resource_variable.go        | 22 +++++++---
+ .../provider/resource_variable_collection.go  |  9 ++++
+ 13 files changed, 161 insertions(+), 16 deletions(-)
  create mode 100644 internal/provider/not_found.go
+ create mode 100644 internal/provider/not_found_test.go
 
 diff --git a/go.mod b/go.mod
 index ce7538a..460f064 100644
@@ -96,10 +120,10 @@ index 0cbec6e..1c5c94b 100644
  github.com/shopspring/decimal v1.3.1/go.mod h1:DKyhrW/HYNuLGql+MJL6WCR6knT2jwCFRcu2hWCYk4o=
 diff --git a/internal/provider/not_found.go b/internal/provider/not_found.go
 new file mode 100644
-index 0000000..21560f0
+index 0000000..c73131f
 --- /dev/null
 +++ b/internal/provider/not_found.go
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,43 @@
 +package provider
 +
 +import (
@@ -109,15 +133,25 @@ index 0000000..21560f0
 +	"github.com/vektah/gqlparser/v2/gqlerror"
 +)
 +
-+// isNotFoundError reports whether err is a Railway GraphQL response error
-+// stating that the requested object does not exist (e.g. "Project not found").
++// errNotFound is wrapped by helpers that look an object up in a list (variables,
++// domains, proxies) when no entry matches.
++var errNotFound = errors.New("not found")
++
++// isNotFoundError reports whether err means the requested object does not
++// exist, either because the Railway GraphQL API said so (e.g. "Project not
++// found") or because a lookup helper wrapped errNotFound.
 +//
-+// Only GraphQL response errors are considered, so internal sentinel errors such
-+// as "deploy is not found" (partial data on an object that does exist) are not
-+// mistaken for a deleted resource. Read implementations use this to remove the
-+// resource from state, which is how Terraform expects out-of-band deletion to
-+// be signalled (and what tooling such as Crossplane/Upjet relies on).
++// Only GraphQL response errors are inspected for the "not found" text, so
++// internal sentinel errors such as "deploy is not found" (partial data on an
++// object that does exist) are not mistaken for a deleted resource.
++//
++// Read implementations use this to remove the resource from state, which is
++// how Terraform expects out-of-band deletion to be signalled so the next plan
++// recreates the resource instead of failing.
 +func isNotFoundError(err error) bool {
++	if errors.Is(err, errNotFound) {
++		return true
++	}
 +	var list gqlerror.List
 +	if errors.As(err, &list) {
 +		for _, e := range list {
@@ -133,6 +167,85 @@ index 0000000..21560f0
 +	}
 +	return false
 +}
+diff --git a/internal/provider/not_found_test.go b/internal/provider/not_found_test.go
+new file mode 100644
+index 0000000..b4b2768
+--- /dev/null
++++ b/internal/provider/not_found_test.go
+@@ -0,0 +1,32 @@
++package provider
++
++import (
++	"errors"
++	"fmt"
++	"testing"
++
++	"github.com/vektah/gqlparser/v2/gqlerror"
++)
++
++func TestIsNotFoundError(t *testing.T) {
++	cases := map[string]struct {
++		err  error
++		want bool
++	}{
++		"nil":                    {err: nil, want: false},
++		"plain error":            {err: errors.New("boom"), want: false},
++		"internal sentinel text": {err: fmt.Errorf("deploy is not found"), want: false},
++		"wrapped errNotFound":    {err: fmt.Errorf("variable %q: %w", "FOO", errNotFound), want: true},
++		"gql list not found":     {err: gqlerror.List{{Message: "Project not found"}}, want: true},
++		"gql list other":         {err: gqlerror.List{{Message: "Not Authorized"}}, want: false},
++		"gql single not found":   {err: &gqlerror.Error{Message: "Service not found"}, want: true},
++		"gql wrapped":            {err: fmt.Errorf("Unable to list custom domains, got error: %w", gqlerror.List{{Message: "Environment not found"}}), want: true},
++	}
++	for name, tc := range cases {
++		t.Run(name, func(t *testing.T) {
++			if got := isNotFoundError(tc.err); got != tc.want {
++				t.Fatalf("isNotFoundError(%v) = %v, want %v", tc.err, got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/internal/provider/resource_custom_domain.go b/internal/provider/resource_custom_domain.go
+index deaf59b..3b9e544 100644
+--- a/internal/provider/resource_custom_domain.go
++++ b/internal/provider/resource_custom_domain.go
+@@ -212,6 +212,11 @@ func (r *CustomDomainResource) Read(ctx context.Context, req resource.ReadReques
+ 	err := readCustomDomain(ctx, *r.client, data.EnvironmentId.ValueString(), data.ServiceId.ValueString(), data.ProjectId.ValueString(), data.Domain.ValueString(), data)
+ 
+ 	if err != nil {
++		if isNotFoundError(err) {
++			resp.State.RemoveResource(ctx)
++			return
++		}
++
+ 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read custom domain, got error: %s", err))
+ 		return
+ 	}
+@@ -334,7 +339,7 @@ func readCustomDomain(ctx context.Context, client graphql.Client, environmentId
+ 	}
+ 
+ 	if domain.Id == "" {
+-		return fmt.Errorf("Unable to find custom domain")
++		return fmt.Errorf("custom domain %q: %w", domainHost, errNotFound)
+ 	}
+ 
+ 	data.Id = types.StringValue(domain.Id)
+diff --git a/internal/provider/resource_environment.go b/internal/provider/resource_environment.go
+index 5ec3154..5a161a7 100644
+--- a/internal/provider/resource_environment.go
++++ b/internal/provider/resource_environment.go
+@@ -137,6 +137,11 @@ func (r *EnvironmentResource) Read(ctx context.Context, req resource.ReadRequest
+ 	response, err := getEnvironment(ctx, *r.client, data.Id.ValueString())
+ 
+ 	if err != nil {
++		if isNotFoundError(err) {
++			resp.State.RemoveResource(ctx)
++			return
++		}
++
+ 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read environment, got error: %s", err))
+ 		return
+ 	}
 diff --git a/internal/provider/resource_project.go b/internal/provider/resource_project.go
 index 8cbe167..3c85e56 100644
 --- a/internal/provider/resource_project.go
@@ -149,6 +262,191 @@ index 8cbe167..3c85e56 100644
  		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read project, got error: %s", err))
  		return
  	}
+diff --git a/internal/provider/resource_service.go b/internal/provider/resource_service.go
+index dba0619..f89f670 100644
+--- a/internal/provider/resource_service.go
++++ b/internal/provider/resource_service.go
+@@ -444,6 +444,11 @@ func (r *ServiceResource) Read(ctx context.Context, req resource.ReadRequest, re
+ 	response, err := getService(ctx, *r.client, data.Id.ValueString())
+ 
+ 	if err != nil {
++		if isNotFoundError(err) {
++			resp.State.RemoveResource(ctx)
++			return
++		}
++
+ 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read service, got error: %s", err))
+ 		return
+ 	}
+diff --git a/internal/provider/resource_service_domain.go b/internal/provider/resource_service_domain.go
+index 3eb64ca..9e9995d 100644
+--- a/internal/provider/resource_service_domain.go
++++ b/internal/provider/resource_service_domain.go
+@@ -189,6 +189,11 @@ func (r *ServiceDomainResource) Read(ctx context.Context, req resource.ReadReque
+ 	err := getAndBuildServiceDomain(ctx, *r.client, data.ProjectId.ValueString(), data.EnvironmentId.ValueString(), data.ServiceId.ValueString(), data.Domain.ValueString(), data)
+ 
+ 	if err != nil {
++		if isNotFoundError(err) {
++			resp.State.RemoveResource(ctx)
++			return
++		}
++
+ 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read service domain, got error: %s", err))
+ 		return
+ 	}
+@@ -310,7 +315,7 @@ func findServiceDomain(ctx context.Context, client graphql.Client, projectId str
+ 		}
+ 	}
+ 
+-	return nil, fmt.Errorf("service domain doesn't exist")
++	return nil, fmt.Errorf("service domain %q: %w", domain, errNotFound)
+ }
+ 
+ func getAndBuildServiceDomain(ctx context.Context, client graphql.Client, projectId string, environmentId string, serviceId string, domain string, data *ServiceDomainResourceModel) error {
+diff --git a/internal/provider/resource_shared_variable.go b/internal/provider/resource_shared_variable.go
+index 2f8104b..200f161 100644
+--- a/internal/provider/resource_shared_variable.go
++++ b/internal/provider/resource_shared_variable.go
+@@ -154,6 +154,11 @@ func (r *SharedVariableResource) Read(ctx context.Context, req resource.ReadRequ
+ 	err := getSharedVariable(ctx, *r.client, data.ProjectId.ValueString(), data.EnvironmentId.ValueString(), data.Name.ValueString(), data)
+ 
+ 	if err != nil {
++		if isNotFoundError(err) {
++			resp.State.RemoveResource(ctx)
++			return
++		}
++
+ 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read shared variable, got error: %s", err))
+ 		return
+ 	}
+@@ -252,13 +257,16 @@ func getSharedVariable(ctx context.Context, client graphql.Client, projectId str
+ 		return err
+ 	}
+ 
+-	if value, ok := response.Variables[name]; ok {
+-		data.Id = types.StringValue(fmt.Sprintf("%s:%s:%s", projectId, environmentId, name))
+-		data.Name = types.StringValue(name)
+-		data.Value = types.StringValue(fmt.Sprintf("%v", value))
+-		data.ProjectId = types.StringValue(projectId)
+-		data.EnvironmentId = types.StringValue(environmentId)
++	value, ok := response.Variables[name]
++	if !ok {
++		return fmt.Errorf("shared variable %q: %w", name, errNotFound)
+ 	}
+ 
++	data.Id = types.StringValue(fmt.Sprintf("%s:%s:%s", projectId, environmentId, name))
++	data.Name = types.StringValue(name)
++	data.Value = types.StringValue(fmt.Sprintf("%v", value))
++	data.ProjectId = types.StringValue(projectId)
++	data.EnvironmentId = types.StringValue(environmentId)
++
+ 	return nil
+ }
+diff --git a/internal/provider/resource_tcp_proxy.go b/internal/provider/resource_tcp_proxy.go
+index c0e0752..a0d35a9 100644
+--- a/internal/provider/resource_tcp_proxy.go
++++ b/internal/provider/resource_tcp_proxy.go
+@@ -169,12 +169,20 @@ func (r *TcpProxyResource) Read(ctx context.Context, req resource.ReadRequest, r
+ 	response, err := getTcpProxy(ctx, *r.client, data.EnvironmentId.ValueString(), data.ServiceId.ValueString())
+ 
+ 	if err != nil {
++		if isNotFoundError(err) {
++			resp.State.RemoveResource(ctx)
++			return
++		}
++
+ 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read tcp proxy, got error: %s", err))
+ 		return
+ 	}
+ 
++	found := false
++
+ 	for _, proxy := range response.TcpProxies {
+ 		if proxy.Id == data.Id.ValueString() {
++			found = true
+ 			data.Id = types.StringValue(proxy.Id)
+ 			data.ApplicationPort = types.Int64Value(int64(proxy.ApplicationPort))
+ 			data.EnvironmentId = types.StringValue(proxy.EnvironmentId)
+@@ -184,6 +192,11 @@ func (r *TcpProxyResource) Read(ctx context.Context, req resource.ReadRequest, r
+ 		}
+ 	}
+ 
++	if !found {
++		resp.State.RemoveResource(ctx)
++		return
++	}
++
+ 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+ }
+ 
+diff --git a/internal/provider/resource_variable.go b/internal/provider/resource_variable.go
+index 91a3876..987b33b 100644
+--- a/internal/provider/resource_variable.go
++++ b/internal/provider/resource_variable.go
+@@ -174,6 +174,11 @@ func (r *VariableResource) Read(ctx context.Context, req resource.ReadRequest, r
+ 	err := getVariable(ctx, *r.client, data.ProjectId.ValueString(), data.EnvironmentId.ValueString(), data.ServiceId.ValueString(), data.Name.ValueString(), data)
+ 
+ 	if err != nil {
++		if isNotFoundError(err) {
++			resp.State.RemoveResource(ctx)
++			return
++		}
++
+ 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read variable, got error: %s", err))
+ 		return
+ 	}
+@@ -304,14 +309,17 @@ func getVariable(ctx context.Context, client graphql.Client, projectId string, e
+ 		return err
+ 	}
+ 
+-	if value, ok := response.Variables[name]; ok {
+-		data.Id = types.StringValue(fmt.Sprintf("%s:%s:%s", serviceId, environmentId, name))
+-		data.Name = types.StringValue(name)
+-		data.Value = types.StringValue(fmt.Sprintf("%v", value))
+-		data.ProjectId = types.StringValue(projectId)
+-		data.EnvironmentId = types.StringValue(environmentId)
+-		data.ServiceId = types.StringValue(serviceId)
++	value, ok := response.Variables[name]
++	if !ok {
++		return fmt.Errorf("variable %q: %w", name, errNotFound)
+ 	}
+ 
++	data.Id = types.StringValue(fmt.Sprintf("%s:%s:%s", serviceId, environmentId, name))
++	data.Name = types.StringValue(name)
++	data.Value = types.StringValue(fmt.Sprintf("%v", value))
++	data.ProjectId = types.StringValue(projectId)
++	data.EnvironmentId = types.StringValue(environmentId)
++	data.ServiceId = types.StringValue(serviceId)
++
+ 	return nil
+ }
+diff --git a/internal/provider/resource_variable_collection.go b/internal/provider/resource_variable_collection.go
+index 64af63c..b73d9d1 100644
+--- a/internal/provider/resource_variable_collection.go
++++ b/internal/provider/resource_variable_collection.go
+@@ -221,6 +221,11 @@ func (r *VariableCollectionResource) Read(ctx context.Context, req resource.Read
+ 	err := getVariableCollection(ctx, *r.client, data.ProjectId.ValueString(), data.EnvironmentId.ValueString(), data.ServiceId.ValueString(), variableNames, data)
+ 
+ 	if err != nil {
++		if isNotFoundError(err) {
++			resp.State.RemoveResource(ctx)
++			return
++		}
++
+ 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read variable collection, got error: %s", err))
+ 		return
+ 	}
+@@ -441,6 +446,10 @@ func getVariableCollection(ctx context.Context, client graphql.Client, projectId
+ 		}
+ 	}
+ 
++	if len(variables) == 0 {
++		return fmt.Errorf("variable collection: none of %d variables exist: %w", len(names), errNotFound)
++	}
++
+ 	data.Id = types.StringValue(getVariableCollectionId(ctx, serviceId, environmentId, names))
+ 	data.ProjectId = types.StringValue(projectId)
+ 	data.EnvironmentId = types.StringValue(environmentId)
 -- 
 2.55.0
 

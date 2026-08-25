@@ -36,6 +36,7 @@ Source provider: `terraform-community-providers/terraform-provider-railway`
 7. **Upstream fix required** — `Read` in every resource errors on not-found instead of
    `resp.State.RemoveResource(ctx)`; Upjet's observe therefore fails on the very first reconcile
    (empty id) and after deletion. Patch: `internal/provider/not_found.go` (`isNotFoundError`, matches
-   GraphQL response errors containing "not found") + a check in each `Read`. Applied to `Project`
-   first; extend to all resources, open a PR upstream, and build our image from the fork until merged.
+   GraphQL response errors containing "not found") + a check in each `Read`. Applied to all nine
+   resources; upstream PR: https://github.com/terraform-community-providers/terraform-provider-railway/pull/93.
+   Build our image from the patched fork (`hack/upstream/`) until it is released.
 8. Volumes / deployments: contribute standalone resources upstream, then regenerate.

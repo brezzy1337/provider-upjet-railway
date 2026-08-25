@@ -29,7 +29,8 @@ a resource no longer exists instead of removing it from state. Crossplane/Upjet
 relies on the removal to detect "does not exist yet" and "deleted", so the
 provider cannot create or finish deleting anything against a stock binary. This
 repo builds the Terraform provider from a patched fork until the fix lands
-upstream (see `docs/PLAN.md`).
+upstream — PR: https://github.com/terraform-community-providers/terraform-provider-railway/pull/93
+(patch in `hack/upstream/`).
 
 ## Developing
 
