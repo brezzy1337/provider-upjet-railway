@@ -22,6 +22,10 @@ const (
 	errTrackUsage           = "cannot track ProviderConfig usage"
 	errExtractCredentials   = "cannot extract credentials"
 	errUnmarshalCredentials = "cannot unmarshal railway credentials as JSON"
+	errMissingToken         = "railway credentials JSON must contain a non-empty \"token\" key"
+
+	// keyToken is the credentials JSON key and the Terraform provider attribute.
+	keyToken = "token"
 )
 
 // TerraformSetupBuilder builds Terraform a terraform.SetupFn function which
@@ -51,10 +55,15 @@ func TerraformSetupBuilder(version, providerSource, providerVersion string) terr
 		}
 
 		// Set credentials in Terraform provider configuration.
-		/*ps.Configuration = map[string]any{
-			"username": creds["username"],
-			"password": creds["password"],
-		}*/
+		// The Railway provider takes a single `token` attribute (the same value
+		// as its RAILWAY_TOKEN env var). Deploy-affecting resources need a
+		// workspace/account token rather than a project token.
+		if creds[keyToken] == "" {
+			return ps, errors.New(errMissingToken)
+		}
+		ps.Configuration = map[string]any{
+			keyToken: creds[keyToken],
+		}
 		return ps, nil
 	}
 }

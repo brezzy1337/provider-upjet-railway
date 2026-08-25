@@ -10,7 +10,7 @@ package namespaced
 import (
 	"k8s.io/apimachinery/pkg/runtime"
 
-	v1alpha1 "github.com/brezzy1337/provider-upjet-railway/apis/namespaced/null/v1alpha1"
+	v1alpha1 "github.com/brezzy1337/provider-upjet-railway/apis/namespaced/railway/v1alpha1"
 	v1alpha1namespaced "github.com/brezzy1337/provider-upjet-railway/apis/namespaced/v1alpha1"
 	v1beta1 "github.com/brezzy1337/provider-upjet-railway/apis/namespaced/v1beta1"
 )

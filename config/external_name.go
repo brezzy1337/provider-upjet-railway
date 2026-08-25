@@ -6,18 +6,31 @@ import (
 
 // ExternalNameConfigs contains all external name configurations for this
 // provider.
+//
+// Every Railway resource gets a server-generated identifier, so the external
+// name is taken from the provider (`IdentifierFromProvider`). The upstream
+// Terraform provider's `terraform import` IDs are noted per resource because
+// several are colon-joined composites rather than the bare `id`; importing
+// pre-existing resources will need per-resource GetIDFn handling later.
 var ExternalNameConfigs = map[string]config.ExternalName{
-	// Import requires using a randomly generated ID from provider: nl-2e21sda
-	"null_resource": idWithStub(),
-}
-
-func idWithStub() config.ExternalName {
-	e := config.IdentifierFromProvider
-	e.GetExternalNameFn = func(tfstate map[string]any) (string, error) {
-		en, _ := config.IDAsExternalName(tfstate)
-		return en, nil
-	}
-	return e
+	// import: <project_id>
+	"railway_project": config.IdentifierFromProvider,
+	// import: <project_id>:<name>
+	"railway_environment": config.IdentifierFromProvider,
+	// import: <service_id>
+	"railway_service": config.IdentifierFromProvider,
+	// import: <service_id>:<environment_name>:<name>
+	"railway_variable": config.IdentifierFromProvider,
+	// import: <service_id>:<environment_name>:<name1>:<name2>:...
+	"railway_variable_collection": config.IdentifierFromProvider,
+	// import: <project_id>:<environment_name>:<name>
+	"railway_shared_variable": config.IdentifierFromProvider,
+	// import: <service_id>:<environment_name>:<domain>
+	"railway_custom_domain": config.IdentifierFromProvider,
+	// import: <service_id>:<environment_name>:<domain>
+	"railway_service_domain": config.IdentifierFromProvider,
+	// import: <service_id>:<environment_id>:<tcp_proxy_id>
+	"railway_tcp_proxy": config.IdentifierFromProvider,
 }
 
 // ExternalNameConfigurations applies all external name configs listed in the

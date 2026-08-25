@@ -1,0 +1,17 @@
+apiVersion: railway.crossplane.io/v1alpha1
+kind: TCPProxy
+metadata:
+  annotations:
+    meta.upbound.io/example-id: railway/v1alpha1/tcpproxy
+  labels:
+    testing.upbound.io/example-name: redis
+  name: redis
+spec:
+  forProvider:
+    applicationPort: 6379
+    environmentIdSelector:
+      matchLabels:
+        testing.upbound.io/example-name: example
+    serviceIdSelector:
+      matchLabels:
+        testing.upbound.io/example-name: example

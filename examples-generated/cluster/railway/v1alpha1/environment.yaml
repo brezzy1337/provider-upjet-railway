@@ -1,0 +1,14 @@
+apiVersion: railway.crossplane.io/v1alpha1
+kind: Environment
+metadata:
+  annotations:
+    meta.upbound.io/example-id: railway/v1alpha1/environment
+  labels:
+    testing.upbound.io/example-name: example
+  name: example
+spec:
+  forProvider:
+    name: staging
+    projectIdSelector:
+      matchLabels:
+        testing.upbound.io/example-name: example

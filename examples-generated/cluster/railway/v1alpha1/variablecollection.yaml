@@ -1,0 +1,27 @@
+apiVersion: railway.crossplane.io/v1alpha1
+kind: VariableCollection
+metadata:
+  annotations:
+    meta.upbound.io/example-id: railway/v1alpha1/variablecollection
+  labels:
+    testing.upbound.io/example-name: example
+  name: example
+spec:
+  forProvider:
+    environmentIdSelector:
+      matchLabels:
+        testing.upbound.io/example-name: example
+    serviceIdSelector:
+      matchLabels:
+        testing.upbound.io/example-name: example
+    variables:
+    - name: SENTRY_KEY
+      valueSecretRef:
+        key: example-key
+        name: example-secret
+        namespace: upbound-system
+    - name: SENTRY_SECRET
+      valueSecretRef:
+        key: example-key
+        name: example-secret
+        namespace: upbound-system
