@@ -1,42 +1,27 @@
-# Provider Template
+# provider-upjet-railway
 
-`upjet-provider-template` is a [Crossplane](https://crossplane.io/) provider
-template that is built using [Upjet](https://github.com/crossplane/upjet) code
-generation tools and exposes XRM-conformant managed resources for the Template
-API.
+A [Crossplane](https://crossplane.io/) provider for [Railway](https://railway.com), generated with
+[Upjet](https://github.com/crossplane/upjet) from the community Terraform provider
+[`terraform-community-providers/railway`](https://registry.terraform.io/providers/terraform-community-providers/railway).
 
-## Getting Started
+It exposes Railway projects, environments, services, variables, domains and TCP proxies as
+Kubernetes managed resources you `kubectl apply`.
 
-This template serves as a starting point for generating a new [Crossplane Provider](https://docs.crossplane.io/latest/packages/providers/) using the [`upjet`](https://github.com/crossplane/upjet) tooling. Please follow the guide linked below to generate a new Provider:
-
-https://github.com/crossplane/upjet/blob/main/docs/generating-a-provider.md
+> **Status:** scaffold. Nothing is generated yet. See `docs/PLAN.md`.
 
 ## Developing
 
-Run code-generation pipeline:
-```console
-go run cmd/generator/main.go "$PWD"
-```
-
-Run against a Kubernetes cluster:
+This repo ships a devcontainer (Go 1.26, docker-in-docker, kubectl, kind, crossplane CLI, terraform).
 
 ```console
-make run
+go run cmd/generator/main.go "$PWD"   # run the Upjet code-generation pipeline
+make run                              # run the provider against the current kube context
+make build                            # build the provider binary
+make all                              # build, push and install the package
 ```
 
-Build, push, and install:
+Upjet guide: https://github.com/crossplane/upjet/blob/main/docs/generating-a-provider.md
 
-```console
-make all
-```
+## License
 
-Build binary:
-
-```console
-make build
-```
-
-## Report a Bug
-
-For filing bugs, suggesting improvements, or requesting new features, please
-open an [issue](https://github.com/crossplane/upjet-provider-template/issues).
+Apache-2.0 — see [LICENSE](LICENSE).

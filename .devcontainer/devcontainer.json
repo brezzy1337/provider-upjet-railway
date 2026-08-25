@@ -1,0 +1,16 @@
+{
+  "name": "provider-upjet-railway",
+  "image": "mcr.microsoft.com/devcontainers/go:1.26",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": { "minikube": "none" }
+  },
+  "hostRequirements": { "cpus": 2, "memory": "8gb", "storage": "32gb" },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.go", "ms-kubernetes-tools.vscode-kubernetes-tools", "hashicorp.terraform"]
+    }
+  },
+  "remoteEnv": { "GOFLAGS": "-buildvcs=false" }
+}
