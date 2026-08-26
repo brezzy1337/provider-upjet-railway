@@ -1,0 +1,13 @@
+# Keep the build context to the git tree. .work in particular holds native-cluster
+# binaries and etcd data (hundreds of MB) that would otherwise be shipped to the
+# builder on every local `docker build`.
+.work/
+_output/
+.cache/
+.git/
+vendor/
+.vendor-new/
+cover.out
+.vscode/
+.idea/
+.DS_Store
