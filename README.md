@@ -1,15 +1,32 @@
 # provider-upjet-railway
 
 A [Crossplane](https://crossplane.io/) provider for [Railway](https://railway.com), generated with
-[Upjet](https://github.com/crossplane/upjet) from the community Terraform provider
-[`terraform-community-providers/railway`](https://registry.terraform.io/providers/terraform-community-providers/railway).
+[Upjet v2](https://github.com/crossplane/upjet) from the community Terraform provider
+[`terraform-community-providers/railway`](https://registry.terraform.io/providers/terraform-community-providers/railway)
+(pinned to 0.6.2).
 
 It exposes Railway projects, environments, services, variables, domains and TCP proxies as
-Kubernetes managed resources you `kubectl apply`.
+Kubernetes managed resources you `kubectl apply`. Nine kinds live in the API group
+`railway.crossplane.io` (cluster-scoped) with namespaced twins in `railway.m.crossplane.io`.
 
-> **Status:** scaffold. Nothing is generated yet. See `docs/PLAN.md`.
+> **Status (2026-11):** generated, builds, and live-verified for `Project` create/delete against a
+> real Railway workspace through Crossplane 2.2.1. The other kinds are generated and wired but not
+> yet exercised live. The provider is one component of a larger
+> [Railway-hosted Crossplane control plane](docs/architecture/control-plane.md), which lives in its
+> own repository. See [`docs/`](docs/README.md) for the full documentation and
+> [`docs/roadmap.md`](docs/roadmap.md) for what is next.
 
-## Authentication
+## Quick start
+
+```yaml
+apiVersion: railway.crossplane.io/v1alpha1
+kind: Project
+metadata:
+  name: example
+spec:
+  forProvider:
+    name: my-project
+```
 
 The `ProviderConfig` credentials Secret holds JSON with a single key:
 
@@ -17,34 +34,35 @@ The `ProviderConfig` credentials Secret holds JSON with a single key:
 { "token": "<Railway workspace or account token>" }
 ```
 
-The token **must be a workspace or account token** (Railway → Account Settings →
-Tokens, optionally scoped to one workspace). **Project tokens do not work**: the
-underlying Terraform provider authenticates with `Authorization: Bearer`, which
-Railway only accepts for workspace/account tokens.
+The token **must be a workspace or account token**. Project tokens fail with "Not Authorized"
+because the Terraform provider only sends `Authorization: Bearer`. Details in
+[docs/getting-started/authentication.md](docs/getting-started/authentication.md).
 
 ## Known upstream issue: not-found handling
 
-`terraform-community-providers/railway` ≤ 0.6.2 returns an error from `Read` when
-a resource no longer exists instead of removing it from state. Crossplane/Upjet
-relies on the removal to detect "does not exist yet" and "deleted", so the
-provider cannot create or finish deleting anything against a stock binary. This
-repo builds the Terraform provider from a patched fork until the fix lands
-upstream — PR: https://github.com/terraform-community-providers/terraform-provider-railway/pull/93
-(patch in `hack/upstream/`).
+`terraform-community-providers/railway` (including the latest 0.6.3) returns an error from `Read`
+when a resource no longer exists instead of removing it from state. Upjet relies on that removal to
+detect "does not exist yet" and "deleted", so a stock binary can neither create nor finish deleting
+anything. This repo builds the Terraform provider from a patch in `hack/upstream/` until
+[upstream PR #93](https://github.com/terraform-community-providers/terraform-provider-railway/pull/93)
+lands. See [docs/upstream/not-found-patch.md](docs/upstream/not-found-patch.md).
 
 ## Developing
 
-This repo ships a devcontainer (Go 1.26, docker-in-docker, kubectl, kind, crossplane CLI, terraform).
+The devcontainer provides Go 1.26, docker-in-docker, kubectl, kind, the crossplane CLI and terraform.
 
 ```console
-go run cmd/generator/main.go "$PWD"   # run the Upjet code-generation pipeline
-make run                              # run the provider against the current kube context
-make build                            # build the provider binary
-make all                              # build, push and install the package
+make generate            # regenerate apis/, controllers, CRDs and examples after editing config/
+go build ./... && go test ./...
+hack/dev-cluster.sh      # kind + Crossplane + our CRDs + ProviderConfig from $RAILWAY_TOKEN
+hack/run-provider.sh     # run the provider out-of-cluster with the patched Terraform mirror
+make build               # build the provider binary and xpkg
 ```
 
-Upjet guide: https://github.com/crossplane/upjet/blob/main/docs/generating-a-provider.md
+Hand-written code is `config/`, `internal/clients/`, `hack/` and `cluster/`. Everything named
+`zz_*.go`, `package/crds/*.yaml` and `examples-generated/` is generated and never edited by hand.
+More in [docs/getting-started/development.md](docs/getting-started/development.md).
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE).
+Apache-2.0, see [LICENSE](LICENSE).

@@ -1,0 +1,92 @@
+# Development
+
+## Toolchain
+
+The repository ships a devcontainer (`.devcontainer/`) based on the Go 1.26 image with
+docker-in-docker and kubectl. Its post-create script installs kind, the crossplane CLI and terraform at
+the versions pinned in the `Makefile`, initialises the `build` submodule (Crossplane's shared make
+library) and downloads Go modules.
+
+If a shell has no `go`, `kubectl` or `kind`, the devcontainer was not built from that definition.
+Rebuild the container, or install Go 1.26 by hand and run `bash .devcontainer/post-create.sh`. A
+shallow clone with an empty `build/` directory needs `git submodule update --init --recursive` before
+any `make` target works.
+
+Pinned versions, all read from the `Makefile`:
+
+| Component                  | Version              |
+|----------------------------|----------------------|
+| Go                         | 1.26                 |
+| Upjet                      | v2.4.1 (pre-release, `go.mod`) |
+| Crossplane / crossplane CLI | 2.2.1               |
+| Terraform CLI              | 1.5.7 (last MPL-licensed release) |
+| Terraform provider         | `terraform-community-providers/railway` 0.6.2 |
+
+## Layout
+
+| Path                              | Hand-written? | Contents                                           |
+|-----------------------------------|:-------------:|----------------------------------------------------|
+| `config/`                         | yes           | Upjet configuration: root group, kind overrides, references, external names, embedded schema and docs |
+| `internal/clients/railway.go`     | yes           | Turns the `ProviderConfig` Secret into Terraform provider configuration |
+| `cmd/provider`, `cmd/generator`   | mostly generated | Provider entrypoint; the generator main        |
+| `apis/{cluster,namespaced}/`      | generated     | Go types per kind (`zz_*_types.go`), scheme registration |
+| `internal/controller/`            | generated     | One controller package per kind                    |
+| `package/crds/`                   | generated     | CRD YAML, also what `hack/dev-cluster.sh` applies  |
+| `examples-generated/`             | generated     | One example manifest per kind                      |
+| `hack/`                           | yes           | Dev scripts and the upstream patch                 |
+| `cluster/images/`                 | yes           | Dockerfile for the provider image                  |
+| `docs/`                           | yes           | This documentation (GitBook-synced)                |
+
+Never edit generated files. Change `config/` and regenerate.
+
+## The generate loop
+
+```console
+make generate
+```
+
+runs the Upjet pipeline (`cmd/generator`): it downloads the Terraform provider schema for the pinned
+version, pulls the registry docs, and regenerates `apis/`, `internal/controller/`, `package/crds/` and
+`examples-generated/` for both the cluster and namespaced API surfaces. Commit the result together
+with the `config/` change that caused it. CI's `check-diff` job fails if the generated tree is stale.
+
+Then:
+
+```console
+go build ./...
+go test ./...
+```
+
+## Running against a real Railway workspace
+
+Two scripts cover the local loop. Both need `RAILWAY_TOKEN` set to a workspace or account token.
+
+```console
+hack/dev-cluster.sh    # kind cluster "railway-dev" + Crossplane 2.2.1 + our CRDs + ProviderConfig/default
+hack/run-provider.sh   # builds cmd/provider and runs it out-of-cluster with --debug
+```
+
+`run-provider.sh` refuses to start unless the **patched** Terraform provider binary exists at
+`.work/provider-mirror/...`. Build it once following `hack/upstream/README.md`; the script writes a
+`terraformrc.hcl` that routes Terraform's provider installation to that filesystem mirror. Without the
+patch, nothing can be created or deleted. See [The not-found patch](../upstream/not-found-patch.md).
+
+Smoke test:
+
+```console
+kubectl apply -f examples-generated/cluster/railway/v1alpha1/project.yaml
+kubectl get project example -w        # wait for SYNCED=True READY=True
+kubectl delete project example        # confirm it disappears from the Railway dashboard
+```
+
+## Building the package
+
+```console
+make build        # provider binary + xpkg under _output/
+make local-deploy # kind + Crossplane + install the local xpkg as a Provider package
+make e2e          # local-deploy + uptest
+```
+
+Note that `cluster/images/provider-upjet-railway/Dockerfile` downloads the **stock** Terraform
+provider release asset. Until the upstream fix lands, an image built from it will carry the not-found
+bug; the control-plane repository builds the patched binary itself instead.
