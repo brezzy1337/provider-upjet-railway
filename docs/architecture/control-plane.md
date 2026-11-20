@@ -5,11 +5,13 @@ Railway** and provisions Kubernetes clusters on DigitalOcean, AWS and GCP. A use
 cloud-agnostic `KubernetesCluster` claim; a Composition picks the DOKS, EKS or GKE implementation; the
 new cluster's kubeconfig comes back as a Crossplane connection secret.
 
-The control plane lives in its own repository,
-`brezzy1337/DigitalOcean-K8-Crossplane-Control-Plane`, because a Railway template is derived from a
-GitHub repository and the control plane is a separate product that merely *runs* providers. Its
-Dockerfile clones this repository at a pinned ref to obtain the provider binary, the CRDs, the
-upstream patch and the Terraform CLI configuration, so the two move independently.
+The plan is for the control plane to live in its own repository, because a Railway template is
+derived from a GitHub repository and the control plane is a separate product that merely *runs*
+providers; its Dockerfile would clone this repository at a pinned ref for the provider binary, CRDs,
+upstream patch and Terraform CLI configuration. **As of 2026-11-20 that split has not happened**:
+the code is on branch `phase-1/control-plane-image` of this repository, under
+`cluster/images/control-plane/` (Dockerfile, Makefile, the `control-plane.sh` supervisor) and
+`hack/native-cluster.sh`. See the [roadmap](../roadmap.md) for the pending decision.
 
 ## Design
 

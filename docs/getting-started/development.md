@@ -8,9 +8,27 @@ the versions pinned in the `Makefile`, initialises the `build` submodule (Crossp
 library) and downloads Go modules.
 
 If a shell has no `go`, `kubectl` or `kind`, the devcontainer was not built from that definition.
-Rebuild the container, or install Go 1.26 by hand and run `bash .devcontainer/post-create.sh`. A
-shallow clone with an empty `build/` directory needs `git submodule update --init --recursive` before
-any `make` target works.
+Rebuild the container, or install by hand. The following worked on an Alpine-based codespace on
+2026-11-20 and gives everything except a container runtime:
+
+```console
+sudo apk add github-cli bash curl unzip make gcc musl-dev git
+curl -sSLo /tmp/go.tgz https://go.dev/dl/go1.26.11.linux-amd64.tar.gz && sudo tar -C /usr/local -xzf /tmp/go.tgz
+echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> ~/.profile
+curl -sSLo /tmp/tf.zip https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip && sudo unzip -oq /tmp/tf.zip -d /usr/local/bin
+curl -sSL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sudo sh -s -- -b /usr/local/bin v2.13.0
+curl -sSL https://raw.githubusercontent.com/crossplane/crossplane/master/install.sh | XP_VERSION=v2.2.1 sh && sudo mv crossplane /usr/local/bin/
+git submodule update --init --recursive
+go install golang.org/x/tools/cmd/goimports   # make generate shells out to it and fails mid-run without it
+```
+
+A shallow clone with an empty `build/` directory needs that last line before any `make` target
+works, and `git fetch --unshallow` before `/ship` can compare branches.
+
+**Without Docker** (no `/var/run/docker.sock`, as in a codespace built from a plain image), kind
+and `hack/dev-cluster.sh` cannot run. Use `hack/native-cluster.sh` from the
+`phase-1/control-plane-image` branch instead: it runs etcd, kube-apiserver, Crossplane core and
+this provider as unprivileged bare processes and needs only Go and curl.
 
 Pinned versions, all read from the `Makefile`:
 

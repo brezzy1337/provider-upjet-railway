@@ -23,4 +23,7 @@ sudo unzip -oq /tmp/tf.zip -d /usr/local/bin
 git submodule update --init --recursive
 go mod download
 
+# goimports: the Upjet generator shells out to it (CI installs it the same way)
+go install golang.org/x/tools/cmd/goimports
+
 echo "---"; go version; kind version; crossplane version --client 2>/dev/null || crossplane --version; terraform version | head -1
