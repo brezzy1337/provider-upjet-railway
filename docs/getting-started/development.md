@@ -90,3 +90,14 @@ make e2e          # local-deploy + uptest
 Note that `cluster/images/provider-upjet-railway/Dockerfile` downloads the **stock** Terraform
 provider release asset. Until the upstream fix lands, an image built from it will carry the not-found
 bug; the control-plane repository builds the patched binary itself instead.
+
+## Shipping a change
+
+Work on a feature branch and run `/ship` in Claude Code. The pipeline builds, tests and lints, checks
+that the generated tree is current, drafts a pull request against `main` for your approval, fans out
+a five-lens read-only review panel, posts one consolidated review, waits for your approval to merge,
+and reports each step to Slack. Opening and merging always prompt; the gates are enforced through
+tool permissions in `.claude/settings.json`, not just prose. The pipeline and its agents live in
+`.claude/commands/ship.md` and `.claude/agents/`; the `Ship workflow` section of `CLAUDE.md` is the
+source of truth for the stages and the Slack channel. The `gh` CLI must be installed and
+authenticated (`gh auth login`); the devcontainer includes it.
