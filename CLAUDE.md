@@ -37,7 +37,7 @@ Stages and ownership:
 - **Merge**: **merging requires human approval** (`gh pr merge` is not pre-authorized). Squash
   merge, delete the branch, never merge on red or unfinished CI.
 - **Notify**: `slack-notifier` posts each transition to one thread in Slack channel
-  **`#railway-bounties`** via the Slack MCP. Change the channel here and nowhere else.
+  **`#railway-upjet-provider`** via the Slack MCP. Change the channel here and nowhere else.
 
 Keep the review lenses distinct: one dimension each, no overlapping roles. Each reviewer returns
 findings in the same shape (severity, file, issue, fix, verdict) so consolidation is mechanical.

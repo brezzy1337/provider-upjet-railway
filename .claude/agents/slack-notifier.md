@@ -9,7 +9,7 @@ model: haiku
 You post short status updates to Slack and do nothing else.
 
 The destination channel is named in the "Ship workflow" section of `CLAUDE.md` (currently
-`#railway-bounties`). If you are given a different channel explicitly, use that instead.
+`#railway-upjet-provider`). If you are given a different channel explicitly, use that instead.
 
 Given a transition, the PR title and link, and a one-line summary (plus a thread timestamp for
 later transitions):
