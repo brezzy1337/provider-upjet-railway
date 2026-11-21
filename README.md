@@ -12,8 +12,8 @@ Kubernetes managed resources you `kubectl apply`. Nine kinds live in the API gro
 > **Status (2026-11):** generated, builds, and live-verified for `Project` create/delete against a
 > real Railway workspace through Crossplane 2.2.1. The other kinds are generated and wired but not
 > yet exercised live. The provider is one component of a larger
-> [Railway-hosted Crossplane control plane](docs/architecture/control-plane.md), which lives in its
-> own repository. See [`docs/`](docs/README.md) for the full documentation and
+> [Railway-hosted Crossplane control plane](docs/architecture/control-plane.md), whose image lives
+> in this repository under `cluster/images/control-plane/`. See [`docs/`](docs/README.md) for the full documentation and
 > [`docs/roadmap.md`](docs/roadmap.md) for what is next.
 
 ## Quick start

@@ -49,6 +49,19 @@ PLUGIN_DIR="${MIRROR}/registry.terraform.io/terraform-community-providers/railwa
 
 say() { printf '\n=== %s\n' "$*" >&2; }
 
+# The supervisor shells out to these at boot; fail early instead of dying
+# mid-PKI with a bare "shutting down".
+need_tools() {
+  local missing=() t
+  for t in openssl curl ip hostname base64; do
+    command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+  done
+  [ ${#missing[@]} -eq 0 ] || {
+    echo "missing on PATH: ${missing[*]} (alpine: apk add openssl curl iproute2 coreutils)" >&2
+    exit 1
+  }
+}
+
 need_go() {
   command -v go >/dev/null 2>&1 || {
     echo "go is not on PATH (need $(awk -F'?= ' '/^GO_REQUIRED_VERSION/{print $2}' Makefile) or newer)" >&2
@@ -101,12 +114,6 @@ build() {
       --branch "v${CROSSPLANE_VERSION}" https://github.com/crossplane/crossplane.git "$SRC/crossplane"
     ( cd "$SRC/crossplane" && CGO_ENABLED=0 go build -o "$BIN/crossplane" ./cmd/crossplane )
   fi
-  # Crossplane's own CRDs live in its source tree, not in a release artifact.
-  mkdir -p "${HOME_DIR}/crds"
-  cp -r "$SRC/crossplane/cluster/crds" "${HOME_DIR}/crds/crossplane.new"
-  rm -rf "${HOME_DIR}/crds/crossplane"; mv "${HOME_DIR}/crds/crossplane.new" "${HOME_DIR}/crds/crossplane"
-  rm -rf "${HOME_DIR}/crds/webhookconfigurations"
-  cp -r "$SRC/crossplane/cluster/webhookconfigurations" "${HOME_DIR}/crds/webhookconfigurations"
 
   if [ ! -x "${PLUGIN_DIR}/terraform-provider-railway_v${TERRAFORM_PROVIDER_VERSION}" ]; then
     say "building patched terraform-provider-railway v${TERRAFORM_PROVIDER_VERSION}"
@@ -136,10 +143,7 @@ provider_installation {
 }
 EOF
 
-  # This provider's CRDs, straight from the repo.
-  rm -rf "${HOME_DIR}/crds/railway"
-  mkdir -p "${HOME_DIR}/crds/railway"
-  cp package/crds/*.yaml "${HOME_DIR}/crds/railway/"
+  stage_crds
 
   say "binaries ready in ${BIN}"
   "$BIN/etcd" --version | head -1
@@ -147,6 +151,25 @@ EOF
   "$BIN/kubectl" version --client 2>/dev/null | head -1
   "$BIN/terraform" version | head -1
   ls -l "${PLUGIN_DIR}"
+}
+
+# Copy the CRDs the supervisor applies at boot into $HOME_DIR. Separate from
+# build() because `clean` removes $HOME_DIR while keeping the binaries, so `up`
+# must be able to restage without a rebuild.
+stage_crds() {
+  [ -d "$SRC/crossplane/cluster/crds" ] || {
+    echo "crossplane source missing at $SRC/crossplane; run: $0 build" >&2; exit 1; }
+  mkdir -p "${HOME_DIR}/crds"
+  # Crossplane's own CRDs live in its source tree, not in a release artifact.
+  rm -rf "${HOME_DIR}/crds/crossplane.new"
+  cp -r "$SRC/crossplane/cluster/crds" "${HOME_DIR}/crds/crossplane.new"
+  rm -rf "${HOME_DIR}/crds/crossplane"; mv "${HOME_DIR}/crds/crossplane.new" "${HOME_DIR}/crds/crossplane"
+  rm -rf "${HOME_DIR}/crds/webhookconfigurations"
+  cp -r "$SRC/crossplane/cluster/webhookconfigurations" "${HOME_DIR}/crds/webhookconfigurations"
+  # This provider's CRDs, straight from the repo.
+  rm -rf "${HOME_DIR}/crds/railway"
+  mkdir -p "${HOME_DIR}/crds/railway"
+  cp package/crds/*.yaml "${HOME_DIR}/crds/railway/"
 }
 
 export_env() {
@@ -163,7 +186,9 @@ export_env() {
 }
 
 up() {
+  need_tools
   [ -x "$BIN/provider" ] || build
+  stage_crds
   export_env
   say "booting control plane (Ctrl-C to stop)"
   exec cluster/images/control-plane/control-plane.sh
@@ -175,11 +200,15 @@ gc_probe() {
   local k=("$KUBECTL" --kubeconfig "$KC")
   "${k[@]}" create ns gc-probe --dry-run=client -o yaml | "${k[@]}" apply -f - >/dev/null
   "${k[@]}" -n gc-probe delete configmap gc-owner gc-owned --ignore-not-found >/dev/null 2>&1
-  "${k[@]}" -n gc-probe create configmap gc-owner --from-literal=a=b >/dev/null
+  # Setup failures must be failures: without these guards a dead API server
+  # made this probe PASS, because "gc-owned not found" was taken as collected.
+  "${k[@]}" -n gc-probe create configmap gc-owner --from-literal=a=b >/dev/null || return 1
   local uid; uid="$("${k[@]}" -n gc-probe get configmap gc-owner -o jsonpath='{.metadata.uid}')"
+  [ -n "$uid" ] || return 1
   printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: gc-owned\n  namespace: gc-probe\n  ownerReferences:\n  - apiVersion: v1\n    kind: ConfigMap\n    name: gc-owner\n    uid: %s\ndata:\n  a: b\n' "$uid" \
-    | "${k[@]}" apply -f - >/dev/null
-  "${k[@]}" -n gc-probe delete configmap gc-owner >/dev/null
+    | "${k[@]}" apply -f - >/dev/null || return 1
+  "${k[@]}" -n gc-probe get configmap gc-owned >/dev/null 2>&1 || return 1
+  "${k[@]}" -n gc-probe delete configmap gc-owner >/dev/null || return 1
   local i
   for i in $(seq 1 30); do
     "${k[@]}" -n gc-probe get configmap gc-owned >/dev/null 2>&1 || {
@@ -237,8 +266,10 @@ verify() {
   if command -v go >/dev/null 2>&1; then
     check "terraform mirror is the PATCHED build (gqlparser dep)" bash -c \
       "go version -m '$tfp' | grep -q 'dep.*github.com/vektah/gqlparser'"
-    check "terraform mirror is built past the v${TERRAFORM_PROVIDER_VERSION} tag" bash -c \
-      "go version -m '$tfp' | grep -qE 'mod\\s+github.com/terraform-community-providers/terraform-provider-railway\\s+v0\\.6\\.[3-9]'"
+    # A tree with the patch committed on top of the tag reports either a
+    # pseudo-version or "(devel)", never the bare release version.
+    check "terraform mirror is not the bare v${TERRAFORM_PROVIDER_VERSION} release build" bash -c \
+      "! go version -m '$tfp' | grep -qE 'mod\\s+github.com/terraform-community-providers/terraform-provider-railway\\s+v${TERRAFORM_PROVIDER_VERSION}\\s*$'"
   fi
   check "terraform resolves the mirror (offline install)" bash -c \
     "d=\$(mktemp -d); printf 'terraform {\n required_providers {\n railway = {\n source = \"terraform-community-providers/railway\"\n version = \"${TERRAFORM_PROVIDER_VERSION}\"\n }\n }\n}\n' > \$d/main.tf; \

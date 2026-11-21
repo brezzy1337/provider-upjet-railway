@@ -5,13 +5,16 @@ Railway** and provisions Kubernetes clusters on DigitalOcean, AWS and GCP. A use
 cloud-agnostic `KubernetesCluster` claim; a Composition picks the DOKS, EKS or GKE implementation; the
 new cluster's kubeconfig comes back as a Crossplane connection secret.
 
-The plan is for the control plane to live in its own repository, because a Railway template is
-derived from a GitHub repository and the control plane is a separate product that merely *runs*
-providers; its Dockerfile would clone this repository at a pinned ref for the provider binary, CRDs,
-upstream patch and Terraform CLI configuration. **As of 2026-11-20 that split has not happened**:
-the code is on branch `phase-1/control-plane-image` of this repository, under
-`cluster/images/control-plane/` (Dockerfile, Makefile, the `control-plane.sh` supervisor) and
-`hack/native-cluster.sh`. See the [roadmap](../roadmap.md) for the pending decision.
+The control plane lives in this repository, under `cluster/images/control-plane/` (Dockerfile,
+Makefile, the `control-plane.sh` supervisor) with `hack/native-cluster.sh` as its Docker-less test
+harness. The original plan was a separate repository, on the theory that a Railway template is
+derived from a GitHub repository; since a Railway service can build from a subdirectory that split
+is not needed for Phase 2 and was dropped on 2026-11-21 (see the [roadmap](../roadmap.md)). The
+image is self-contained: it builds the provider from this tree, Crossplane core from its tag, and
+the patched Terraform provider from `hack/upstream/`, so `package/crds/`, the patch and
+`cluster/images/provider-upjet-railway/terraformrc.hcl` are inputs to the image build and should be
+treated as a contract. The [Phase 1 review](phase-1-review.md) records the verification results and
+the open findings.
 
 ## Design
 

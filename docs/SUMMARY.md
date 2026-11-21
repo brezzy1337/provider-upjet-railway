@@ -25,3 +25,4 @@
 ## Architecture
 
 * [Railway-hosted control plane](architecture/control-plane.md)
+* [Phase 1 review](architecture/phase-1-review.md)

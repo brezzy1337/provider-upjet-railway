@@ -119,23 +119,41 @@ wait_ready() {
 start_bg() {
   local name="$1"; shift
   log "starting ${name}"
-  "$@" >>"${CP_LOG_DIR}/${name}.log" 2>&1 &
+  # Own process group per component so shutdown can signal its children too.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" >>"${CP_LOG_DIR}/${name}.log" 2>&1 &
+  else
+    "$@" >>"${CP_LOG_DIR}/${name}.log" 2>&1 &
+  fi
   local pid=$!
   PIDS+=("$pid")
   NAMES+=("$name")
   log "${name} pid=${pid} log=${CP_LOG_DIR}/${name}.log"
 }
 
+# Stop in reverse start order, one component at a time: TERM the process group
+# (so terraform grandchildren forked by the provider go too), give it
+# CP_SHUTDOWN_TIMEOUT seconds, then KILL. Observed without this: kube-apiserver
+# outlived the supervisor by a quarter of an hour after a failed boot.
+CP_SHUTDOWN_TIMEOUT="${CP_SHUTDOWN_TIMEOUT:-30}"
 shutdown() {
   local rc=$?
   trap - EXIT TERM INT
   log "shutting down"
-  local i
+  local i pid t
   for (( i=${#PIDS[@]}-1; i>=0; i-- )); do
-    kill -TERM "${PIDS[$i]}" 2>/dev/null || true
-  done
-  for (( i=${#PIDS[@]}-1; i>=0; i-- )); do
-    wait "${PIDS[$i]}" 2>/dev/null || true
+    pid="${PIDS[$i]}"
+    kill -0 "$pid" 2>/dev/null || continue
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for (( t=0; t<CP_SHUTDOWN_TIMEOUT; t++ )); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      log "${NAMES[$i]} (pid $pid) ignored TERM for ${CP_SHUTDOWN_TIMEOUT}s -- killing"
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
   done
   exit "$rc"
 }
@@ -492,7 +510,9 @@ crd_established() {
 
 apply_crd_dir() {
   local d="$1"
-  [ -d "$d" ] || { log "skipping missing CRD dir $d"; return 0; }
+  # Every configured CRD dir is required: silently skipping one just moves
+  # the failure to a 120s "not Established" timeout with no explanation.
+  [ -d "$d" ] || fail "CRD dir $d does not exist (CP_CROSSPLANE_CRDS_DIR / CP_CRD_DIRS)"
   log "applying CRDs from $d"
   # Server-side apply: several of these CRDs are far too large for the
   # last-applied-configuration annotation that client-side apply writes.

@@ -1,6 +1,6 @@
 # Roadmap and status
 
-_Last updated 2026-11-20._
+_Last updated 2026-11-21._
 
 ## Where things stand
 
@@ -10,7 +10,7 @@ _Last updated 2026-11-20._
 | Build and unit tests | Passed 2026-11-20 on Go 1.26.11: `go build`, `go test`, `golangci-lint` with 0 issues. The patched Terraform provider builds from `hack/upstream/` and its tests pass. |
 | Live verification | `Project` create → visible in Railway → delete → gone, via kind + Crossplane 2.2.1 + the provider out-of-cluster (2026-08-25, repeated through the native control plane 2026-08-26). No other kind has been exercised live. |
 | Upstream dependency | Blocked on [PR #93](https://github.com/terraform-community-providers/terraform-provider-railway/pull/93) (open, no activity since 2026-08-25). Upstream shipped 0.6.3 on 2026-10-19 **without** the fix. We build from a patch; see [The not-found patch](upstream/not-found-patch.md). |
-| Control plane | Phase 1 done. The 2026-08 handoff says it was extracted to `brezzy1337/DigitalOcean-K8-Crossplane-Control-Plane`, but that repository does not exist; the work is on branch [`phase-1/control-plane-image`](https://github.com/brezzy1337/provider-upjet-railway/tree/phase-1/control-plane-image) of this repository (commit `3e52d25`, 2026-08-26): `cluster/images/control-plane/`, `hack/native-cluster.sh`. Phase 2 not started. See [Architecture](architecture/control-plane.md). |
+| Control plane | Phase 1 done and merged to `main` on 2026-11-21: `cluster/images/control-plane/` and `hack/native-cluster.sh`. Re-verified that day on current code: 16/16 native checks, 14 s cold boot, restart on persisted state. A design review found one Phase 2 blocker (PKI not on the volume) and several items of design debt; see the [Phase 1 review](architecture/phase-1-review.md). Phase 2 not started. |
 | Package publishing | No xpkg or image has been pushed to a registry yet. CI workflows exist from the Upjet template but have not been exercised for a release. |
 
 ## Decisions pending
@@ -22,10 +22,10 @@ _Last updated 2026-11-20._
 2. Railway plan and sizing for the control-plane service (2–4 GB RAM plus a volume) and which
    workspace hosts it.
 3. Registry for the xpkg and control-plane image (ghcr.io assumed).
-4. **Where the control plane lives.** The plan was a separate repository (a Railway template is
-   derived from a GitHub repo). That extraction was never pushed. Either create the repository and
-   move `cluster/images/control-plane/` plus `hack/native-cluster.sh` there from the
-   `phase-1/control-plane-image` branch, or merge the branch here and defer the split.
+4. ~~**Where the control plane lives.**~~ Decided 2026-11-21: it lives in this repository
+   (`cluster/images/control-plane/`), merged from the `phase-1/control-plane-image` branch. A
+   Railway service can build from a subdirectory, so a separate repository is not needed for
+   Phase 2; revisit only if the control plane becomes a product on its own.
 
 ## Phases
 
@@ -33,10 +33,11 @@ _Last updated 2026-11-20._
 
 A single container running etcd, kube-apiserver, kube-controller-manager (node-independent
 controllers only), Crossplane core and this provider as supervised processes. Proven natively,
-16/16 checks, including restart on persisted etcd data. The code is on branch
-`phase-1/control-plane-image` pending the decision above. `hack/native-cluster.sh` on that branch
-is also the way to run the full stack in an environment without Docker, such as the current
-codespace.
+16/16 checks, including restart on persisted etcd data; re-verified on `main` 2026-11-21.
+`hack/native-cluster.sh` is also the way to run the full stack in an environment without Docker,
+such as the current codespace. The [Phase 1 review](architecture/phase-1-review.md) records what
+was verified, what the review found, and what Phase 2 must fix first (PKI persistence, shutdown
+ordering, per-component restart policy, supply-chain pins).
 
 ### Phase 2: deploy to Railway. Next
 
