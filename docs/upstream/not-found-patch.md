@@ -73,7 +73,8 @@ same at build time. See `hack/upstream/README.md` and
    `railway_service_domain`), build and test.
 3. Delete `hack/upstream/0001-*.patch`, drop the mirror logic from `hack/run-provider.sh`, and let the
    Dockerfile download the stock release asset again.
-4. Update the control-plane repository's pinned `PROVIDER_REF`.
+4. Update the pinned provider ref in `cluster/images/control-plane/` on the
+   `phase-1/control-plane-image` branch (or in the control-plane repository, once one exists).
 
 If upstream stays quiet, the alternative is to move to 0.6.3 now and rebase the patch onto it. The
 patch touches one hunk per resource plus the new helper file, so the rebase is mechanical, but the
