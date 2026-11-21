@@ -145,10 +145,14 @@ kc() { "${CP_BIN_DIR}/kubectl" --kubeconfig "${KUBECONFIG_INTERNAL}" "$@"; }
 # ------------------------------------------------------------------------------
 # Step 0: PKI + auth material
 #
-# Persisted under $CP_PKI_DIR so that restarts keep the same CA and the
-# kubeconfig handed out to clients stays valid. The serving certificate is
-# regenerated whenever the requested SAN set changes (e.g. once the Railway TCP
-# proxy hostname is known).
+# Written under $CP_PKI_DIR. Material found there is reused, so a restart that
+# keeps the directory keeps the same CA, SA signing key and admin credentials.
+# KNOWN LIMITATION (Phase 2 work): in the image, $CP_PKI_DIR is on the ephemeral
+# container filesystem while etcd is on the volume, so a redeploy mints a new CA
+# against old etcd state and every issued kubeconfig goes stale. Point
+# CP_PKI_DIR at persistent storage (or move all state under one volume) before
+# relying on restarts. The serving certificate is regenerated whenever the
+# requested SAN set changes (e.g. once the Railway TCP proxy hostname is known).
 # ------------------------------------------------------------------------------
 # All local addresses, one per line. `hostname -I` is GNU; busybox only has -i.
 host_addrs() {
@@ -459,8 +463,11 @@ start_controller_manager() {
     --profiling=false \
     --v=1
 
-  wait_ready "kube-controller-manager" "${CP_READY_TIMEOUT}" \
-    kc get --raw=/readyz
+  # Probe the controller manager itself, not the API server. /healthz is in
+  # kube-controller-manager's default --authorization-always-allow-paths, so no
+  # credential is needed; -k because it serves a self-signed cert.
+  wait_ready "kube-controller-manager /healthz" "${CP_READY_TIMEOUT}" \
+    curl -fsSk "https://127.0.0.1:10257/healthz"
 }
 
 # ------------------------------------------------------------------------------

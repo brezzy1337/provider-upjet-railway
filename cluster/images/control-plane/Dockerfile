@@ -89,9 +89,9 @@ RUN mkdir -p /out/crds /out/webhookconfigurations \
 # ==============================================================================
 # Stage: tfprovider-build -- patched terraform-provider-railway
 #
-# Upstream PR #93 (remove resources from state on not-found) is still open and
-# v0.6.2 is still the latest release, so the published binary breaks Upjet's
-# observe on first reconcile and after delete. Build from the tag with our
+# Upstream PR #93 (remove resources from state on not-found) is still open; the
+# v0.6.3 release (2026-10) also lacks it, so every published binary breaks
+# Upjet's observe on first reconcile and after delete. Build from the tag with our
 # patch applied instead of downloading the release.
 # ==============================================================================
 FROM golang:${GO_VERSION}-alpine AS tfprovider-build
@@ -163,6 +163,9 @@ COPY --from=crossplane-build /out/webhookconfigurations/ ${CP_HOME}/crds/webhook
 # CP_ETCD_DATA_DIR is the mount point for the persistent volume. If the platform
 # mounts it root-owned, either chown it in the platform's start command or run
 # this image as root (USER 0); the supervisor fails loudly if it cannot write.
+# NOTE: only etcd is on the volume. ${CP_HOME}/pki (cluster CA, SA key, admin
+# credentials) is ephemeral, so a redeploy regenerates it; see the Phase 1
+# review in docs/architecture for the planned fix.
 ENV CP_ETCD_DATA_DIR=/var/lib/etcd
 RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/pki ${CP_HOME}/cache ${CP_HOME}/tf ${CP_ETCD_DATA_DIR} \
     && chmod +x /usr/local/bin/control-plane.sh \

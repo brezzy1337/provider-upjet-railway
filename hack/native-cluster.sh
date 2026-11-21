@@ -110,8 +110,8 @@ build() {
 
   if [ ! -x "${PLUGIN_DIR}/terraform-provider-railway_v${TERRAFORM_PROVIDER_VERSION}" ]; then
     say "building patched terraform-provider-railway v${TERRAFORM_PROVIDER_VERSION}"
-    # Upstream PR #93 is still open and v0.6.2 is still the latest release, so
-    # the released binary lacks the not-found fix Upjet's observe depends on.
+    # Upstream PR #93 is still open and no release (0.6.3 included) carries it,
+    # so the released binary lacks the not-found fix Upjet's observe depends on.
     rm -rf "$SRC/terraform-provider-railway"
     git clone --quiet --branch "v${TERRAFORM_PROVIDER_VERSION}" \
       "${TERRAFORM_PROVIDER_REPO}" "$SRC/terraform-provider-railway"
@@ -209,8 +209,11 @@ verify() {
   check "apiserver /readyz" "${k[@]}" get --raw=/readyz
   check "apiserver rejects anonymous" bash -c \
     "curl -sk https://127.0.0.1:${CP_APISERVER_PORT}/api | grep -q Unauthorized"
-  check "nine railway kinds present" bash -c \
-    "'$BIN/kubectl' --kubeconfig '$KC' get crd -o name | grep -c '^customresourcedefinition.apiextensions.k8s.io/[a-z]*\\.railway\\.crossplane\\.io$' | grep -qx 11"
+  # Every CRD shipped under package/crds for the cluster-scoped group must be
+  # present; compare against the repo instead of a hard-coded count.
+  local want_crds; want_crds="$(ls package/crds/railway.crossplane.io_*.yaml | wc -l | tr -d ' ')"
+  check "all ${want_crds} railway.crossplane.io CRDs present" bash -c \
+    "'$BIN/kubectl' --kubeconfig '$KC' get crd -o name | grep -c '^customresourcedefinition.apiextensions.k8s.io/[a-z]*\\.railway\\.crossplane\\.io$' | grep -qx ${want_crds}"
   check "crossplane apiextensions CRDs present" "${k[@]}" get crd \
     compositeresourcedefinitions.apiextensions.crossplane.io \
     compositions.apiextensions.crossplane.io \
