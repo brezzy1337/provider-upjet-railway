@@ -1,0 +1,16 @@
+# GitBook Git Sync, site level: maps this repository's directories onto the documentation site.
+# One space, read from docs/. Its content settings live in docs/.gitbook.yaml.
+#
+# The `key` is how GitBook recognises the space between syncs. Changing it replaces the space
+# with a new one (new space ID, broken links), so treat it as permanent; rename via `title`.
+$schema: https://api.gitbook.com/gitbook-docs.yaml
+site:
+  title: provider-upjet-railway
+  structure:
+    - type: space
+      key: provider-upjet-railway
+      title: provider-upjet-railway
+      path: docs
+      default: true
+      content:
+        directory: ./docs
