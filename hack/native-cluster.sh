@@ -53,11 +53,11 @@ say() { printf '\n=== %s\n' "$*" >&2; }
 # mid-PKI with a bare "shutting down".
 need_tools() {
   local missing=() t
-  for t in openssl curl ip hostname base64; do
+  for t in openssl curl ip hostname base64 git tar unzip; do
     command -v "$t" >/dev/null 2>&1 || missing+=("$t")
   done
   [ ${#missing[@]} -eq 0 ] || {
-    echo "missing on PATH: ${missing[*]} (alpine: apk add openssl curl iproute2 coreutils)" >&2
+    echo "missing on PATH: ${missing[*]} (alpine: apk add openssl curl iproute2 coreutils git tar unzip)" >&2
     exit 1
   }
 }
@@ -238,11 +238,16 @@ verify() {
   check "apiserver /readyz" "${k[@]}" get --raw=/readyz
   check "apiserver rejects anonymous" bash -c \
     "curl -sk https://127.0.0.1:${CP_APISERVER_PORT}/api | grep -q Unauthorized"
-  # Every CRD shipped under package/crds for the cluster-scoped group must be
-  # present; compare against the repo instead of a hard-coded count.
-  local want_crds; want_crds="$(ls package/crds/railway.crossplane.io_*.yaml | wc -l | tr -d ' ')"
+  # Every CRD shipped under package/crds must be present, for both the
+  # cluster-scoped group and the namespaced (.m.) group; compare against the
+  # repo instead of a hard-coded count.
+  local want_crds want_mcrds
+  want_crds="$(ls package/crds/railway.crossplane.io_*.yaml | wc -l | tr -d ' ')"
+  want_mcrds="$(ls package/crds/railway.m.crossplane.io_*.yaml | wc -l | tr -d ' ')"
   check "all ${want_crds} railway.crossplane.io CRDs present" bash -c \
     "'$BIN/kubectl' --kubeconfig '$KC' get crd -o name | grep -c '^customresourcedefinition.apiextensions.k8s.io/[a-z]*\\.railway\\.crossplane\\.io$' | grep -qx ${want_crds}"
+  check "all ${want_mcrds} railway.m.crossplane.io CRDs present" bash -c \
+    "'$BIN/kubectl' --kubeconfig '$KC' get crd -o name | grep -c '^customresourcedefinition.apiextensions.k8s.io/[a-z]*\\.railway\\.m\\.crossplane\\.io$' | grep -qx ${want_mcrds}"
   check "crossplane apiextensions CRDs present" "${k[@]}" get crd \
     compositeresourcedefinitions.apiextensions.crossplane.io \
     compositions.apiextensions.crossplane.io \
@@ -267,9 +272,10 @@ verify() {
     check "terraform mirror is the PATCHED build (gqlparser dep)" bash -c \
       "go version -m '$tfp' | grep -q 'dep.*github.com/vektah/gqlparser'"
     # A tree with the patch committed on top of the tag reports either a
-    # pseudo-version or "(devel)", never the bare release version.
-    check "terraform mirror is not the bare v${TERRAFORM_PROVIDER_VERSION} release build" bash -c \
-      "! go version -m '$tfp' | grep -qE 'mod\\s+github.com/terraform-community-providers/terraform-provider-railway\\s+v${TERRAFORM_PROVIDER_VERSION}\\s*$'"
+    # pseudo-version (vX.Y.Z-0.<timestamp>-<sha>) or "(devel)", never the bare
+    # release version. Assert positively so an empty `go version -m` cannot pass.
+    check "terraform mirror module version is (devel) or a pseudo-version, not the bare tag" bash -c \
+      "go version -m '$tfp' | grep -qE 'mod\\s+github.com/terraform-community-providers/terraform-provider-railway\\s+(\\(devel\\)|v[0-9.]+-0\\.[0-9]{14}-[0-9a-f]+)'"
   fi
   check "terraform resolves the mirror (offline install)" bash -c \
     "d=\$(mktemp -d); printf 'terraform {\n required_providers {\n railway = {\n source = \"terraform-community-providers/railway\"\n version = \"${TERRAFORM_PROVIDER_VERSION}\"\n }\n }\n}\n' > \$d/main.tf; \

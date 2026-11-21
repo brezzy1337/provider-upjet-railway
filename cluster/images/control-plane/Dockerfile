@@ -10,7 +10,7 @@
 # which ADDs a binary the Makefile must cross-compile beforehand.
 #
 # Build from the REPOSITORY ROOT:
-#   docker build -f cluster/images/control-plane/Dockerfile -t control-plane:dev .
+#   docker build -f cluster/images/control-plane/Dockerfile -t provider-upjet-railway-control-plane:dev .
 # ==============================================================================
 
 ARG GO_VERSION=1.26.7
@@ -90,7 +90,7 @@ RUN mkdir -p /out/crds /out/webhookconfigurations \
 # Stage: tfprovider-build -- patched terraform-provider-railway
 #
 # Upstream PR #93 (remove resources from state on not-found) is still open; the
-# v0.6.3 release (2026-10) also lacks it, so every published binary breaks
+# v0.6.3 release (2026-10-19) also lacks it, so every published binary breaks
 # Upjet's observe on first reconcile and after delete. Build from the tag with our
 # patch applied instead of downloading the release.
 # ==============================================================================
@@ -160,9 +160,11 @@ COPY --from=crossplane-build /out/crds/                 ${CP_HOME}/crds/crosspla
 COPY --from=crossplane-build /out/webhookconfigurations/ ${CP_HOME}/crds/webhookconfigurations/
 
 # ---- writable state ---------------------------------------------------------
-# CP_ETCD_DATA_DIR is the mount point for the persistent volume. If the platform
-# mounts it root-owned, either chown it in the platform's start command or run
-# this image as root (USER 0); the supervisor fails loudly if it cannot write.
+# CP_ETCD_DATA_DIR is the mount point for the persistent volume. Railway mounts
+# volumes root-owned, and this image runs as an unprivileged USER, so a chown
+# from the start command cannot work. Until the Phase 2 fix (start as root,
+# chown the state root, drop privileges) lands, run with RAILWAY_RUN_UID=0; the
+# supervisor fails loudly if it cannot write.
 # NOTE: only etcd is on the volume. ${CP_HOME}/pki (cluster CA, SA key, admin
 # credentials) is ephemeral, so a redeploy regenerates it; see the Phase 1
 # review in docs/architecture for the planned fix.

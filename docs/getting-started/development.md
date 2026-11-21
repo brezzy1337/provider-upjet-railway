@@ -12,7 +12,7 @@ Rebuild the container, or install by hand. The following worked on an Alpine-bas
 2026-11-20 and gives everything except a container runtime:
 
 ```console
-sudo apk add github-cli bash curl unzip make gcc musl-dev git openssl iproute2 coreutils   # last three: native-cluster.sh
+sudo apk add github-cli bash curl unzip make gcc musl-dev git openssl iproute2 coreutils
 curl -sSLo /tmp/go.tgz https://go.dev/dl/go1.26.11.linux-amd64.tar.gz && sudo tar -C /usr/local -xzf /tmp/go.tgz
 echo 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin' >> ~/.profile
 export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin   # for this shell; later lines need it
@@ -34,7 +34,9 @@ binaries and compiles Crossplane core (several minutes), `up` boots the plane in
 (about 15 s), `verify` runs the 16 assertions against it, `down` stops it, `clean` also removes
 the state while keeping the binaries. On this codespace the full cycle was run on 2026-11-21.
 
-Pinned versions, all read from the `Makefile`:
+Pinned versions. These are read from the `Makefile`; the control-plane image and native harness
+additionally pin Kubernetes (`v1.35.8`), etcd (`v3.6.14`) and the Alpine base in
+`cluster/images/control-plane/Dockerfile` and `hack/native-cluster.sh` (see D5 in the Phase 1 review):
 
 | Component                  | Version              |
 |----------------------------|----------------------|

@@ -1,7 +1,7 @@
 # Phase 1 review: the nodeless control-plane image
 
-_Reviewed 2026-11-21 against commit `3e52d25` of branch `phase-1/control-plane-image`, merged to
-`main` the same day with the fixes listed below._
+_Last updated 2026-11-21. Reviewed against commit `3e52d25` of branch `phase-1/control-plane-image`,
+merged to `main` the same day via PR #3 with the fixes listed below._
 
 ## What Phase 1 delivered
 
@@ -43,6 +43,7 @@ branch point, so this exercised exactly what Phase 1 built.
 | Supervisor `SIGTERM` | All five components gone in **7 s**, no kill escalation needed |
 | Third `up` on the persisted state | Ready in **13 s**, same cluster CA as before, **16/16 pass** |
 | Final `SIGTERM` | All components gone in 8 s, no leftover processes |
+| Fourth `up`, after the review follow-up commit | Ready in 12 s; **17/17** (the namespaced CRD count added); `SIGTERM` exited **143**; all components gone in 9 s |
 
 The failed first boot also exposed two things the harness had been hiding: the API server survived
 the supervisor's shutdown for a quarter of an hour, and `verify` reported passes against a plane
@@ -62,14 +63,19 @@ Small fixes applied on top of `3e52d25` before merging, all found by the review 
 2. **Missing CRD directory is fatal.** `apply_crd_dir` skipped a missing directory and let the boot
    fail later with an unhelpful timeout. It now fails immediately and names the variable to set.
 3. **Shutdown escalates.** Components are stopped one at a time in reverse start order, each in its
-   own process group (`setsid`), with `CP_SHUTDOWN_TIMEOUT` (30 s) before `SIGKILL`.
+   own process group (`setsid`), with `CP_SHUTDOWN_TIMEOUT` (10 s per component, so 50 s worst case;
+   keep the platform drain window above that) before `SIGKILL`. `SIGTERM` and `SIGINT` now exit 143
+   and 130. Side effect of `setsid` in native mode: Ctrl-C reaches the components through the
+   supervisor's trap rather than directly, and if the supervisor itself is `SIGKILL`ed the
+   components survive; `native-cluster.sh down` handles that case. The `SIGKILL` escalation path has
+   not been exercised, since every observed shutdown completed on `SIGTERM`.
 4. **Harness restages CRDs on every `up`** and checks for `openssl`, `curl`, `ip`, `hostname` and
    `base64` before booting; the codespace lacked `openssl`, which produced a bare "shutting down"
    with no reason.
 5. **Verify probes are honest.** The garbage-collector probe fails when its setup fails instead of
-   treating "child not found" as "collected"; the CRD count is derived from `package/crds/` instead
-   of a hard-coded 11; the "built past the tag" check accepts the `(devel)` module version the Go
-   toolchain now reports.
+   treating "child not found" as "collected"; the CRD counts for both API groups are derived from
+   `package/crds/` instead of a hard-coded 11; the "built past the tag" check asserts positively
+   for `(devel)` or a pseudo-version, since the Go toolchain reports `(devel)` for this build.
 6. Comments corrected: the PKI directory is **not** persisted in the image (see below), and 0.6.3
    is no longer "not yet released".
 
@@ -82,8 +88,8 @@ consolidated, verified set. Severity reflects impact on the next phase, not on m
 
 | # | Finding | Why it matters | Fix |
 |---|---------|----------------|-----|
-| B1 | **PKI is on the ephemeral filesystem; only etcd is on the volume.** `CP_PKI_DIR` defaults to `/var/lib/control-plane/pki`; the only `VOLUME` is `/var/lib/etcd`. | Every redeploy mints a new cluster CA, service-account key and admin token while etcd keeps Secrets and SA tokens signed by the old ones. Every issued kubeconfig goes stale. The August restart test passed only because the native harness keeps both directories on disk. | One state root on one volume (`etcd/`, `pki/`, `cache/` under it), `umask 077`, and a `VERSION` stamp so an older image refuses newer stored state. |
-| B2 | **Volume ownership.** The image runs as uid 65532; Railway mounts volumes root-owned. | First boot fails the writability check. The in-file suggestion to "chown in the start command" cannot work for a non-root `USER`. | Start as root, `chown` the state root, drop privileges with `su-exec`; or document `RAILWAY_RUN_UID=0`. |
+| B1 | **PKI is on the ephemeral filesystem; only etcd is on the volume.** `CP_PKI_DIR` defaults to `/var/lib/control-plane/pki`; the only `VOLUME` is `/var/lib/etcd`. | Every redeploy mints a new cluster CA, service-account key and admin token while etcd keeps Secrets and SA tokens signed by the old ones. Every issued kubeconfig goes stale. The 2026-08-25 restart test passed only because the native harness keeps both directories on disk. | One state root on one volume (`etcd/`, `pki/`, `cache/` under it), `umask 077`, and a `VERSION` stamp so an older image refuses newer stored state. |
+| B2 | **Volume ownership.** The image runs as uid 65532; Railway mounts volumes root-owned. | First boot fails the writability check; a chown from the start command cannot work for a non-root `USER`. | Start as root, `chown` the state root, drop privileges with `su-exec` (`apk add su-exec`, not in the image today); minimum viable: document `RAILWAY_RUN_UID=0`. |
 | B3 | **Secrets unencrypted in etcd, no audit log, 10-year admin credentials.** No `--encryption-provider-config`, no `--audit-policy-file`; the admin client cert, CA and static bearer token all live 3650 days with no revocation path. | The Railway workspace token sits in plaintext on the volume; a leaked kubeconfig is permanent cluster-admin on an internet-facing endpoint. | Add an encryption provider with a key kept off the volume; audit at Metadata level to stdout; shorten client-cert validity and reissue on boot; make the bearer-token kubeconfig opt-in. |
 | B4 | **`RAILWAY_TOKEN` handling.** It stays in the supervisor's environment (inherited by every child), is interpolated into JSON by hand, and passes through a `kubectl` command line. | Readable from `/proc/*/environ` and `ps` inside the container; breaks on a quote or backslash. | Read it into a local and `unset` it; build the Secret via `--from-file=/dev/stdin` with `jq -n --arg`; start the other components before it is read, or under `env -u`. |
 | B5 | **etcd quota and memory.** `--quota-backend-bytes` is 8 GiB, likely larger than the volume; no defrag, no snapshot, no `GOMEMLIMIT` on any Go process. | Disk-full on the volume risks a corrupted etcd; an OOM kill picks an arbitrary victim. | `CP_ETCD_QUOTA_BYTES` defaulting to about 2 GiB, periodic `etcdctl defrag` and `snapshot save` to the volume, `GOMEMLIMIT` per process derived from the container limit. |
@@ -92,7 +98,7 @@ consolidated, verified set. Severity reflects impact on the next phase, not on m
 
 | # | Finding | Fix |
 |---|---------|-----|
-| D1 | **All-or-nothing supervision.** Any process exit tears down etcd and the API server and costs a full cold boot. Right for the core, wrong for providers and functions, which fork `terraform` per reconcile and are the likeliest OOM victims. | Give each component a criticality: core is fatal, providers and functions restart with backoff. Replace the `kill -0` poll with `wait -n`. |
+| D1 | **All-or-nothing supervision.** Any process exit tears down etcd and the API server and costs a full cold boot. Right for the core, wrong for providers and functions, which fork `terraform` per reconcile and are the likeliest OOM victims. Shutdown is sequential with a per-component budget, so a global deadline is also missing. | Give each component a criticality: core is fatal, providers and functions restart with backoff. Replace the `kill -0` poll with `wait -n -p` (bash 5.1+, Alpine ships 5.2) to map an exit back to a name. Add a total shutdown deadline, or stop non-etcd components concurrently and etcd last. |
 | D2 | **No component abstraction.** Adding a provider means a new `start_*` function, a `main()` edit, port variables, CRD waits, a ProviderConfig block and a shutdown decision. Functions are not supported at all: nothing signs a leaf with the `crossplane-root-ca` Secret, and nothing writes `FunctionRevision.status.endpoint`. | A `components.d/<name>.sh` drop-in with `_start`, `_ready`, `_crds`, `_critical`; one `issue_cert` helper and one `sign_with_crossplane_ca` helper; ports allocated from a base. |
 | D3 | **Everything runs as `system:masters`** under one uid, including the provider, Crossplane core and the controller manager (which already has its own RBAC bindings). | Per-component client certs and kubeconfigs; a ClusterRole for the provider scoped to its groups, Secrets in its namespace, and Events. |
 | D4 | **Package manager bypassed.** CRDs are applied by `kubectl`, so no `Provider` or `ProviderRevision` object exists and Crossplane's dependency resolution cannot see the provider. | Decide, and write down, whether future providers install as a Provider package (for CRDs and dependency metadata) plus an external process, or stay on the CRD-directory path. |

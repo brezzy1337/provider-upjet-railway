@@ -36,6 +36,7 @@ CP_RUN_DIR="${CP_RUN_DIR:-${CP_HOME}/run}"
 
 # etcd data lives on a mounted volume; keep it out of $CP_HOME by default.
 CP_ETCD_DATA_DIR="${CP_ETCD_DATA_DIR:-/var/lib/etcd}"
+CP_KCM_PORT="${CP_KCM_PORT:-10257}"   # kube-controller-manager secure/health port, loopback only
 CP_ETCD_CLIENT_PORT="${CP_ETCD_CLIENT_PORT:-2379}"
 CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-2380}"
 
@@ -120,6 +121,13 @@ start_bg() {
   local name="$1"; shift
   log "starting ${name}"
   # Own process group per component so shutdown can signal its children too.
+  # Side effect in native mode: Ctrl-C on the terminal no longer reaches the
+  # components directly; the supervisor's INT trap stops them. If the
+  # supervisor itself is SIGKILLed they survive; `native-cluster.sh down` copes.
+  if ! command -v setsid >/dev/null 2>&1 && [ -z "${_CP_WARNED_SETSID:-}" ]; then
+    log "WARNING: setsid not found; children of ${name} will not be signalled on shutdown"
+    _CP_WARNED_SETSID=1
+  fi
   if command -v setsid >/dev/null 2>&1; then
     setsid "$@" >>"${CP_LOG_DIR}/${name}.log" 2>&1 &
   else
@@ -135,7 +143,11 @@ start_bg() {
 # (so terraform grandchildren forked by the provider go too), give it
 # CP_SHUTDOWN_TIMEOUT seconds, then KILL. Observed without this: kube-apiserver
 # outlived the supervisor by a quarter of an hour after a failed boot.
-CP_SHUTDOWN_TIMEOUT="${CP_SHUTDOWN_TIMEOUT:-30}"
+# The budget is per component, so the worst case is 5 x CP_SHUTDOWN_TIMEOUT;
+# keep the platform's drain window (Railway: RAILWAY_DEPLOYMENT_DRAINING_SECONDS)
+# above that. A clean stop of all five took 7 s in testing.
+CP_SHUTDOWN_TIMEOUT="${CP_SHUTDOWN_TIMEOUT:-10}"
+[[ "${CP_SHUTDOWN_TIMEOUT}" =~ ^[0-9]+$ ]] || CP_SHUTDOWN_TIMEOUT=10
 shutdown() {
   local rc=$?
   trap - EXIT TERM INT
@@ -477,7 +489,7 @@ start_controller_manager() {
     --root-ca-file "${CP_PKI_DIR}/ca.crt" \
     --service-account-private-key-file "${CP_PKI_DIR}/sa.key" \
     --bind-address 127.0.0.1 \
-    --secure-port 10257 \
+    --secure-port "${CP_KCM_PORT}" \
     --profiling=false \
     --v=1
 
@@ -485,7 +497,7 @@ start_controller_manager() {
   # kube-controller-manager's default --authorization-always-allow-paths, so no
   # credential is needed; -k because it serves a self-signed cert.
   wait_ready "kube-controller-manager /healthz" "${CP_READY_TIMEOUT}" \
-    curl -fsSk "https://127.0.0.1:10257/healthz"
+    curl -fsSk "https://127.0.0.1:${CP_KCM_PORT}/healthz"
 }
 
 # ------------------------------------------------------------------------------
@@ -722,7 +734,11 @@ start_provider() {
 # ------------------------------------------------------------------------------
 main() {
   mkdir -p "${CP_HOME}" "${CP_LOG_DIR}" "${CP_RUN_DIR}" "${CP_HOME}/cache"
-  trap shutdown EXIT TERM INT
+  # Separate handlers so a platform stop exits 143/130; the EXIT trap then runs
+  # shutdown with that status instead of whatever command happened to be running.
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap shutdown EXIT
 
   bootstrap_pki
 

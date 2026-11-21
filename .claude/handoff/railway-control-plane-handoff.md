@@ -1,9 +1,10 @@
 # Handoff — Railway-hosted Crossplane control plane
 
-> **Correction (2026-11-20):** the extraction to a separate control-plane repository described below
-> never happened. The Phase 1 code (`cluster/images/control-plane/`, `hack/native-cluster.sh`) is live
-> on branch `phase-1/control-plane-image` of this repo, not "historical". Current status is in
-> `docs/roadmap.md`; the rest of this file is kept as the 2026-08 record.
+> **Correction (2026-11-21):** the extraction to a separate control-plane repository described below
+> never happened. The Phase 1 code (`cluster/images/control-plane/`, `hack/native-cluster.sh`) is on
+> `main` of this repo (merged 2026-11-21 via PR #3), not "historical". Current status is in
+> `docs/roadmap.md` and the findings in `docs/architecture/phase-1-review.md`; the rest of this
+> file is kept as the 2026-08 record.
 
 **Written:** 2026-08-25, for a fresh Claude Code session working in this repo
 (`brezzy1337/provider-upjet-railway`, branch `main`).
@@ -73,13 +74,8 @@ straight into cloud APIs. All of this runs unprivileged (Docker/kind would not).
 
 ## Phase 1 status (2026-08-25) — built, and proven without Docker
 
-> **Moved (2026-08-26).** The control plane is now its own repository:
-> **`brezzy1337/DigitalOcean-K8-Crossplane-Control-Plane`**. It is a separate product from this
-> provider — it merely *runs* providers — and a Railway template is derived from a GitHub repo, so
-> it needs to be one. The Dockerfile there clones this repo at a pinned `PROVIDER_REF` for the
-> provider binary, its CRDs, `hack/upstream/*.patch` and `terraformrc.hcl`, so nothing here has to
-> move in lockstep. `hack/native-cluster.sh` moved with it. The paths named below are historical;
-> the commit that added them here is preserved on branch `phase-1/control-plane-image`.
+> **Superseded.** This section originally claimed a move to a separate repository on 2026-08-26.
+> That never happened; see the correction at the top and `docs/architecture/control-plane.md`.
 
 `cluster/images/control-plane/{Dockerfile,control-plane.sh,Makefile}` exist. The Dockerfile is
 fully self-contained (multi-stage: builds `cmd/provider`, Crossplane core v2.2.1 from source, and

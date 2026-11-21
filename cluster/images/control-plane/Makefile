@@ -9,7 +9,7 @@
 # the repository root as context and nothing else -- so it needs no build
 # machinery beyond docker itself, and it is not an xpkg.
 #
-# Run these from anywhere; every target sets the context to the repo root.
+# Run these from anywhere; the build targets use the repo root as context.
 # ==============================================================================
 
 IMAGE       ?= provider-upjet-railway-control-plane
@@ -32,6 +32,7 @@ help:
 	@echo "kubeconfig      copy the generated kubeconfig out of a running container"
 	@echo "shell           interactive shell in the image"
 	@echo "push            push $(REGISTRY)/$(IMAGE):$(TAG)"
+	@echo "clean           remove the image and its etcd volume"
 
 build:
 	docker build --platform $(PLATFORM) -f $(DOCKERFILE) -t $(IMAGE):$(TAG) $(ROOT)
