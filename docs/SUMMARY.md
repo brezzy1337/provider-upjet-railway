@@ -26,3 +26,8 @@
 
 * [Railway-hosted control plane](architecture/control-plane.md)
 * [Phase 1 review](architecture/phase-1-review.md)
+
+## Development reports
+
+* [Development reports](reports/README.md)
+  * [2026-11-21](reports/2026-11-21.md)

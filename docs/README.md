@@ -41,3 +41,5 @@ Railway itself, including, eventually, its own hosting.
 * [Development](getting-started/development.md): toolchain, scripts and the generate loop.
 * [Resources](resources/overview.md): every kind, its references and what has been tested live.
 * [Roadmap](roadmap.md): current status and the phased plan.
+* [Development reports](reports/README.md): dated records of what each working session shipped,
+  verified, decided and left open.

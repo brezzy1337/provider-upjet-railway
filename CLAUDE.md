@@ -7,7 +7,8 @@ Crossplane provider for Railway, generated with **Upjet v2** from
 
 Start with `docs/README.md` (GitBook-synced documentation: concepts, roadmap, architecture) and then
 `.claude/handoff/railway-control-plane-handoff.md`, the 2026-08 record of what was verified and the
-lessons learned building the control plane. When status changes, update `docs/roadmap.md`.
+lessons learned building the control plane. When status changes, update `docs/roadmap.md`; when a
+session ships something, add or extend the day's report under `docs/reports/` (conventions in its README).
 
 Commands: `make generate` (regenerate after touching `config/`), `go build ./...`, `go test ./...`,
 `hack/dev-cluster.sh` (kind + Crossplane + CRDs), `hack/run-provider.sh` (provider out-of-cluster).
