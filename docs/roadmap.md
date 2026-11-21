@@ -2,6 +2,15 @@
 
 _Last updated 2026-11-21._
 
+## End goal
+
+A Crossplane control plane hosted on Railway provisions Kubernetes clusters on DigitalOcean (then
+AWS and GCP). Inside those clusters run [Hermes](https://hermes-agent.nousresearch.com) AI agent
+instances, which the user's Railway-hosted application reaches over the cluster's ingress. Hermes
+is a Kubernetes workload, not a Railway service, so this provider's job is the Railway side only:
+the control-plane service itself and the user application. See
+[Architecture](architecture/control-plane.md).
+
 ## Where things stand
 
 | Area | Status |
@@ -15,10 +24,12 @@ _Last updated 2026-11-21._
 
 ## Decisions pending
 
-1. **0.6.2 + patch, or 0.6.3 + rebased patch.** 0.6.3 reshapes `railway_service` (build and deploy
-   settings, updatable regions) and adds `target_port` to `railway_service_domain`. Moving means
-   rebasing `hack/upstream/0001-*.patch`, regenerating, and re-reviewing the `Service` schema. Staying
-   costs nothing today but widens the gap.
+1. **0.6.2 + patch, or 0.6.3 + rebased patch.** Resolved for Phase 2 (2026-11-21): stay on 0.6.2 +
+   patch. 0.6.3 reshapes `railway_service` (adds `start_command`, health check, restart policy, build
+   settings, updatable regions) and adds `target_port` to `railway_service_domain`; none of that is
+   needed to host the control plane (image, volume, TCP proxy, env vars). Revisit when a Railway
+   service needs those fields or when upstream merges the not-found fix. Moving means rebasing
+   `hack/upstream/0001-*.patch`, regenerating, and re-reviewing the `Service` schema.
 2. Railway plan and sizing for the control-plane service (2–4 GB RAM plus a volume) and which
    workspace hosts it.
 3. Registry for the xpkg and control-plane image (ghcr.io assumed).
