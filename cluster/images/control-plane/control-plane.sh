@@ -24,6 +24,8 @@
 # in hack/native-cluster.sh, so the flags proven there are the flags shipped.
 # ==============================================================================
 set -euo pipefail
+# Everything this script writes is credential material or cluster state.
+umask 077
 
 # ------------------------------------------------------------------------------
 # Configuration (every value overridable from the environment)
@@ -31,11 +33,20 @@ set -euo pipefail
 CP_HOME="${CP_HOME:-/var/lib/control-plane}"
 CP_BIN_DIR="${CP_BIN_DIR:-/usr/local/bin}"
 CP_LOG_DIR="${CP_LOG_DIR:-${CP_HOME}/log}"
-CP_PKI_DIR="${CP_PKI_DIR:-${CP_HOME}/pki}"
 CP_RUN_DIR="${CP_RUN_DIR:-${CP_HOME}/run}"
 
-# etcd data lives on a mounted volume; keep it out of $CP_HOME by default.
-CP_ETCD_DATA_DIR="${CP_ETCD_DATA_DIR:-/var/lib/etcd}"
+# One state root on one volume. Everything that must survive a redeploy lives
+# under it: etcd data AND the PKI (cluster CA, SA signing key, admin
+# credentials). Keeping only etcd persistent, as Phase 1 did, meant every
+# redeploy minted a new CA against old etcd state and invalidated every
+# kubeconfig ever issued. Mount the platform volume here (Railway: set the
+# service volume mount path to this directory; Dockerfile VOLUME is ignored).
+CP_STATE_DIR="${CP_STATE_DIR:-${CP_HOME}/state}"
+CP_PKI_DIR="${CP_PKI_DIR:-${CP_STATE_DIR}/pki}"
+CP_ETCD_DATA_DIR="${CP_ETCD_DATA_DIR:-${CP_STATE_DIR}/etcd}"
+# Refuse to start an older image on newer stored state (etcd and kube-apiserver
+# do not support downgrade). Set to true to override once, knowingly.
+CP_ALLOW_DOWNGRADE="${CP_ALLOW_DOWNGRADE:-false}"
 CP_KCM_PORT="${CP_KCM_PORT:-10257}"   # kube-controller-manager secure/health port, loopback only
 CP_ETCD_CLIENT_PORT="${CP_ETCD_CLIENT_PORT:-2379}"
 CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-2380}"
@@ -173,16 +184,72 @@ shutdown() {
 kc() { "${CP_BIN_DIR}/kubectl" --kubeconfig "${KUBECONFIG_INTERNAL}" "$@"; }
 
 # ------------------------------------------------------------------------------
+# Step -1: the state root
+#
+# Create or adopt $CP_STATE_DIR, refuse to run if it is not writable, warn if
+# the PKI or etcd directories were pointed somewhere else, and keep a VERSION
+# stamp so an accidental rollback of the image onto newer stored state fails
+# before etcd or the API server get a chance to corrupt it.
+# ------------------------------------------------------------------------------
+component_versions() {
+  printf 'etcd=%s\n' "$("${CP_BIN_DIR}/etcd" --version 2>/dev/null | awk '/etcd Version/{print $3}')"
+  printf 'kubernetes=%s\n' "$("${CP_BIN_DIR}/kube-apiserver" --version 2>/dev/null | awk '{print $2}')"
+}
+
+# usage: version_lt A B  -> true when A sorts strictly before B (sort -V)
+version_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+
+prepare_state_dir() {
+  mkdir -p "${CP_STATE_DIR}" 2>/dev/null || true
+  [ -d "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} does not exist and cannot be created"
+  [ -w "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} is not writable by uid $(id -u). Railway mounts volumes root-owned: run with RAILWAY_RUN_UID=0, or chown the mount to $(id -u) first"
+  chmod 700 "${CP_STATE_DIR}" 2>/dev/null || true
+  mkdir -p "${CP_PKI_DIR}" "${CP_ETCD_DATA_DIR}"
+
+  # The whole point is that pki and etcd share the volume. Warn (not fail) if an
+  # override split them, because that silently recreates the Phase 1 bug.
+  local dev_state dev_pki dev_etcd
+  dev_state="$(stat -c %d "${CP_STATE_DIR}")"
+  dev_pki="$(stat -c %d "${CP_PKI_DIR}")"
+  dev_etcd="$(stat -c %d "${CP_ETCD_DATA_DIR}")"
+  if [ "${dev_pki}" != "${dev_state}" ] || [ "${dev_etcd}" != "${dev_state}" ]; then
+    log "WARNING: CP_PKI_DIR (${CP_PKI_DIR}) and CP_ETCD_DATA_DIR (${CP_ETCD_DATA_DIR}) are not on the same filesystem as CP_STATE_DIR (${CP_STATE_DIR})."
+    log "         A redeploy that keeps one but not the other invalidates every issued kubeconfig."
+  fi
+
+  local stamp="${CP_STATE_DIR}/VERSION" current stored k cur old
+  current="$(component_versions)"
+  if [ -f "${stamp}" ]; then
+    stored="$(cat "${stamp}")"
+    for k in etcd kubernetes; do
+      cur="$(printf '%s\n' "${current}" | awk -F= -v k="$k" '$1==k{print $2}')"
+      old="$(printf '%s\n' "${stored}"  | awk -F= -v k="$k" '$1==k{print $2}')"
+      [ -n "${cur}" ] && [ -n "${old}" ] || continue
+      if version_lt "${cur}" "${old}"; then
+        if [ "${CP_ALLOW_DOWNGRADE}" = "true" ]; then
+          log "WARNING: ${k} ${cur} is older than the ${old} that wrote ${stamp}; continuing because CP_ALLOW_DOWNGRADE=true"
+        else
+          fail "${k} ${cur} in this image is older than ${old} recorded in ${stamp}. Downgrades are unsupported; deploy an image >= ${old}, or set CP_ALLOW_DOWNGRADE=true if you accept the risk"
+        fi
+      elif version_lt "${old}" "${cur}"; then
+        log "state written by ${k} ${old}, now running ${cur} (upgrade)"
+      fi
+    done
+  else
+    log "new state root at ${CP_STATE_DIR}"
+  fi
+  printf '%s\n' "${current}" > "${stamp}"
+  log "state root ${CP_STATE_DIR} ready: $(printf '%s' "${current}" | tr '\n' ' ')"
+}
+
+# ------------------------------------------------------------------------------
 # Step 0: PKI + auth material
 #
-# Written under $CP_PKI_DIR. Material found there is reused, so a restart that
-# keeps the directory keeps the same CA, SA signing key and admin credentials.
-# KNOWN LIMITATION (Phase 2 work): in the image, $CP_PKI_DIR is on the ephemeral
-# container filesystem while etcd is on the volume, so a redeploy mints a new CA
-# against old etcd state and every issued kubeconfig goes stale. Point
-# CP_PKI_DIR at persistent storage (or move all state under one volume) before
-# relying on restarts. The serving certificate is regenerated whenever the
-# requested SAN set changes (e.g. once the Railway TCP proxy hostname is known).
+# Written under $CP_PKI_DIR, which lives in the persistent state root next to
+# etcd. Material found there is reused, so a restart or redeploy keeps the same
+# CA, SA signing key and admin credentials, and every issued kubeconfig stays
+# valid. The serving certificate is regenerated whenever the requested SAN set
+# changes (e.g. once the Railway TCP proxy hostname is known).
 # ------------------------------------------------------------------------------
 # All local addresses, one per line. `hostname -I` is GNU; busybox only has -i.
 host_addrs() {
@@ -312,14 +379,24 @@ bootstrap_pki() {
   # ---- static bearer token --------------------------------------------------
   # Convenient for clients that cannot carry a client certificate. NEVER
   # anonymous: --anonymous-auth=false is passed to the apiserver.
-  if [ ! -f "${CP_PKI_DIR}/tokens.csv" ]; then
-    local tok="${CP_ADMIN_TOKEN:-}"
-    [ -n "${tok}" ] || tok="$(openssl rand -hex 32)"
+  # Persisted with the PKI. If CP_ADMIN_TOKEN is set in the environment it wins,
+  # so rotating the platform variable rotates the token on the next boot;
+  # unset, the stored token is reused (or generated on first boot).
+  local tok="${CP_ADMIN_TOKEN:-}"
+  if [ -n "${tok}" ] && ! [[ "${tok}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    fail "CP_ADMIN_TOKEN must match ^[A-Za-z0-9._-]+$ (it is written into tokens.csv)"
+  fi
+  if [ -z "${tok}" ] && [ -f "${CP_PKI_DIR}/tokens.csv" ]; then
+    tok="$(cut -d, -f1 "${CP_PKI_DIR}/tokens.csv")"
+  fi
+  [ -n "${tok}" ] || tok="$(openssl rand -hex 32)"
+  if [ ! -f "${CP_PKI_DIR}/tokens.csv" ] || [ "$(cut -d, -f1 "${CP_PKI_DIR}/tokens.csv")" != "${tok}" ]; then
+    [ -f "${CP_PKI_DIR}/tokens.csv" ] && log "rotating admin bearer token from CP_ADMIN_TOKEN"
     printf '%s,control-plane-admin,control-plane-admin,"system:masters"\n' "${tok}" \
       > "${CP_PKI_DIR}/tokens.csv"
     chmod 600 "${CP_PKI_DIR}/tokens.csv"
   fi
-  CP_ADMIN_TOKEN="$(cut -d, -f1 "${CP_PKI_DIR}/tokens.csv")"
+  CP_ADMIN_TOKEN="${tok}"
 }
 
 issue_client_cert() {
@@ -402,7 +479,7 @@ start_etcd() {
   # rather than deep inside etcd.
   mkdir -p "${CP_ETCD_DATA_DIR}" 2>/dev/null || true
   [ -d "${CP_ETCD_DATA_DIR}" ] || fail "etcd data dir ${CP_ETCD_DATA_DIR} does not exist and cannot be created"
-  [ -w "${CP_ETCD_DATA_DIR}" ] || fail "etcd data dir ${CP_ETCD_DATA_DIR} is not writable by uid $(id -u) -- chown the volume or run this image as root"
+  [ -w "${CP_ETCD_DATA_DIR}" ] || fail "etcd data dir ${CP_ETCD_DATA_DIR} is not writable by uid $(id -u) -- see the state dir check above"
   start_bg etcd "${CP_BIN_DIR}/etcd" \
     --name control-plane \
     --data-dir "${CP_ETCD_DATA_DIR}" \
@@ -740,6 +817,7 @@ main() {
   trap 'exit 130' INT
   trap shutdown EXIT
 
+  prepare_state_dir
   bootstrap_pki
 
   local external="${CP_EXTERNAL_URL}"

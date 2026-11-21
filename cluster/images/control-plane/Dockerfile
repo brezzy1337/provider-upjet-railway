@@ -160,20 +160,22 @@ COPY --from=crossplane-build /out/crds/                 ${CP_HOME}/crds/crosspla
 COPY --from=crossplane-build /out/webhookconfigurations/ ${CP_HOME}/crds/webhookconfigurations/
 
 # ---- writable state ---------------------------------------------------------
-# CP_ETCD_DATA_DIR is the mount point for the persistent volume. Railway mounts
-# volumes root-owned, and this image runs as an unprivileged USER, so a chown
-# from the start command cannot work. Until the Phase 2 fix (start as root,
-# chown the state root, drop privileges) lands, run with RAILWAY_RUN_UID=0; the
-# supervisor fails loudly if it cannot write.
-# NOTE: only etcd is on the volume. ${CP_HOME}/pki (cluster CA, SA key, admin
-# credentials) is ephemeral, so a redeploy regenerates it; see the Phase 1
-# review in docs/architecture for the planned fix.
-ENV CP_ETCD_DATA_DIR=/var/lib/etcd
-RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/pki ${CP_HOME}/cache ${CP_HOME}/tf ${CP_ETCD_DATA_DIR} \
+# CP_STATE_DIR is the ONE persistent mount: etcd data, the PKI (cluster CA, SA
+# signing key, admin credentials) and a VERSION stamp all live under it, so a
+# redeploy keeps the cluster identity together with its data. Mount the
+# platform volume exactly here (Railway: service volume mount path; the VOLUME
+# instruction below documents it but Railway does not read it).
+# Railway mounts volumes root-owned and this image runs as an unprivileged
+# USER, so a chown from the start command cannot work: run with
+# RAILWAY_RUN_UID=0 until B2 (start as root, chown, drop privileges) lands. The
+# supervisor fails loudly, naming this, if it cannot write the state dir.
+ENV CP_STATE_DIR=${CP_HOME}/state
+RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/cache ${CP_HOME}/tf ${CP_STATE_DIR} \
     && chmod +x /usr/local/bin/control-plane.sh \
-    && chown -R ${USER_ID}:${USER_ID} ${CP_HOME} ${CP_ETCD_DATA_DIR} /terraform
+    && chmod 700 ${CP_STATE_DIR} \
+    && chown -R ${USER_ID}:${USER_ID} ${CP_HOME} /terraform
 
-VOLUME ${CP_ETCD_DATA_DIR}
+VOLUME ${CP_STATE_DIR}
 
 USER ${USER_ID}
 

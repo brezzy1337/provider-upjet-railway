@@ -175,7 +175,7 @@ stage_crds() {
 export_env() {
   export CP_HOME="${HOME_DIR}"
   export CP_BIN_DIR="${BIN}"
-  export CP_ETCD_DATA_DIR="${NATIVE_WORK}/etcd"
+  export CP_STATE_DIR="${NATIVE_WORK}/state"   # etcd + pki + VERSION, like the image
   export CP_CRD_DIRS="${HOME_DIR}/crds/railway"
   export CP_CROSSPLANE_CRDS_DIR="${HOME_DIR}/crds/crossplane"
   export CP_WEBHOOK_CONFIGS_DIR="${HOME_DIR}/crds/webhookconfigurations"
@@ -233,6 +233,11 @@ verify() {
   }
 
   say "verifying"
+  # B1: the PKI and etcd must share the persistent state root, and the root
+  # must carry the VERSION stamp that guards against image rollback.
+  check "state root holds pki, etcd and VERSION" bash -c \
+    "test -f '${CP_STATE_DIR}/pki/ca.crt' && test -d '${CP_STATE_DIR}/etcd/member' && grep -q '^kubernetes=v' '${CP_STATE_DIR}/VERSION'"
+  check "state root is private (0700)" bash -c "test \"\$(stat -c %a '${CP_STATE_DIR}')\" = 700"
   check "etcd healthy" env ETCDCTL_API=3 "$BIN/etcdctl" \
     --endpoints "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" endpoint health
   check "apiserver /readyz" "${k[@]}" get --raw=/readyz
@@ -316,8 +321,8 @@ down() {
 
 clean() {
   down
-  rm -rf "${HOME_DIR}" "${NATIVE_WORK}/etcd"
-  say "removed ${HOME_DIR} and ${NATIVE_WORK}/etcd (binaries in ${BIN} kept)"
+  rm -rf "${HOME_DIR}" "${NATIVE_WORK}/state" "${NATIVE_WORK}/etcd"
+  say "removed ${HOME_DIR} and ${NATIVE_WORK}/state (binaries in ${BIN} kept)"
 }
 
 case "${1:-up}" in

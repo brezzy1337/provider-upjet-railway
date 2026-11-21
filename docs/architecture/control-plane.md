@@ -28,7 +28,7 @@ processes:
 
 | Process                   | Role                                                                 |
 |---------------------------|----------------------------------------------------------------------|
-| `etcd`                    | State, on a Railway volume                                           |
+| `etcd`                    | State, under the one persistent state root (`CP_STATE_DIR`: etcd data, PKI, `VERSION`) on the Railway volume |
 | `kube-apiserver`          | The API, serving its own TLS end-to-end                              |
 | `kube-controller-manager` | Only node-independent controllers: garbage collector, namespace, service accounts, resource quota, TTL |
 | `crossplane core`         | XRDs and Compositions, started with `--package-runtime=External`    |
