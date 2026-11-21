@@ -2,6 +2,15 @@
 
 _Last updated 2026-11-21._
 
+## End goal
+
+A Crossplane control plane hosted on Railway provisions Kubernetes clusters on DigitalOcean (then
+AWS and GCP). Inside those clusters will run [Hermes](https://hermes-agent.nousresearch.com) AI agent
+instances, to be reached from the user's Railway-hosted application over the cluster's ingress.
+Nothing of that is built yet. Hermes is a Kubernetes workload, not a Railway service, so this provider's job is the Railway side only:
+the control-plane service itself and the user application. See
+[Architecture](architecture/control-plane.md).
+
 ## Where things stand
 
 | Area | Status |
@@ -13,12 +22,14 @@ _Last updated 2026-11-21._
 | Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Re-verified on that code with the native harness; results and the review findings are in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 not started. |
 | Package publishing | No xpkg or image has been pushed to a registry yet. CI workflows exist from the Upjet template but have not been exercised for a release. |
 
-## Decisions pending
+## Decisions
 
-1. **0.6.2 + patch, or 0.6.3 + rebased patch.** 0.6.3 reshapes `railway_service` (build and deploy
-   settings, updatable regions) and adds `target_port` to `railway_service_domain`. Moving means
-   rebasing `hack/upstream/0001-*.patch`, regenerating, and re-reviewing the `Service` schema. Staying
-   costs nothing today but widens the gap.
+1. **0.6.2 + patch, or 0.6.3 + rebased patch.** Resolved for Phase 2 (2026-11-21): stay on 0.6.2 +
+   patch. 0.6.3 reshapes `railway_service` (adds `start_command`, health check, restart policy, build
+   settings, updatable regions) and adds `target_port` to `railway_service_domain`; none of that is
+   needed to host the control plane (image, volume, TCP proxy, env vars). Revisit when a Railway
+   service needs those fields or when upstream merges the not-found fix. Moving means rebasing
+   `hack/upstream/0001-*.patch`, regenerating, and re-reviewing the `Service` schema.
 2. Railway plan and sizing for the control-plane service (2–4 GB RAM plus a volume) and which
    workspace hosts it.
 3. Registry for the xpkg and control-plane image (ghcr.io assumed).
@@ -33,7 +44,8 @@ _Last updated 2026-11-21._
 
 A single container running etcd, kube-apiserver, kube-controller-manager (node-independent
 controllers only), Crossplane core and this provider as supervised processes. Proven natively,
-16/16 checks, including restart on persisted etcd data; re-verified on `main` 2026-11-21.
+17 checks (16 before the namespaced-CRD count was added), including restart on persisted etcd
+data; re-verified on `main` 2026-11-21.
 `hack/native-cluster.sh` is also the way to run the full stack in an environment without Docker,
 such as the current codespace. The [Phase 1 review](architecture/phase-1-review.md) records what
 was verified, what the review found, and what Phase 2 must fix before deploying (B1 to B5: PKI on
@@ -51,8 +63,10 @@ with this provider once it exists.
 
 Add the DigitalOcean provider as another supervised process, write a `KubernetesCluster` XRD with a
 DOKS Composition, provision a real cluster, read its kubeconfig back as a connection secret. Then
-EKS and GKE as additional Composition variants using the family providers. Open problem: Compositions
-need a Function, which is a gRPC server that must serve a certificate signed by Crossplane's root CA.
+EKS and GKE as additional Composition variants using the family providers. Then a `HermesAgent` XRD
+that composes a Hermes instance onto a provisioned cluster via provider-kubernetes or provider-helm.
+Open problem: Compositions need a Function, which is a gRPC server that must serve a certificate
+signed by Crossplane's root CA.
 
 ## Provider backlog
 
