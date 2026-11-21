@@ -31,7 +31,7 @@ and `hack/dev-cluster.sh` cannot run. Use `hack/native-cluster.sh` instead: it r
 kube-apiserver, Crossplane core and this provider as unprivileged bare processes and needs Go,
 curl, git, tar, unzip, openssl, `ip` (iproute2) and GNU coreutils. `build` fetches the pinned
 binaries and compiles Crossplane core (several minutes), `up` boots the plane in the foreground
-(about 15 s), `verify` runs the 16 assertions against it, `down` stops it, `clean` also removes
+(about 15 s), `verify` runs the 17 assertions against it, `down` stops it, `clean` also removes
 the state while keeping the binaries. On this codespace the full cycle was run on 2026-11-21.
 
 Pinned versions. These are read from the `Makefile`; the control-plane image and native harness

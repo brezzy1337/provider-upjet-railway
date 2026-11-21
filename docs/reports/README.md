@@ -5,14 +5,15 @@ was verified, what was decided, and what was left open, so the project's history
 rather than from Slack threads or git archaeology.
 
 Reports complement, not replace, the other pages: [Roadmap and status](../roadmap.md) is the
-current truth and gets edited in place; a report is a dated record and is not edited after the
-session beyond fixing errors. Design reviews that outlive a session, such as the
+current truth and gets edited in place; a report is a dated record whose existing text is not
+rewritten afterwards except to fix errors. Design reviews that outlive a session, such as the
 [Phase 1 review](../architecture/phase-1-review.md), live under Architecture and are linked from the
 report that produced them.
 
 ## Conventions
 
-- File name `YYYY-MM-DD.md`, one per day worked; a second session on the same day appends to it.
+- File name `YYYY-MM-DD.md`, one per day worked; a second session on the same day appends a new
+  dated section. A report may cover the preceding days when they had no report of their own.
 - Sections, in order: **Summary**, **Shipped** (PRs with merge commits), **Verified** (what was
   actually run and the result), **Decided**, **Found** (problems discovered, fixed or not),
   **Open** (what the next session should pick up).

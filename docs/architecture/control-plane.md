@@ -6,7 +6,7 @@ cloud-agnostic `KubernetesCluster` claim; a Composition picks the DOKS, EKS or G
 new cluster's kubeconfig comes back as a Crossplane connection secret. The workloads those clusters
 exist for are [Hermes](https://hermes-agent.nousresearch.com) AI agent instances (one long-running
 gateway process per agent, persistent volume, a model-provider key and channel tokens as Secrets,
-roughly 4 GB and 2 CPUs each), reached from the user's Railway-hosted application. A later
+expected to need roughly 4 GB and 2 CPUs each per the Hermes Docker guidance), reached from the user's Railway-hosted application. A later
 `HermesAgent` XRD will compose them onto a provisioned cluster through provider-kubernetes or
 provider-helm; it depends on the same composition-function work as the cluster XRD.
 
