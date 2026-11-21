@@ -1,0 +1,7 @@
+# GitBook Git Sync, space level: how GitBook reads the content of this directory.
+# The site-level mapping that points GitBook at this directory is ../gitbook-docs.yaml.
+root: ./
+
+structure:
+  readme: README.md
+  summary: SUMMARY.md
