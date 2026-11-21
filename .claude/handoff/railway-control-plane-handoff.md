@@ -1,4 +1,9 @@
- railway login# Handoff — Railway-hosted Crossplane control plane
+# Handoff — Railway-hosted Crossplane control plane
+
+> **Correction (2026-11-20):** the extraction to a separate control-plane repository described below
+> never happened. The Phase 1 code (`cluster/images/control-plane/`, `hack/native-cluster.sh`) is live
+> on branch `phase-1/control-plane-image` of this repo, not "historical". Current status is in
+> `docs/roadmap.md`; the rest of this file is kept as the 2026-08 record.
 
 **Written:** 2026-08-25, for a fresh Claude Code session working in this repo
 (`brezzy1337/provider-upjet-railway`, branch `main`).
