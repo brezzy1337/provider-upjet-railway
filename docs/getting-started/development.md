@@ -22,7 +22,7 @@ git submodule update --init --recursive
 go install golang.org/x/tools/cmd/goimports   # make generate shells out to it and fails mid-run without it
 ```
 
-A shallow clone with an empty `build/` directory needs that last line before any `make` target
+A shallow clone with an empty `build/` directory needs the submodule line before any `make` target
 works, and `git fetch --unshallow` before `/ship` can compare branches.
 
 **Without Docker** (no `/var/run/docker.sock`, as in a codespace built from a plain image), kind
