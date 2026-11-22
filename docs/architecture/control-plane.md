@@ -83,10 +83,15 @@ CA, service-account signing key, front-proxy CA, admin client cert and bearer to
 Keeping only etcd persistent, as Phase 1 did, meant every redeploy minted a new CA against old data
 and invalidated every kubeconfig ever issued (finding B1 of the [Phase 1 review](phase-1-review.md)).
 
+Ownership first: Railway mounts volumes root-owned, so the image starts as root (no `USER`), and
+the supervisor's very first step chowns the state root and the ephemeral directories to `CP_RUN_UID`
+(default 65532; recursive only when the owner differs, so a healthy boot costs one `stat`), then
+re-execs itself through `su-exec` as that uid with the same environment. Everything after that line,
+etcd and the API server included, runs unprivileged. `CP_STAY_ROOT=true` opts out, with a warning.
+
 Guards at boot, in order: the root must not be `CP_HOME` or contain the ephemeral `log/`, `run/` or
-`cache/`; it must be writable (Railway mounts volumes root-owned, so chown it to 65532 or, interim
-until B2, run with `RAILWAY_RUN_UID=0`); it is forced to mode 0700 and everything the supervisor
-writes uses `umask 077`; with `CP_REQUIRE_PERSISTENT=true` (set in the image) a root on the same
+`cache/`; it must be writable by the running uid; it is forced to mode 0700 and everything the
+supervisor writes uses `umask 077`; with `CP_REQUIRE_PERSISTENT=true` (set in the image) a root on the same
 filesystem as `CP_HOME`, meaning no volume is mounted, fails the boot; etcd data without the PKI that
 signed it is refused rather than overwritten with a new CA.
 

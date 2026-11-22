@@ -52,6 +52,13 @@ CP_ALLOW_DOWNGRADE="${CP_ALLOW_DOWNGRADE:-false}"
 # CP_HOME, i.e. no volume is mounted there. The image sets this; the native
 # harness, which has no mount, leaves it unset and gets an informational line.
 CP_REQUIRE_PERSISTENT="${CP_REQUIRE_PERSISTENT:-false}"
+# The image starts as root so it can take ownership of a platform-mounted,
+# root-owned volume, then re-execs itself as this uid:gid via su-exec before
+# anything else runs. Nothing below this block ever runs as root unless
+# CP_STAY_ROOT=true is set deliberately.
+CP_RUN_UID="${CP_RUN_UID:-65532}"
+CP_RUN_GID="${CP_RUN_GID:-${CP_RUN_UID}}"
+CP_STAY_ROOT="${CP_STAY_ROOT:-false}"
 CP_KCM_PORT="${CP_KCM_PORT:-10257}"   # kube-controller-manager secure/health port, loopback only
 CP_ETCD_CLIENT_PORT="${CP_ETCD_CLIENT_PORT:-2379}"
 CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-2380}"
@@ -189,6 +196,39 @@ shutdown() {
 kc() { "${CP_BIN_DIR}/kubectl" --kubeconfig "${KUBECONFIG_INTERNAL}" "$@"; }
 
 # ------------------------------------------------------------------------------
+# Step -2: root only long enough to own the volume (B2)
+#
+# Railway mounts volumes root-owned. A container that starts unprivileged can
+# never fix that, so the image starts as root, chowns the state root and the
+# ephemeral dirs to CP_RUN_UID, and re-execs this same script as that uid with
+# the same arguments and environment. The whole control plane then runs
+# unprivileged. The chown is recursive only when the state root is not already
+# owned by the target uid (an interim root-run deployment leaves root-owned
+# pki/ and etcd/ behind; a healthy one costs a single stat).
+# ------------------------------------------------------------------------------
+drop_privileges_if_root() {
+  [ "$(id -u)" = "0" ] || return 0
+  if [ "${CP_STAY_ROOT}" = "true" ]; then
+    log "WARNING: running the control plane as root because CP_STAY_ROOT=true"
+    return 0
+  fi
+  command -v su-exec >/dev/null 2>&1 \
+    || fail "running as root but su-exec is not installed (apk add su-exec); set CP_STAY_ROOT=true only if you accept running everything as root"
+  log "started as root: taking ownership of ${CP_STATE_DIR} and ${CP_HOME} for ${CP_RUN_UID}:${CP_RUN_GID}, then dropping privileges"
+  mkdir -p "${CP_STATE_DIR}" "${CP_HOME}" "${CP_LOG_DIR}" "${CP_RUN_DIR}" "${CP_HOME}/cache" "${CP_HOME}/tf"
+  local d
+  for d in "${CP_STATE_DIR}" "${CP_HOME}" /terraform; do
+    [ -d "$d" ] || continue
+    if [ "$(stat -c %u "$d")" != "${CP_RUN_UID}" ] || [ "${CP_FORCE_CHOWN:-false}" = "true" ]; then
+      log "chown -R ${CP_RUN_UID}:${CP_RUN_GID} $d"
+      chown -R "${CP_RUN_UID}:${CP_RUN_GID}" "$d"
+    fi
+  done
+  chmod 700 "${CP_STATE_DIR}"
+  exec su-exec "${CP_RUN_UID}:${CP_RUN_GID}" env HOME="${CP_HOME}" "$0" "$@"
+}
+
+# ------------------------------------------------------------------------------
 # Step -1: the state root
 #
 # Create or adopt $CP_STATE_DIR, refuse to run if it is not writable, warn if
@@ -226,7 +266,7 @@ prepare_state_dir() {
 
   mkdir -p "${CP_STATE_DIR}" 2>/dev/null || true
   [ -d "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} does not exist and cannot be created"
-  [ -w "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} is not writable by uid $(id -u). The platform mounted it root-owned: chown the mount to $(id -u), or (interim, until B2 lands) run with RAILWAY_RUN_UID=0"
+  [ -w "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} is not writable by uid $(id -u). Start the container as root (the image default) so the supervisor can chown the mount and drop to CP_RUN_UID, or chown it to $(id -u) yourself"
   chmod 700 "${CP_STATE_DIR}" 2>/dev/null || true
   [ "$(stat -c %a "${CP_STATE_DIR}")" = "700" ] || fail "state dir ${CP_STATE_DIR} is mode $(stat -c %a "${CP_STATE_DIR}"), not 700, and chmod failed (owner uid $(stat -c %u "${CP_STATE_DIR}"), we are $(id -u))"
   mkdir -p "${CP_PKI_DIR}" "${CP_ETCD_DATA_DIR}"
@@ -859,6 +899,7 @@ start_provider() {
 # Boot
 # ------------------------------------------------------------------------------
 main() {
+  drop_privileges_if_root "$@"
   mkdir -p "${CP_HOME}" "${CP_LOG_DIR}" "${CP_RUN_DIR}" "${CP_HOME}/cache"
   # Separate handlers so a platform stop exits 143/130; the EXIT trap then runs
   # shutdown with that status instead of whatever command happened to be running.

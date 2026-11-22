@@ -30,4 +30,5 @@
 ## Development reports
 
 * [Development reports](reports/README.md)
+  * [2026-11-22](reports/2026-11-22.md)
   * [2026-11-21](reports/2026-11-21.md)

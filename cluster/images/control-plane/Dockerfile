@@ -131,7 +131,9 @@ ARG TERRAFORM_NATIVE_PROVIDER_BINARY
 # bash: the supervisor uses arrays and process substitution.
 # openssl: PKI bootstrap. curl: readiness probes. iproute2: address discovery.
 # coreutils: GNU base64/hostname semantics the supervisor relies on.
-RUN apk add --no-cache bash ca-certificates curl openssl iproute2 coreutils tzdata
+# su-exec: start as root to own the volume, then drop to CP_RUN_UID (see
+# control-plane.sh, Step -2).
+RUN apk add --no-cache bash ca-certificates curl openssl iproute2 coreutils tzdata su-exec
 
 ENV USER_ID=65532
 
@@ -163,10 +165,12 @@ COPY --from=crossplane-build /out/webhookconfigurations/ ${CP_HOME}/crds/webhook
 # CP_STATE_DIR is the one persistent mount (etcd, PKI, VERSION); the why and
 # the guards are documented at CP_STATE_DIR in control-plane.sh. Mount the
 # platform volume exactly here. CP_REQUIRE_PERSISTENT makes a forgotten mount
-# fail the boot. Railway mounts volumes root-owned: chown the mount to
-# ${USER_ID}, or, interim until B2 lands, run with RAILWAY_RUN_UID=0.
+# fail the boot. The container starts as root (no USER below) purely so the
+# supervisor can chown a root-owned platform volume to CP_RUN_UID before it
+# re-execs itself unprivileged.
 ENV CP_STATE_DIR=${CP_HOME}/state
 ENV CP_REQUIRE_PERSISTENT=true
+ENV CP_RUN_UID=${USER_ID}
 RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/cache ${CP_HOME}/tf ${CP_STATE_DIR} \
     && chmod +x /usr/local/bin/control-plane.sh \
     && chmod 700 ${CP_STATE_DIR} \
@@ -174,7 +178,8 @@ RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/cache ${CP_HOME}/tf ${CP_S
 
 VOLUME ${CP_STATE_DIR}
 
-USER ${USER_ID}
+# Deliberately no USER: control-plane.sh drops to CP_RUN_UID itself after the
+# volume chown. Set CP_STAY_ROOT=true to opt out (not recommended).
 
 # 6443 kube-apiserver (put a Railway *TCP* proxy in front: HTTP domains
 #      terminate TLS at the edge and this API server serves its own TLS).

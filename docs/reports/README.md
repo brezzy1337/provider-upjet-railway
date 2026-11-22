@@ -26,4 +26,5 @@ report that produced them.
 
 | Date | Summary |
 |------|---------|
+| [2026-11-22](2026-11-22.md) | Phase 2 B2: start as root to own the volume, then drop privileges via `su-exec` |
 | [2026-11-21](2026-11-21.md) | Toolchain restored, GitBook docs live, `/ship` pipeline in use, Phase 1 control plane merged and reviewed; session 2: Phase 2 B1, one persistent state root |
