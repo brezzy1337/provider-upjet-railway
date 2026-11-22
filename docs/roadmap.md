@@ -19,7 +19,7 @@ the control-plane service itself and the user application. See
 | Build and unit tests | Passed 2026-11-20 on Go 1.26.11: `go build`, `go test`, `golangci-lint` with 0 issues. The patched Terraform provider builds from `hack/upstream/` and its tests pass. |
 | Live verification | `Project` create → visible in Railway → delete → gone, via kind + Crossplane 2.2.1 + the provider out-of-cluster (2026-08-25, repeated through the native control plane 2026-08-26). No other kind has been exercised live. |
 | Upstream dependency | Blocked on [PR #93](https://github.com/terraform-community-providers/terraform-provider-railway/pull/93) (open, no activity since 2026-08-25). Upstream shipped 0.6.3 on 2026-10-19 **without** the fix. We build from a patch; see [The not-found patch](upstream/not-found-patch.md). |
-| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Re-verified on that code with the native harness; results and the review findings are in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 not started. |
+| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 started 2026-11-21 with B1 (PR #5); see Phase 2 below for what remains. |
 | Package publishing | No xpkg or image has been pushed to a registry yet. CI workflows exist from the Upjet template but have not been exercised for a release. |
 
 ## Decisions
@@ -44,8 +44,8 @@ the control-plane service itself and the user application. See
 
 A single container running etcd, kube-apiserver, kube-controller-manager (node-independent
 controllers only), Crossplane core and this provider as supervised processes. Proven natively,
-17 checks (16 before the namespaced-CRD count was added), including restart on persisted etcd
-data; re-verified on `main` 2026-11-21.
+17 checks at the time (16 before the namespaced-CRD count, 21 after B1 added state-root and
+identity checks), including restart on persisted etcd data; re-verified on `main` 2026-11-21.
 `hack/native-cluster.sh` is also the way to run the full stack in an environment without Docker,
 such as the current codespace. The [Phase 1 review](architecture/phase-1-review.md) records what
 was verified, what the review found, and what Phase 2 must fix before deploying (B1 to B5: PKI on
@@ -53,11 +53,13 @@ the volume, volume ownership, secrets encryption and audit, token handling, etcd
 
 ### Phase 2: deploy to Railway. Next
 
-Service from the image, one volume holding a single state root (etcd data, PKI, cache; see B1 in
-the Phase 1 review), TCP proxy on 6443, env vars for the Railway token and API-server credential
-material. First spike: a composition function as a supervised process, since every XRD depends on
-it. Done when the `Project` smoke test passes over the internet. Consider provisioning the service
-with this provider once it exists.
+Service from the image, one volume mounted at `CP_STATE_DIR` (etcd data, PKI and `VERSION` stamp;
+B1, done 2026-11-21 in PR #5), TCP proxy on 6443, env vars for the Railway token and API-server credential
+material. Still to do before the first deploy: B2 volume ownership (start as root, chown, drop
+privileges), B3 secrets encryption, audit log and shorter credentials, B4 token handling, B5 etcd
+quota and memory limits. First spike after that: a composition function as a supervised process,
+since every XRD depends on it. Done when the `Project` smoke test passes over the internet.
+Consider provisioning the service with this provider once it exists.
 
 ### Phase 3: first cloud, DigitalOcean
 

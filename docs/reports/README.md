@@ -19,9 +19,11 @@ report that produced them.
   **Open** (what the next session should pick up).
 - Facts only: numbers come from a run, not from memory; anything not run is listed as not verified.
 - Add the new report to `SUMMARY.md` under this section, newest first.
+- A PR that carries the report itself cannot know its own merge commit; write "this PR" in the
+  Merge column and let the next session fill in the SHA.
 
 ## Reports
 
 | Date | Summary |
 |------|---------|
-| [2026-11-21](2026-11-21.md) | Toolchain restored, GitBook docs live, `/ship` pipeline in use, Phase 1 control plane merged and reviewed |
+| [2026-11-21](2026-11-21.md) | Toolchain restored, GitBook docs live, `/ship` pipeline in use, Phase 1 control plane merged and reviewed; session 2: Phase 2 B1, one persistent state root |

@@ -19,7 +19,8 @@ ROOT        := $(shell git -C $(CURDIR) rev-parse --show-toplevel)
 DOCKERFILE  := cluster/images/control-plane/Dockerfile
 
 # Container-side paths/ports, kept here so `run` matches the Dockerfile.
-ETCD_DATA_DIR ?= /var/lib/etcd
+# The one volume: etcd + pki + VERSION. Must match ENV CP_STATE_DIR in the Dockerfile.
+STATE_DIR ?= /var/lib/control-plane/state
 APISERVER_PORT ?= 6443
 KUBECONFIG_OUT ?= $(ROOT)/.work/control-plane.kubeconfig
 
@@ -28,11 +29,11 @@ KUBECONFIG_OUT ?= $(ROOT)/.work/control-plane.kubeconfig
 help:
 	@echo "build           build $(IMAGE):$(TAG) for $(PLATFORM)"
 	@echo "build-multiarch build+push linux/amd64,linux/arm64 (needs REGISTRY)"
-	@echo "run             run it with a named volume for etcd, publishing $(APISERVER_PORT)"
+	@echo "run             run it with a named volume at $(STATE_DIR), publishing $(APISERVER_PORT)"
 	@echo "kubeconfig      copy the generated kubeconfig out of a running container"
 	@echo "shell           interactive shell in the image"
 	@echo "push            push $(REGISTRY)/$(IMAGE):$(TAG)"
-	@echo "clean           remove the image and its etcd volume"
+	@echo "clean           remove the image and its state volume"
 
 build:
 	docker build --platform $(PLATFORM) -f $(DOCKERFILE) -t $(IMAGE):$(TAG) $(ROOT)
@@ -48,7 +49,7 @@ build-multiarch:
 run:
 	docker run --rm -it --name $(IMAGE) \
 		-p $(APISERVER_PORT):$(APISERVER_PORT) \
-		-v $(IMAGE)-etcd:$(ETCD_DATA_DIR) \
+		-v $(IMAGE)-state:$(STATE_DIR) \
 		-e RAILWAY_TOKEN \
 		-e CP_APISERVER_CERT_SANS \
 		-e CP_EXTERNAL_URL \
@@ -72,4 +73,4 @@ push:
 
 clean:
 	-docker rmi $(IMAGE):$(TAG)
-	-docker volume rm $(IMAGE)-etcd
+	-docker volume rm $(IMAGE)-state

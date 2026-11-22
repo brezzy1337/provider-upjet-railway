@@ -160,20 +160,19 @@ COPY --from=crossplane-build /out/crds/                 ${CP_HOME}/crds/crosspla
 COPY --from=crossplane-build /out/webhookconfigurations/ ${CP_HOME}/crds/webhookconfigurations/
 
 # ---- writable state ---------------------------------------------------------
-# CP_ETCD_DATA_DIR is the mount point for the persistent volume. Railway mounts
-# volumes root-owned, and this image runs as an unprivileged USER, so a chown
-# from the start command cannot work. Until the Phase 2 fix (start as root,
-# chown the state root, drop privileges) lands, run with RAILWAY_RUN_UID=0; the
-# supervisor fails loudly if it cannot write.
-# NOTE: only etcd is on the volume. ${CP_HOME}/pki (cluster CA, SA key, admin
-# credentials) is ephemeral, so a redeploy regenerates it; see the Phase 1
-# review in docs/architecture for the planned fix.
-ENV CP_ETCD_DATA_DIR=/var/lib/etcd
-RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/pki ${CP_HOME}/cache ${CP_HOME}/tf ${CP_ETCD_DATA_DIR} \
+# CP_STATE_DIR is the one persistent mount (etcd, PKI, VERSION); the why and
+# the guards are documented at CP_STATE_DIR in control-plane.sh. Mount the
+# platform volume exactly here. CP_REQUIRE_PERSISTENT makes a forgotten mount
+# fail the boot. Railway mounts volumes root-owned: chown the mount to
+# ${USER_ID}, or, interim until B2 lands, run with RAILWAY_RUN_UID=0.
+ENV CP_STATE_DIR=${CP_HOME}/state
+ENV CP_REQUIRE_PERSISTENT=true
+RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/cache ${CP_HOME}/tf ${CP_STATE_DIR} \
     && chmod +x /usr/local/bin/control-plane.sh \
-    && chown -R ${USER_ID}:${USER_ID} ${CP_HOME} ${CP_ETCD_DATA_DIR} /terraform
+    && chmod 700 ${CP_STATE_DIR} \
+    && chown -R ${USER_ID}:${USER_ID} ${CP_HOME} /terraform
 
-VOLUME ${CP_ETCD_DATA_DIR}
+VOLUME ${CP_STATE_DIR}
 
 USER ${USER_ID}
 

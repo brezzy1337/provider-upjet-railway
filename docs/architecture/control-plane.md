@@ -28,7 +28,7 @@ processes:
 
 | Process                   | Role                                                                 |
 |---------------------------|----------------------------------------------------------------------|
-| `etcd`                    | State, on a Railway volume                                           |
+| `etcd`                    | State, on the Railway volume under `CP_STATE_DIR` (see below)        |
 | `kube-apiserver`          | The API, serving its own TLS end-to-end                              |
 | `kube-controller-manager` | Only node-independent controllers: garbage collector, namespace, service accounts, resource quota, TTL |
 | `crossplane core`         | XRDs and Compositions, started with `--package-runtime=External`    |
@@ -74,3 +74,35 @@ Lessons that changed the design, in brief (the full list is in
 
 See the [roadmap](../roadmap.md). Phase 1 is done; Phase 2 (deploy to Railway, smoke test over the
 internet) is next; Phase 3 adds DigitalOcean, then EKS and GKE.
+
+## The state root
+
+Everything that must survive a redeploy lives under one directory, `CP_STATE_DIR` (default
+`/var/lib/control-plane/state`), which is the single volume mount: `etcd/` (the data), `pki/` (cluster
+CA, service-account signing key, front-proxy CA, admin client cert and bearer token) and `VERSION`.
+Keeping only etcd persistent, as Phase 1 did, meant every redeploy minted a new CA against old data
+and invalidated every kubeconfig ever issued (finding B1 of the [Phase 1 review](phase-1-review.md)).
+
+Guards at boot, in order: the root must not be `CP_HOME` or contain the ephemeral `log/`, `run/` or
+`cache/`; it must be writable (Railway mounts volumes root-owned, so chown it to 65532 or, interim
+until B2, run with `RAILWAY_RUN_UID=0`); it is forced to mode 0700 and everything the supervisor
+writes uses `umask 077`; with `CP_REQUIRE_PERSISTENT=true` (set in the image) a root on the same
+filesystem as `CP_HOME`, meaning no volume is mounted, fails the boot; etcd data without the PKI that
+signed it is refused rather than overwritten with a new CA.
+
+`VERSION` is a high-water mark of the etcd and Kubernetes versions that have written the state. An
+image older than the mark refuses to start; `CP_ALLOW_DOWNGRADE=true` lets one boot through with a
+warning and leaves the mark unchanged. Pre-release suffixes are ignored in the comparison. Crossplane
+keeps no local state (everything is in etcd), so it is not stamped; adding it is open.
+
+Kubeconfigs, the Crossplane TLS material unpacked from its Secret, logs and caches (`xpkg`, `xfn`,
+Terraform plugins) are derived or re-fetched every boot and stay on the ephemeral filesystem, so a
+change of external URL or SAN needs no state migration and volume snapshots stay small.
+
+The admin bearer token is persisted with the PKI. Setting `CP_ADMIN_TOKEN` (at least 32 characters of
+`[A-Za-z0-9._-]`) rotates it on the next boot; removing the variable keeps the stored token. The
+value is never logged unless `CP_LOG_ADMIN_TOKEN=true`.
+
+There is no migration from Phase 1 layouts: a volume at the old `/var/lib/etcd` is not adopted. No
+Railway deployment existed before this change.
+
