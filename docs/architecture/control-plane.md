@@ -79,7 +79,8 @@ internet) is next; Phase 3 adds DigitalOcean, then EKS and GKE.
 
 Everything that must survive a redeploy lives under one directory, `CP_STATE_DIR` (default
 `/var/lib/control-plane/state`), which is the single volume mount: `etcd/` (the data), `pki/` (cluster
-CA, service-account signing key, front-proxy CA, admin client cert and bearer token) and `VERSION`.
+CA, service-account signing key, front-proxy CA, client certs and, when enabled, the bearer token) and
+`VERSION`.
 Keeping only etcd persistent, as Phase 1 did, meant every redeploy minted a new CA against old data
 and invalidated every kubeconfig ever issued (finding B1 of the [Phase 1 review](phase-1-review.md)).
 
@@ -109,7 +110,7 @@ Kubeconfigs, the Crossplane TLS material unpacked from its Secret, logs and cach
 Terraform plugins) are derived or re-fetched every boot and stay on the ephemeral filesystem, so a
 change of external URL or SAN needs no state migration and volume snapshots stay small.
 
-The admin bearer token is persisted with the PKI. Setting `CP_ADMIN_TOKEN` (at least 32 characters of
+When `CP_ADMIN_TOKEN_ENABLED=true`, the admin bearer token is persisted with the PKI. Setting `CP_ADMIN_TOKEN` (at least 32 characters of
 `[A-Za-z0-9._-]`) rotates it on the next boot; removing the variable keeps the stored token. The
 value is never logged unless `CP_LOG_ADMIN_TOKEN=true`.
 
@@ -123,7 +124,9 @@ Railway deployment existed before this change.
 from the platform's secret store; the image sets `CP_REQUIRE_EXTERNAL_KEY=true`, so a missing key
 fails the boot there, while the native harness generates one under `pki/` with a warning. The key
 itself never touches the volume when supplied externally: the EncryptionConfiguration is written
-under `run/` each boot. A fingerprint of the key in use is stamped at `state/ENCRYPTION`; a boot with
+under `run/` each boot, and the key is removed from the supervisor's environment before any
+component starts, so no child process inherits it. A key that is not exactly the base64 of 32 bytes
+is refused. A fingerprint of the key in use is stamped at `state/ENCRYPTION`; a boot with
 a different key is refused unless the previous key is passed as `CP_ENCRYPTION_KEY_PREVIOUS`, in which
 case the supervisor re-encrypts every Secret under the new key after the API server is up and moves
 the stamp. First enablement follows the same path, so Secrets written before encryption was on are
@@ -132,22 +135,35 @@ etcd is plaintext, as in any Kubernetes cluster.
 
 **Audit.** With `CP_AUDIT_ENABLED` (default on) the API server writes a JSON audit log to
 `CP_AUDIT_LOG_PATH` (default `log/audit.log`, rotated at 20 MB, three backups, seven days). The
-policy records every write and every access to a Secret at `Metadata` level (who, what, when, never
-the body); reads of other resources and the health, discovery and metrics endpoints are not logged,
-since the controllers watch constantly. The log lives on the ephemeral filesystem; shipping it out is
-part of D6.
+policy records every write and every human access to a Secret at `Metadata` level (who, what, when,
+never the body). Reads of Secrets by the in-container identities (`control-plane-internal`,
+`system:kube-controller-manager`) are excluded, since the controllers read them on every reconcile
+and would drown the log; reads of other resources and the health, discovery and metrics endpoints are
+not logged either. Failed authentication is never audited by the API server. The log lives on the
+ephemeral filesystem and is lost on redeploy; `CP_AUDIT_LOG_PATH=-` sends it to the API server's
+stdout instead for a platform log drain to keep (D6).
 
-**Credential lifetimes.** The admin and controller-manager client certificates are valid for
-`CP_CLIENT_CERT_DAYS` (default 90) and are reissued at boot once less than half that remains, so a
-kubeconfig handed to a person lives at most 90 days and is renewed transparently by a restart after
-the midpoint. The API server's serving certificate is valid for `CP_SERVING_CERT_DAYS` (default 365)
-and is reissued when its SAN set changes or within 30 days of expiry. The two CAs stay long-lived.
-`CP_TLS_MIN_VERSION` defaults to TLS 1.2.
+**Credential lifetimes.** Two kinds of client certificate exist. The `admin` certificate is the one
+in the exported kubeconfig: valid `CP_CLIENT_CERT_DAYS` (default 90), reissued at boot once less than
+half that remains or if it outlives the policy, so a kubeconfig handed to a person expires within 90
+days and a restart past the midpoint hands out a renewed one. The in-container clients (the
+supervisor, Crossplane, the provider, the controller manager) use separate `admin-internal` and
+`controller-manager` certificates that are minted fresh on every boot with a long lifetime
+(`CP_INTERNAL_CERT_DAYS`) and never leave the container, so a long-running container cannot lose its
+own credentials. An hourly watchdog restarts the container if any in-container certificate or the
+serving certificate has under seven days left. The serving certificate is valid
+`CP_SERVING_CERT_DAYS` (default 365) and is reissued when its SAN set changes or within 30 days of
+expiry. The two CAs stay long-lived. `CP_TLS_MIN_VERSION` defaults to TLS 1.2.
+
+Two limits to be plain about. Nothing revokes a certificate: a kubeconfig issued before this change,
+or one that leaks, stays valid until its own expiry against the same CA, and rotating the CA is the
+only revocation. And `ca.key` lives on the volume next to the data, so whoever holds the volume can
+mint any credential; the 90-day limit protects against a leaked kubeconfig, not a leaked volume.
 
 **Bearer token.** The static admin token is a cluster-admin credential with no expiry and no
-revocation path, so `CP_ADMIN_TOKEN_ENABLED` is `false` in the image and the token kubeconfig is not
-written there. The native harness keeps it on. When on, the token file is passed to the API server
-and `CP_ADMIN_TOKEN` rotates it as described above.
+revocation path, so `CP_ADMIN_TOKEN_ENABLED` is `false` in the image: no token file is passed to the
+API server, no token kubeconfig is written, and a token file left by an earlier boot is removed. The
+native harness keeps it on. When on, `CP_ADMIN_TOKEN` rotates it as described above.
 
 Still open from B3: etcd listens on loopback without client authentication, so any process in the
 container can read and write etcd directly. Client certificates for etcd, or a Unix socket, are the

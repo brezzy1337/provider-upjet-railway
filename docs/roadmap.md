@@ -55,10 +55,10 @@ the volume, volume ownership, secrets encryption and audit, token handling, etcd
 
 Service from the image, one volume mounted at `CP_STATE_DIR` (etcd data, PKI and `VERSION` stamp;
 B1, done 2026-11-21 in PR #5; ownership of that volume handled by the image itself, B2, done
-2026-11-22 in PR #6), Secrets encrypted at rest with the key supplied from Railway's secret store,
-an audit log and 90-day client certificates (B3, done 2026-11-22 in PR #7), TCP proxy on 6443, env
-vars for the Railway token and API-server credential material. Still to do before the first deploy:
-B4 token handling, B5 etcd quota and memory limits; etcd client authentication is the B3 leftover. First spike after that: a composition function as a supervised process,
+2026-11-22 in PR #6; Secrets at rest, audit and credential lifetimes, B3, done 2026-11-22 in PR #7),
+TCP proxy on 6443, env vars for the Railway token, `CP_ENCRYPTION_KEY` and API-server credential
+material. Still to do before the first deploy: B4 token handling, B5 etcd quota and memory limits;
+etcd client authentication is the B3 leftover. First spike after that: a composition function as a supervised process,
 since every XRD depends on it. Done when the `Project` smoke test passes over the internet.
 Consider provisioning the service with this provider once it exists.
 

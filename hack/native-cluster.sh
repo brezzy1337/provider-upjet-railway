@@ -193,6 +193,10 @@ export_env() {
   # not traverse the repository) unless the caller chose otherwise.
   # The gid comes from that user's primary group, not from the directory: a
   # codespace checkout is often user:root, and the supervisor refuses gid 0.
+  # Mirror the supervisor's defaults so verify reads the same values it did.
+  export CP_LOG_DIR="${CP_LOG_DIR:-${HOME_DIR}/log}"
+  export CP_AUDIT_LOG_PATH="${CP_AUDIT_LOG_PATH:-${CP_LOG_DIR}/audit.log}"
+  export CP_CLIENT_CERT_DAYS="${CP_CLIENT_CERT_DAYS:-90}"
   export CP_RUN_UID="${CP_RUN_UID:-$(stat -c %u "${REPO}")}"
   export CP_RUN_GID="${CP_RUN_GID:-$(id -g "${CP_RUN_UID}" 2>/dev/null || printf '%s' "${CP_RUN_UID}")}"
   export CP_CRD_DIRS="${HOME_DIR}/crds/railway"
@@ -321,21 +325,27 @@ verify() {
      cd \$d && TF_CLI_CONFIG_FILE='${NATIVE_WORK}/terraformrc.hcl' '$BIN/terraform' init -no-color -input=false >/dev/null; rc=\$?; rm -rf \$d; exit \$rc"
 
   # B3: Secrets are encrypted at rest, audited, and admin credentials are short.
-  check "secrets are encrypted at rest (secretbox) in etcd" bash -c "
-    '$BIN/kubectl' --kubeconfig '$KC' -n default delete secret b3-probe --ignore-not-found >/dev/null 2>&1
-    '$BIN/kubectl' --kubeconfig '$KC' -n default create secret generic b3-probe --from-literal=k=v >/dev/null 2>&1 || exit 1
-    v=\$(ETCDCTL_API=3 '$BIN/etcdctl' --endpoints http://127.0.0.1:${CP_ETCD_CLIENT_PORT} get /registry/secrets/default/b3-probe --print-value-only | head -c 24)
+  local probe=b3-probe
+  kp() { "$BIN/kubectl" --kubeconfig "$KC" -n default "$@"; }
+  kp delete secret "$probe" --ignore-not-found >/dev/null 2>&1 || true
+  check "secrets are encrypted at rest (secretbox) in etcd" bash -c "$(declare -f kp); BIN='$BIN' KC='$KC'
+    kp create secret generic '$probe' --from-literal=k=v >/dev/null 2>&1 || exit 1
+    v=\$(ETCDCTL_API=3 '$BIN/etcdctl' --endpoints http://127.0.0.1:${CP_ETCD_CLIENT_PORT} get /registry/secrets/default/$probe --print-value-only | head -c 24)
     case \"\$v\" in k8s:enc:secretbox:v1:*) exit 0;; *) echo \"stored as: \$v\" >&2; exit 1;; esac"
   check "encryption key fingerprint stamped in the state root" bash -c "grep -qE '^[0-9a-f]{16}\$' '${CP_STATE_DIR}/ENCRYPTION'"
-  check "audit log records the secret write at Metadata level" bash -c "
-    f='${CP_AUDIT_LOG_PATH:-${HOME_DIR}/log/audit.log}'; test -s \"\$f\" || exit 1
-    grep -q '\"name\":\"b3-probe\"' \"\$f\" && grep '\"name\":\"b3-probe\"' \"\$f\" | grep -q '\"level\":\"Metadata\"' && ! grep '\"name\":\"b3-probe\"' \"\$f\" | grep -q requestObject"
-  check "admin client certificate valid for at most ${CP_CLIENT_CERT_DAYS:-90} days" bash -c "
-    end=\$(date -d \"\$(openssl x509 -enddate -noout -in '${CP_STATE_DIR}/pki/admin.crt' | cut -d= -f2)\" +%s); now=\$(date +%s)
-    [ \$(( (end - now) / 86400 )) -le ${CP_CLIENT_CERT_DAYS:-90} ]"
-  check "TLS 1.1 refused by the API server" bash -c \
-    "! curl -sk --tls-max 1.1 https://127.0.0.1:${CP_APISERVER_PORT}/ >/dev/null 2>&1"
-  '$BIN/kubectl' --kubeconfig '$KC' -n default delete secret b3-probe --ignore-not-found >/dev/null 2>&1 || true
+  check "audit log records the secret write at Metadata level without a body" bash -c "
+    f='${CP_AUDIT_LOG_PATH}'; test -s \"\$f\" || exit 1
+    l=\$(grep '\"name\":\"$probe\"' \"\$f\" | grep '\"verb\":\"create\"'); [ -n \"\$l\" ] || exit 1
+    printf '%s' \"\$l\" | grep -q '\"level\":\"Metadata\"' && ! printf '%s' \"\$l\" | grep -q requestObject"
+  # The exported admin cert must not outlive the policy (same predicate the supervisor uses).
+  check "exported admin certificate does not outlive CP_CLIENT_CERT_DAYS (${CP_CLIENT_CERT_DAYS})" bash -c \
+    "! openssl x509 -checkend $(( CP_CLIENT_CERT_DAYS * 86400 + 60 )) -noout -in '${CP_STATE_DIR}/pki/admin.crt'"
+  check "in-container identity (control-plane-internal) is separate from the exported admin cert" bash -c \
+    "openssl x509 -subject -noout -in '${CP_STATE_DIR}/pki/admin-internal.crt' | grep -q control-plane-internal && openssl x509 -subject -noout -in '${CP_STATE_DIR}/pki/admin.crt' | grep -q control-plane-admin"
+  # TLS floor: positive control first (1.2 works), then the refusal.
+  check "TLS 1.2 accepted and TLS 1.1 refused by the API server" bash -c \
+    "curl -sk --tlsv1.2 --tls-max 1.2 -o /dev/null https://127.0.0.1:${CP_APISERVER_PORT}/ && ! curl -sk --tls-max 1.1 -o /dev/null https://127.0.0.1:${CP_APISERVER_PORT}/"
+  kp delete secret "$probe" --ignore-not-found >/dev/null 2>&1 || true
 
   # Owner-reference cascading deletion is the garbage collector's job, and the
   # garbage collector lives in kube-controller-manager. Prove it actually runs.
