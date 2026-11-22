@@ -169,6 +169,10 @@ COPY --from=crossplane-build /out/webhookconfigurations/ ${CP_HOME}/crds/webhook
 ENV CP_STATE_DIR=${CP_HOME}/state
 ENV CP_REQUIRE_PERSISTENT=true
 ENV CP_RUN_UID=${USER_ID}
+# B3: the secrets encryption key must come from the platform's secret store,
+# and the static admin bearer token is off; client certificates only.
+ENV CP_REQUIRE_EXTERNAL_KEY=true
+ENV CP_ADMIN_TOKEN_ENABLED=false
 RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/cache ${CP_HOME}/tf ${CP_STATE_DIR} \
     && chmod +x /usr/local/bin/control-plane.sh \
     && chmod 700 ${CP_STATE_DIR} \

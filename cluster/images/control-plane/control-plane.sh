@@ -61,6 +61,34 @@ CP_RUN_GID="${CP_RUN_GID:-${CP_RUN_UID}}"
 CP_STAY_ROOT="${CP_STAY_ROOT:-false}"
 # Force the recursive chown even when no mismatched file is found.
 CP_FORCE_CHOWN="${CP_FORCE_CHOWN:-false}"
+
+# ---- B3: secrets at rest, audit, credential lifetimes ------------------------
+# Rationale and behaviour: docs/architecture/control-plane.md, "Secrets, audit
+# and credential lifetimes". Only what each variable does is noted here.
+# Secretbox key for Secrets in etcd (32 random bytes, base64; openssl rand -base64 32).
+CP_ENCRYPTION_KEY="${CP_ENCRYPTION_KEY:-}"
+# The key the data is currently under, when rotating to CP_ENCRYPTION_KEY.
+CP_ENCRYPTION_KEY_PREVIOUS="${CP_ENCRYPTION_KEY_PREVIOUS:-}"
+# true (the image): refuse to boot without CP_ENCRYPTION_KEY; false: generate one under pki/.
+CP_REQUIRE_EXTERNAL_KEY="${CP_REQUIRE_EXTERNAL_KEY:-false}"
+CP_AUDIT_ENABLED="${CP_AUDIT_ENABLED:-true}"
+# "-" sends the audit log to the API server's stdout (CP_LOG_DIR/kube-apiserver.log).
+CP_AUDIT_LOG_PATH="${CP_AUDIT_LOG_PATH:-${CP_LOG_DIR}/audit.log}"
+CP_AUDIT_LOG_MAXSIZE_MB="${CP_AUDIT_LOG_MAXSIZE_MB:-20}"
+CP_AUDIT_LOG_MAXBACKUP="${CP_AUDIT_LOG_MAXBACKUP:-3}"
+CP_AUDIT_LOG_MAXAGE_DAYS="${CP_AUDIT_LOG_MAXAGE_DAYS:-7}"
+# Lifetime of the admin certificate in the EXPORTED kubeconfig (renewed at boot past the midpoint).
+CP_CLIENT_CERT_DAYS="${CP_CLIENT_CERT_DAYS:-90}"
+# Lifetime of the certificates the in-container clients use; minted fresh every boot, never exported.
+CP_INTERNAL_CERT_DAYS="${CP_INTERNAL_CERT_DAYS:-3650}"
+CP_SERVING_CERT_DAYS="${CP_SERVING_CERT_DAYS:-365}"
+# Static admin bearer token; false in the image (client certificates only).
+CP_ADMIN_TOKEN_ENABLED="${CP_ADMIN_TOKEN_ENABLED:-true}"
+CP_TLS_MIN_VERSION="${CP_TLS_MIN_VERSION:-VersionTLS12}"
+for _v in CP_CLIENT_CERT_DAYS CP_INTERNAL_CERT_DAYS CP_SERVING_CERT_DAYS CP_AUDIT_LOG_MAXSIZE_MB CP_AUDIT_LOG_MAXBACKUP CP_AUDIT_LOG_MAXAGE_DAYS; do
+  [[ "${!_v}" =~ ^[1-9][0-9]*$ ]] || { printf '%s [control-plane] FATAL: %s must be a positive integer (got "%s")\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_v" "${!_v}" >&2; exit 1; }
+done
+unset _v
 CP_KCM_PORT="${CP_KCM_PORT:-10257}"   # kube-controller-manager secure/health port, loopback only
 CP_ETCD_CLIENT_PORT="${CP_ETCD_CLIENT_PORT:-2379}"
 CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-2380}"
@@ -291,6 +319,11 @@ drop_privileges_if_root() {
 # stamp so an accidental rollback of the image onto newer stored state fails
 # before etcd or the API server get a chance to corrupt it.
 # ------------------------------------------------------------------------------
+# stamp_read FILE -> contents or ""; stamp_write FILE VALUE: atomic. Used by the
+# VERSION and ENCRYPTION stamps in the state root.
+stamp_read()  { [ -f "$1" ] && cat "$1" || true; }
+stamp_write() { printf '%s' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"; }
+
 component_versions() {
   printf 'etcd=%s\n' "$("${CP_BIN_DIR}/etcd" --version 2>/dev/null | awk '/etcd Version/{print $3; exit}')"
   printf 'kubernetes=%s\n' "$("${CP_BIN_DIR}/kube-apiserver" --version 2>/dev/null | awk 'NR==1{print $2}')"
@@ -359,7 +392,7 @@ prepare_state_dir() {
     cur="$(kv "${current}" "$k")"
     [ -n "${cur}" ] || fail "could not determine the ${k} version from its binary; refusing to run with a blind downgrade guard"
   done
-  stored=""; [ -f "${stamp}" ] && stored="$(cat "${stamp}")"
+  stored="$(stamp_read "${stamp}")"
   for k in etcd kubernetes; do
     cur="$(kv "${current}" "$k")"; old="$(kv "${stored}" "$k")"
     if [ -n "${old}" ] && version_lt "${cur}" "${old}"; then
@@ -379,7 +412,7 @@ prepare_state_dir() {
     fi
   done
   [ -n "${stored}" ] || log "new state root at ${CP_STATE_DIR}"
-  printf '%s' "${keep}" > "${stamp}.tmp" && mv -f "${stamp}.tmp" "${stamp}"
+  stamp_write "${stamp}" "${keep}"
   log "state root ${CP_STATE_DIR} ready: $(printf '%s' "${keep}" | tr '\n' ' ')"
 }
 
@@ -496,14 +529,15 @@ bootstrap_pki() {
   fi
 
   if [ ! -f "${CP_PKI_DIR}/apiserver.sans" ] || \
-     [ "$(cat "${CP_PKI_DIR}/apiserver.sans")" != "${sans}" ]; then
-    log "issuing apiserver serving certificate for ${sans}"
+     [ "$(cat "${CP_PKI_DIR}/apiserver.sans")" != "${sans}" ] || \
+     ! cert_within_policy "${CP_PKI_DIR}/apiserver.crt" "${CP_SERVING_CERT_DAYS}" $(( 30 * 86400 )); then
+    log "issuing apiserver serving certificate (${CP_SERVING_CERT_DAYS} days) for ${sans}"
     openssl genrsa -out "${CP_PKI_DIR}/apiserver.key" 2048 2>/dev/null
     openssl req -new -key "${CP_PKI_DIR}/apiserver.key" \
       -subj "/CN=kube-apiserver" -out "${CP_PKI_DIR}/apiserver.csr" 2>/dev/null
     openssl x509 -req -in "${CP_PKI_DIR}/apiserver.csr" \
       -CA "${CP_PKI_DIR}/ca.crt" -CAkey "${CP_PKI_DIR}/ca.key" -CAcreateserial \
-      -out "${CP_PKI_DIR}/apiserver.crt" -days 3650 -sha256 \
+      -out "${CP_PKI_DIR}/apiserver.crt" -days "${CP_SERVING_CERT_DAYS}" -sha256 \
       -extfile <(printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\n' "${sans}") 2>/dev/null
     rm -f "${CP_PKI_DIR}/apiserver.csr"
     printf '%s' "${sans}" > "${CP_PKI_DIR}/apiserver.sans"
@@ -513,12 +547,23 @@ bootstrap_pki() {
   # admin: O=system:masters, which RBAC treats as superuser.
   # controller-manager: a distinct identity, also system:masters for simplicity
   #   in a single-tenant control plane.
-  issue_client_cert admin            "control-plane-admin"          "system:masters"
-  issue_client_cert controller-manager "system:kube-controller-manager" "system:masters"
+  # admin: the identity in the EXPORTED kubeconfig; short-lived, renewed past the midpoint.
+  # admin-internal / controller-manager: the in-container clients (supervisor,
+  # Crossplane, provider, controller manager); minted fresh every boot and never
+  # exported, so their lifetime is irrelevant to anything outside the container
+  # and a long-running container never loses its own credentials.
+  issue_client_cert admin              "control-plane-admin"            "system:masters" "${CP_CLIENT_CERT_DAYS}"
+  issue_client_cert admin-internal     "control-plane-internal"         "system:masters" "${CP_INTERNAL_CERT_DAYS}" always
+  issue_client_cert controller-manager "system:kube-controller-manager" "system:masters" "${CP_INTERNAL_CERT_DAYS}" always
 
   # ---- static bearer token --------------------------------------------------
   # Convenient for clients that cannot carry a client certificate. NEVER
   # anonymous: --anonymous-auth=false is passed to the apiserver.
+  if [ "${CP_ADMIN_TOKEN_ENABLED}" != "true" ]; then
+    CP_ADMIN_TOKEN=""
+    rm -f "${CP_PKI_DIR}/tokens.csv"   # a disabled credential must not linger on the volume
+    return 0
+  fi
   # Persisted with the PKI. If CP_ADMIN_TOKEN is set in the environment it wins,
   # so changing the platform variable rotates the token on the next boot. Unset,
   # the stored token is reused (or generated on first boot) -- so removing the
@@ -541,16 +586,29 @@ bootstrap_pki() {
   CP_ADMIN_TOKEN="${tok}"
 }
 
+# cert_fresh FILE SECONDS: true when FILE exists and is valid for at least SECONDS more.
+cert_fresh() { [ -f "$1" ] && openssl x509 -checkend "$2" -noout -in "$1" >/dev/null 2>&1; }
+# cert_within_policy FILE DAYS [MIN_SECONDS]: true when FILE exists, has at least
+# MIN_SECONDS left (default half of DAYS), and does not outlive DAYS (so
+# lowering the policy shortens an existing cert). The 60 s absorbs issuance skew.
+cert_within_policy() {
+  local min="${3:-$(( $2 * 86400 / 2 ))}"
+  cert_fresh "$1" "${min}" && ! cert_fresh "$1" $(( $2 * 86400 + 60 ))
+}
+
+# issue_client_cert NAME CN ORG DAYS [always]: with "always", mint every boot.
 issue_client_cert() {
-  local name="$1" cn="$2" org="$3"
-  [ -f "${CP_PKI_DIR}/${name}.crt" ] && return 0
-  log "issuing client certificate ${name} (CN=${cn}, O=${org})"
+  local name="$1" cn="$2" org="$3" days="$4" mode="${5:-policy}"
+  if [ "${mode}" != "always" ]; then
+    cert_within_policy "${CP_PKI_DIR}/${name}.crt" "${days}" && return 0
+  fi
+  log "issuing client certificate ${name} (CN=${cn}, O=${org}, ${days} days)"
   openssl genrsa -out "${CP_PKI_DIR}/${name}.key" 2048 2>/dev/null
   openssl req -new -key "${CP_PKI_DIR}/${name}.key" \
     -subj "/O=${org}/CN=${cn}" -out "${CP_PKI_DIR}/${name}.csr" 2>/dev/null
   openssl x509 -req -in "${CP_PKI_DIR}/${name}.csr" \
     -CA "${CP_PKI_DIR}/ca.crt" -CAkey "${CP_PKI_DIR}/ca.key" -CAcreateserial \
-    -out "${CP_PKI_DIR}/${name}.crt" -days 3650 -sha256 \
+    -out "${CP_PKI_DIR}/${name}.crt" -days "${days}" -sha256 \
     -extfile <(printf 'extendedKeyUsage=clientAuth\n') 2>/dev/null
   rm -f "${CP_PKI_DIR}/${name}.csr"
 }
@@ -637,16 +695,158 @@ start_etcd() {
 }
 
 # ------------------------------------------------------------------------------
+# Step 1b: secrets at rest and audit policy (B3)
+#
+# Files under CP_RUN_DIR, written each boot. See docs/architecture/control-plane.md.
+# ------------------------------------------------------------------------------
+key_fp() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+# Exactly the base64 of 32 bytes: 43 base64 characters and one '=' pad. Anything
+# else (whitespace, extra lines, odd padding) is refused before it can reach the
+# YAML below; the decode check is belt and braces.
+key_ok() {
+  [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]] \
+    && [ "$(printf '%s' "$1" | base64 -d 2>/dev/null | wc -c | tr -d ' ')" = "32" ]
+}
+
+ENCRYPTION_CONFIG="${CP_RUN_DIR}/encryption-config.yaml"
+ENCRYPTION_STAMP="${CP_STATE_DIR}/ENCRYPTION"
+ENCRYPTION_REWRAP=false
+ENCRYPTION_FP=""
+
+prepare_encryption() {
+  local key prev keyfile="${CP_PKI_DIR}/encryption.key"
+  key="$(printf '%s' "${CP_ENCRYPTION_KEY}" | tr -d '[:space:]')"
+  prev="$(printf '%s' "${CP_ENCRYPTION_KEY_PREVIOUS}" | tr -d '[:space:]')"
+  # Never let the key material reach the components' environments.
+  unset CP_ENCRYPTION_KEY CP_ENCRYPTION_KEY_PREVIOUS
+  if [ -z "${key}" ]; then
+    if [ "${CP_REQUIRE_EXTERNAL_KEY}" = "true" ]; then
+      fail "CP_ENCRYPTION_KEY is unset. Generate one with 'openssl rand -base64 32', store it in the platform's secret store (never on the volume), and pass it as CP_ENCRYPTION_KEY"
+    fi
+    if [ -f "${keyfile}" ]; then
+      key="$(cat "${keyfile}")"
+    else
+      key="$(openssl rand -base64 32)"
+      printf '%s' "${key}" > "${keyfile}"; chmod 600 "${keyfile}"
+      log "generated a secrets encryption key at ${keyfile}"
+    fi
+    log "WARNING: the secrets encryption key lives at ${keyfile}, on the same volume as the data it protects; pass CP_ENCRYPTION_KEY from a secret store for a real deployment"
+  fi
+  key_ok "${key}" || fail "CP_ENCRYPTION_KEY must be exactly the base64 of 32 random bytes (openssl rand -base64 32)"
+  [ -z "${prev}" ] || key_ok "${prev}" || fail "CP_ENCRYPTION_KEY_PREVIOUS must be exactly the base64 of 32 random bytes"
+  [ "${prev}" != "${key}" ] || prev=""   # same key twice is not a rotation
+
+  ENCRYPTION_FP="$(key_fp "${key}")"
+  local prev_fp=""; [ -z "${prev}" ] || prev_fp="$(key_fp "${prev}")"
+  local stored; stored="$(stamp_read "${ENCRYPTION_STAMP}")"
+  if [ -z "${stored}" ]; then
+    ENCRYPTION_REWRAP=true   # first boot with encryption: rewrite any plaintext Secrets
+  elif [ "${stored}" != "${ENCRYPTION_FP}" ]; then
+    if [ -n "${prev}" ] && [ "${prev_fp}" = "${stored}" ]; then
+      log "rotating the secrets encryption key (${stored} -> ${ENCRYPTION_FP}); Secrets are re-encrypted once the API server is up"
+      ENCRYPTION_REWRAP=true
+    else
+      fail "Secrets in etcd were encrypted with key ${stored}, but CP_ENCRYPTION_KEY has fingerprint ${ENCRYPTION_FP}. Restore the right key, or pass the old one as CP_ENCRYPTION_KEY_PREVIOUS to rotate"
+    fi
+  fi
+
+  {
+    printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: EncryptionConfiguration\nresources:\n  - resources: [secrets]\n    providers:\n      - secretbox:\n          keys:\n'
+    printf '            - name: key-%s\n              secret: %s\n' "${ENCRYPTION_FP}" "${key}"
+    [ -z "${prev}" ] || printf '            - name: key-%s\n              secret: %s\n' "${prev_fp}" "${prev}"
+    printf '      - identity: {}\n'
+  } > "${ENCRYPTION_CONFIG}"
+  chmod 600 "${ENCRYPTION_CONFIG}"
+  log "secrets encryption at rest: secretbox, key ${ENCRYPTION_FP}${prev_fp:+ (+ previous ${prev_fp} for reading)}"
+}
+
+# After the API server is ready: rewrite every Secret so it is stored under the
+# current key (covers first enablement and rotation), then move the stamp.
+finish_encryption() {
+  [ "${ENCRYPTION_REWRAP}" = "true" ] || return 0
+  # A failed list must fail the boot (a wrong key on unstamped data shows up
+  # here as decryption errors); an empty list is a valid result.
+  local names; names="$(kc get secrets -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}')" \
+    || fail "could not list Secrets to re-encrypt them; not moving the encryption stamp"
+  local n=0 failed=0 ns name attempt
+  for ref in ${names}; do
+    ns="${ref%%/*}"; name="${ref#*/}"; n=$((n+1))
+    for attempt in 1 2 3; do
+      # get-then-replace per object: a 409 means something rewrote it after our
+      # read, and every new write is already under the current key.
+      if kc -n "${ns}" get secret "${name}" -o json 2>/dev/null | kc replace -f - >/dev/null 2>&1; then break; fi
+      kc -n "${ns}" get secret "${name}" >/dev/null 2>&1 || break   # deleted meanwhile: fine
+      [ "${attempt}" -lt 3 ] && sleep 1 || { failed=$((failed+1)); log "WARNING: could not re-encrypt ${ref} after 3 attempts"; }
+    done
+  done
+  [ "${failed}" -eq 0 ] || fail "${failed} of ${n} Secret(s) could not be re-encrypted under key ${ENCRYPTION_FP}; the stamp stays at the previous key, keep CP_ENCRYPTION_KEY_PREVIOUS set and retry"
+  [ "${n}" -eq 0 ] || log "re-encrypted ${n} Secret(s) under key ${ENCRYPTION_FP}"
+  stamp_write "${ENCRYPTION_STAMP}" "${ENCRYPTION_FP}"
+}
+
+AUDIT_POLICY="${CP_RUN_DIR}/audit-policy.yaml"
+write_audit_policy() {
+  cat > "${AUDIT_POLICY}" <<'EOF'
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  # Health, discovery and metrics: never.
+  - level: None
+    nonResourceURLs: ["/healthz*", "/readyz*", "/livez*", "/metrics", "/version", "/openapi*", "/api", "/api/*", "/apis", "/apis/*"]
+  # The in-container controllers read Secrets on every reconcile; that is
+  # machine noise, not evidence. Humans and everything else: logged below.
+  - level: None
+    users: ["control-plane-internal", "system:kube-controller-manager"]
+    verbs: ["get", "list", "watch"]
+    resources:
+      - group: ""
+        resources: ["secrets"]
+  # Any other access to Secrets: who, what, when (never the body).
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets"]
+  # Reads of everything else: the controllers watch constantly; not logged.
+  - level: None
+    verbs: ["get", "list", "watch"]
+  # Every write: Metadata.
+  - level: Metadata
+EOF
+  chmod 600 "${AUDIT_POLICY}"
+}
+
+apiserver_audit_flags() {
+  [ "${CP_AUDIT_ENABLED}" = "true" ] || return 0
+  printf -- '--audit-policy-file=%s\n--audit-log-path=%s\n--audit-log-format=json\n' "${AUDIT_POLICY}" "${CP_AUDIT_LOG_PATH}"
+  [ "${CP_AUDIT_LOG_PATH}" = "-" ] || printf -- '--audit-log-maxsize=%s\n--audit-log-maxbackup=%s\n--audit-log-maxage=%s\n' \
+    "${CP_AUDIT_LOG_MAXSIZE_MB}" "${CP_AUDIT_LOG_MAXBACKUP}" "${CP_AUDIT_LOG_MAXAGE_DAYS}"
+}
+
+apiserver_token_flags() {
+  [ "${CP_ADMIN_TOKEN_ENABLED}" = "true" ] || return 0
+  printf -- '--token-auth-file=%s\n' "${CP_PKI_DIR}/tokens.csv"
+}
+
+# ------------------------------------------------------------------------------
 # Step 2: kube-apiserver
 #
 # Nodeless notes:
-#   * --anonymous-auth=false, RBAC + Node authorizers, client-cert and static
-#     token authn. Nothing is reachable unauthenticated.
+#   * --anonymous-auth=false, RBAC + Node authorizers, client-cert and (optional)
+#     static token authn. Nothing is reachable unauthenticated.
 #   * ServiceAccount admission needs the SA key pair even though nothing here
 #     mounts a token into a Pod.
 #   * No --enable-aggregator-routing: there is no kube-proxy to route to.
 # ------------------------------------------------------------------------------
 start_apiserver() {
+  # The policy is written here, in the parent shell, so a failure is fatal
+  # instead of silently starting the API server without audit.
+  if [ "${CP_AUDIT_ENABLED}" = "true" ]; then
+    write_audit_policy
+    [ -s "${AUDIT_POLICY}" ] || fail "audit policy ${AUDIT_POLICY} was not written"
+  fi
+  local extra=()
+  mapfile -t extra < <(apiserver_audit_flags; apiserver_token_flags)
   start_bg kube-apiserver "${CP_BIN_DIR}/kube-apiserver" \
     --etcd-servers "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
     --bind-address "${CP_APISERVER_BIND_ADDRESS}" \
@@ -655,7 +855,8 @@ start_apiserver() {
     --tls-cert-file "${CP_PKI_DIR}/apiserver.crt" \
     --tls-private-key-file "${CP_PKI_DIR}/apiserver.key" \
     --client-ca-file "${CP_PKI_DIR}/ca.crt" \
-    --token-auth-file "${CP_PKI_DIR}/tokens.csv" \
+    --encryption-provider-config "${ENCRYPTION_CONFIG}" \
+    --tls-min-version "${CP_TLS_MIN_VERSION}" \
     --service-account-key-file "${CP_PKI_DIR}/sa.pub" \
     --service-account-signing-key-file "${CP_PKI_DIR}/sa.key" \
     --service-account-issuer "https://kubernetes.default.svc.cluster.local" \
@@ -673,10 +874,12 @@ start_apiserver() {
     --allow-privileged=false \
     --profiling=false \
     --enable-priority-and-fairness=true \
-    --v=1
+    --v=1 \
+    "${extra[@]}"
 
   wait_ready "kube-apiserver /readyz" "${CP_READY_TIMEOUT}" \
     kc get --raw=/readyz
+  finish_encryption
 }
 
 # ------------------------------------------------------------------------------
@@ -970,9 +1173,14 @@ main() {
     fi
   fi
 
-  write_kubeconfig "${KUBECONFIG_INTERNAL}" "https://127.0.0.1:${CP_APISERVER_PORT}" admin
+  write_kubeconfig "${KUBECONFIG_INTERNAL}" "https://127.0.0.1:${CP_APISERVER_PORT}" admin-internal
   write_kubeconfig "${KUBECONFIG_EXTERNAL}" "${external}" admin
-  write_kubeconfig_token "${KUBECONFIG_EXTERNAL_TOKEN}" "${external}"
+  if [ "${CP_ADMIN_TOKEN_ENABLED}" = "true" ]; then
+    write_kubeconfig_token "${KUBECONFIG_EXTERNAL_TOKEN}" "${external}"
+  else
+    rm -f "${KUBECONFIG_EXTERNAL_TOKEN}"
+  fi
+  prepare_encryption
 
   start_etcd
   start_apiserver
@@ -986,21 +1194,28 @@ main() {
   log "control plane UP"
   log "  api server (external): ${external}"
   log "  kubeconfig (external): ${KUBECONFIG_EXTERNAL}      (client cert)"
-  log "  kubeconfig (external): ${KUBECONFIG_EXTERNAL_TOKEN} (bearer token)"
+  if [ "${CP_ADMIN_TOKEN_ENABLED}" = "true" ]; then
+    log "  kubeconfig (external): ${KUBECONFIG_EXTERNAL_TOKEN} (bearer token)"
+  else
+    log "  bearer token:          disabled (CP_ADMIN_TOKEN_ENABLED=false)"
+  fi
+  log "  client cert validity:  ${CP_CLIENT_CERT_DAYS} days (renewed on restart past the midpoint)"
   # The token is a cluster-admin credential and this log stream is usually the
   # platform's deploy log, so print it only when explicitly asked. It is always
   # in the token kubeconfig above and in ${CP_PKI_DIR}/tokens.csv.
-  if [ "${CP_LOG_ADMIN_TOKEN:-false}" = "true" ]; then
-    log "  bearer token:          ${CP_ADMIN_TOKEN}"
-  else
-    log "  bearer token:          <hidden; set CP_LOG_ADMIN_TOKEN=true to print>"
+  if [ "${CP_ADMIN_TOKEN_ENABLED}" = "true" ]; then
+    if [ "${CP_LOG_ADMIN_TOKEN:-false}" = "true" ]; then
+      log "  bearer token:          ${CP_ADMIN_TOKEN}"
+    else
+      log "  bearer token:          <hidden; set CP_LOG_ADMIN_TOKEN=true to print>"
+    fi
   fi
   log "  logs:                  ${CP_LOG_DIR}"
   log "=============================================================="
 
   # Supervise: if any component dies, take the whole container down so the
   # platform restarts it. Partial control planes are worse than dead ones.
-  local i
+  local i tick=0
   while true; do
     for i in "${!PIDS[@]}"; do
       if ! kill -0 "${PIDS[$i]}" 2>/dev/null; then
@@ -1009,6 +1224,17 @@ main() {
         exit 1
       fi
     done
+    # Hourly: the in-container identities and the serving cert must stay valid
+    # for at least 7 more days; if not, exit so the platform restarts us and the
+    # boot path reissues them. A silently expiring plane is worse than a restart.
+    tick=$((tick+1))
+    if [ $((tick % 720)) -eq 0 ]; then
+      local c
+      for c in admin-internal controller-manager apiserver; do
+        cert_fresh "${CP_PKI_DIR}/${c}.crt" $(( 7 * 86400 )) \
+          || { log "certificate ${c} expires within 7 days -- restarting to reissue"; exit 1; }
+      done
+    fi
     sleep 5
   done
 }
