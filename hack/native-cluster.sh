@@ -68,6 +68,13 @@ say() { printf '\n=== %s\n' "$*" >&2; }
 # how both `up` and the image's re-exec leave it. Anchored, so a shell whose
 # command line merely mentions the path (such as this probe) does not match.
 sup_pid() { pgrep -f '^bash [^ ]*cluster/images/control-plane/control-plane\.sh$' | head -1; }
+# etcd requires a client certificate from its own CA; verify borrows the
+# supervisor's identity from the state root's PKI.
+ectl() {
+  "$BIN/etcdctl" --endpoints "https://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --cacert "${CP_STATE_DIR}/pki/etcd-ca.crt" \
+    --cert "${CP_STATE_DIR}/pki/etcd-client-supervisor.crt" --key "${CP_STATE_DIR}/pki/etcd-client-supervisor.key" "$@"
+}
 
 # The supervisor shells out to these at boot; fail early instead of dying
 # mid-PKI with a bare "shutting down".
@@ -294,8 +301,7 @@ verify() {
   # B2: nothing in the control plane may run as root, however it was started.
   check "no control-plane process runs as uid 0" bash -c \
     "pids=\$(pgrep -f '${NATIVE_WORK}/bin/'); [ -n \"\$pids\" ] && ! ps -o uid= -p \$pids | grep -qx ' *0'"
-  check "etcd healthy" env ETCDCTL_API=3 "$BIN/etcdctl" \
-    --endpoints "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" endpoint health
+  check "etcd healthy" ectl endpoint health
   check "apiserver /readyz" "${k[@]}" get --raw=/readyz
   check "apiserver rejects anonymous" bash -c \
     "curl -sk https://127.0.0.1:${CP_APISERVER_PORT}/api | grep -q Unauthorized"
@@ -346,9 +352,9 @@ verify() {
   local probe=b3-probe
   kp() { "$BIN/kubectl" --kubeconfig "$KC" -n default "$@"; }
   kp delete secret "$probe" --ignore-not-found >/dev/null 2>&1 || true
-  check "secrets are encrypted at rest (secretbox) in etcd" bash -c "$(declare -f kp); BIN='$BIN' KC='$KC'
+  check "secrets are encrypted at rest (secretbox) in etcd" bash -c "$(declare -f kp ectl); BIN='$BIN' KC='$KC'
     kp create secret generic '$probe' --from-literal=k=v >/dev/null 2>&1 || exit 1
-    v=\$(ETCDCTL_API=3 '$BIN/etcdctl' --endpoints http://127.0.0.1:${CP_ETCD_CLIENT_PORT} get /registry/secrets/default/$probe --print-value-only | head -c 24)
+    v=\$(ectl get /registry/secrets/default/$probe --print-value-only | head -c 24)
     case \"\$v\" in k8s:enc:secretbox:v1:*) exit 0;; *) echo \"stored as: \$v\" >&2; exit 1;; esac"
   check "encryption key fingerprint stamped in the state root" bash -c "grep -qE '^[0-9a-f]{16}\$' '${CP_STATE_DIR}/ENCRYPTION'"
   check "audit log records the secret write at Metadata level without a body" bash -c "
@@ -424,8 +430,8 @@ verify() {
   check "etcd runs with --quota-backend-bytes ${CP_ETCD_QUOTA_BYTES}" bash -c '
     p=$(pgrep -f "^$1/bin/etcd " | head -1); [ -n "$p" ] || exit 1
     tr "\0" "\n" < "/proc/$p/cmdline" | grep -A1 -x -- --quota-backend-bytes | grep -qx "$2"' _ "${NATIVE_WORK}" "${CP_ETCD_QUOTA_BYTES}"
-  check "etcd has no alarm raised" bash -c '
-    [ -z "$("$1" --endpoints "http://127.0.0.1:$2" alarm list)" ]' _ "$BIN/etcdctl" "${CP_ETCD_CLIENT_PORT}"
+  check "etcd has no alarm raised" bash -c "$(declare -f ectl); BIN='$BIN'"'
+    out=$(ectl alarm list) || exit 1; [ -z "$out" ]'
   if [ -n "${CP_MEMORY_LIMIT_BYTES:-}" ]; then
     # Same table as gomemlimit_share in the supervisor; the sum must stay under the limit.
     check "GOMEMLIMIT on every Go component is its share of CP_MEMORY_LIMIT_BYTES (sum under the limit)" bash -c '
@@ -460,6 +466,44 @@ verify() {
     "$2" snapshot status "$new" -w table | grep -q -i revision' _ "${snapdir}" "$BIN/etcdutl"
   check "snapshots are pruned to CP_ETCD_SNAPSHOT_KEEP (${CP_ETCD_SNAPSHOT_KEEP})" bash -c '
     [ "$(ls -1 "$1"/etcd-*.db | wc -l)" -le "$2" ]' _ "${snapdir}" "${CP_ETCD_SNAPSHOT_KEEP}"
+
+  # etcd client authentication (the B3 leftover): both loopback listeners take
+  # TLS only, demand a client certificate, and trust only the etcd CA. The
+  # refusals are asserted by cause (curl's TLS alert text), never by a timeout,
+  # and each port gets a positive control with the supervisor's identity first.
+  local pki="${CP_STATE_DIR}/pki"
+  tls_refused() {   # tls_refused URL [curl identity flags...]: a TLS-level refusal, not a timeout
+    local url="$1"; shift
+    local err; err="$(curl -sS --http1.1 --max-time 5 --cacert "${pki}/etcd-ca.crt" "$@" "$url" 2>&1 >/dev/null)" && return 1
+    printf '%s' "$err" | grep -qiE 'alert|handshake|certificate' && ! printf '%s' "$err" | grep -qi 'timed out'
+  }
+  plaintext_dropped() {   # a TLS-only listener closes a plaintext request without any HTTP reply (curl 52/56), never a timeout (28)
+    local code rc; code="$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$1")"; rc=$?
+    [ "$code" = "000" ] && { [ "$rc" -eq 52 ] || [ "$rc" -eq 56 ]; }
+  }
+  check "etcd client port serves /health to the supervisor's certificate" bash -c "$(declare -f ectl)"'
+    curl -fsS --max-time 5 --cacert "$1/etcd-ca.crt" --cert "$1/etcd-client-supervisor.crt" --key "$1/etcd-client-supervisor.key" \
+      "https://127.0.0.1:$2/health" | grep -q "\"health\":\"true\""' _ "$pki" "${CP_ETCD_CLIENT_PORT}"
+  check "etcd client port drops a plaintext request without an HTTP reply" bash -c "$(declare -f plaintext_dropped)"'
+    plaintext_dropped "http://127.0.0.1:$1/health"' _ "${CP_ETCD_CLIENT_PORT}"
+  check "etcd client port refuses a TLS client without a certificate (TLS alert)" bash -c "pki='$pki'; $(declare -f tls_refused)"'
+    tls_refused "https://127.0.0.1:$1/health"' _ "${CP_ETCD_CLIENT_PORT}"
+  check "etcd client port refuses a certificate from the cluster CA, admin-internal (TLS alert)" bash -c "pki='$pki'; $(declare -f tls_refused)"'
+    [ -r "$pki/admin-internal.key" ] && tls_refused "https://127.0.0.1:$1/health" --cert "$pki/admin-internal.crt" --key "$pki/admin-internal.key"' _ "${CP_ETCD_CLIENT_PORT}"
+  check "etcd peer port serves /members to the etcd-CA identity and refuses plaintext and certificate-less clients" bash -c "pki='$pki'; $(declare -f tls_refused plaintext_dropped)"'
+    curl -fsS --http1.1 --max-time 5 --cacert "$pki/etcd-ca.crt" --cert "$pki/etcd-client-supervisor.crt" --key "$pki/etcd-client-supervisor.key" \
+      "https://127.0.0.1:$1/members" | grep -q control-plane || { echo "positive control failed" >&2; exit 1; }
+    plaintext_dropped "http://127.0.0.1:$1/members" || { echo "plaintext not dropped" >&2; exit 1; }
+    tls_refused "https://127.0.0.1:$1/members"' _ "${CP_ETCD_PEER_PORT}"
+  check "etcd member record carries the https peer URL" bash -c "$(declare -f ectl); BIN='$BIN'"'
+    ectl member list | grep ", control-plane, " | grep -q ", https://127.0.0.1:$1, "' _ "${CP_ETCD_PEER_PORT}"
+  check "etcd server certificate is signed by the etcd CA and not by the cluster CA" bash -c \
+    'openssl verify -CAfile "$1/etcd-ca.crt" "$1/etcd-server.crt" >/dev/null 2>&1 && ! openssl verify -CAfile "$1/ca.crt" "$1/etcd-server.crt" >/dev/null 2>&1' _ "$pki"
+  check "kube-apiserver reaches etcd over https with its own client certificate" bash -c '
+    p=$(pgrep -f "^$1/bin/kube-apiserver " | head -1); [ -n "$p" ] || exit 1
+    c=$(tr "\0" "\n" < "/proc/$p/cmdline")
+    printf "%s\n" "$c" | grep -A1 -x -- --etcd-servers | grep -q "^https://127.0.0.1:" \
+      && printf "%s\n" "$c" | grep -A1 -x -- --etcd-certfile | grep -q etcd-client-apiserver.crt' _ "${NATIVE_WORK}"
 
   # Owner-reference cascading deletion is the garbage collector's job, and the
   # garbage collector lives in kube-controller-manager. Prove it actually runs.

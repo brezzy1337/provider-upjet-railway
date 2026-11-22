@@ -509,12 +509,7 @@ bootstrap_pki() {
   fi
 
   # ---- CA -------------------------------------------------------------------
-  if [ ! -f "${CP_PKI_DIR}/ca.key" ]; then
-    log "generating cluster CA"
-    openssl genrsa -out "${CP_PKI_DIR}/ca.key" 4096 2>/dev/null
-    openssl req -x509 -new -nodes -key "${CP_PKI_DIR}/ca.key" -sha256 -days 3650 \
-      -subj "/CN=control-plane-ca" -out "${CP_PKI_DIR}/ca.crt" 2>/dev/null
-  fi
+  ensure_ca ca control-plane-ca
 
   # ---- front-proxy CA -------------------------------------------------------
   # Without --requestheader-client-ca-file the API server publishes an
@@ -524,22 +519,10 @@ bootstrap_pki() {
   # the cluster CA: anything signed by the requestheader CA can impersonate any
   # user through the aggregation layer, so it must not be the same trust root
   # that ordinary client certificates come from.
-  if [ ! -f "${CP_PKI_DIR}/front-proxy-ca.key" ]; then
-    log "generating front-proxy CA"
-    openssl genrsa -out "${CP_PKI_DIR}/front-proxy-ca.key" 4096 2>/dev/null
-    openssl req -x509 -new -nodes -key "${CP_PKI_DIR}/front-proxy-ca.key" -sha256 -days 3650 \
-      -subj "/CN=front-proxy-ca" -out "${CP_PKI_DIR}/front-proxy-ca.crt" 2>/dev/null
-  fi
-  if [ ! -f "${CP_PKI_DIR}/front-proxy-client.crt" ]; then
+  ensure_ca front-proxy-ca front-proxy-ca
+  if ! keypair_ok "${CP_PKI_DIR}/front-proxy-client.crt" "${CP_PKI_DIR}/front-proxy-client.key"; then
     log "issuing front-proxy client certificate"
-    openssl genrsa -out "${CP_PKI_DIR}/front-proxy-client.key" 2048 2>/dev/null
-    openssl req -new -key "${CP_PKI_DIR}/front-proxy-client.key" \
-      -subj "/CN=front-proxy-client" -out "${CP_PKI_DIR}/front-proxy-client.csr" 2>/dev/null
-    openssl x509 -req -in "${CP_PKI_DIR}/front-proxy-client.csr" \
-      -CA "${CP_PKI_DIR}/front-proxy-ca.crt" -CAkey "${CP_PKI_DIR}/front-proxy-ca.key" -CAcreateserial \
-      -out "${CP_PKI_DIR}/front-proxy-client.crt" -days 3650 -sha256 \
-      -extfile <(printf 'extendedKeyUsage=clientAuth\n') 2>/dev/null
-    rm -f "${CP_PKI_DIR}/front-proxy-client.csr"
+    sign_cert front-proxy-client front-proxy-ca "/CN=front-proxy-client" clientAuth "" 3650
   fi
 
   # ---- service account signing key -----------------------------------------
@@ -566,18 +549,30 @@ bootstrap_pki() {
 
   if [ ! -f "${CP_PKI_DIR}/apiserver.sans" ] || \
      [ "$(cat "${CP_PKI_DIR}/apiserver.sans")" != "${sans}" ] || \
-     ! cert_within_policy "${CP_PKI_DIR}/apiserver.crt" "${CP_SERVING_CERT_DAYS}" $(( 30 * 86400 )); then
+     ! cert_within_policy "${CP_PKI_DIR}/apiserver.crt" "${CP_SERVING_CERT_DAYS}" $(( 30 * 86400 )) || \
+     ! keypair_ok "${CP_PKI_DIR}/apiserver.crt" "${CP_PKI_DIR}/apiserver.key"; then
     log "issuing apiserver serving certificate (${CP_SERVING_CERT_DAYS} days) for ${sans}"
-    openssl genrsa -out "${CP_PKI_DIR}/apiserver.key" 2048 2>/dev/null
-    openssl req -new -key "${CP_PKI_DIR}/apiserver.key" \
-      -subj "/CN=kube-apiserver" -out "${CP_PKI_DIR}/apiserver.csr" 2>/dev/null
-    openssl x509 -req -in "${CP_PKI_DIR}/apiserver.csr" \
-      -CA "${CP_PKI_DIR}/ca.crt" -CAkey "${CP_PKI_DIR}/ca.key" -CAcreateserial \
-      -out "${CP_PKI_DIR}/apiserver.crt" -days "${CP_SERVING_CERT_DAYS}" -sha256 \
-      -extfile <(printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\n' "${sans}") 2>/dev/null
-    rm -f "${CP_PKI_DIR}/apiserver.csr"
+    sign_cert apiserver ca "/CN=kube-apiserver" serverAuth "${sans}" "${CP_SERVING_CERT_DAYS}"
     printf '%s' "${sans}" > "${CP_PKI_DIR}/apiserver.sans"
   fi
+
+  # ---- etcd PKI -------------------------------------------------------------
+  # etcd requires a client certificate on both loopback listeners (the B3
+  # leftover). A CA of its own: the cluster CA signs Kubernetes identities, and
+  # none of those may also open etcd. The server certificate covers loopback
+  # only, serves the client and the peer port (hence both EKUs) and follows the
+  # serving-cert policy; the two client identities (the API server, the
+  # supervisor's etcdctl) are minted every boot like the other in-container
+  # identities. Rotation: remove etcd-ca.crt and etcd-ca.key and reboot;
+  # everything below is reissued and the data stays readable.
+  ensure_ca etcd-ca etcd-ca
+  if ! cert_within_policy "${CP_PKI_DIR}/etcd-server.crt" "${CP_SERVING_CERT_DAYS}" $(( 30 * 86400 )) \
+     || ! keypair_ok "${CP_PKI_DIR}/etcd-server.crt" "${CP_PKI_DIR}/etcd-server.key" \
+     || ! openssl verify -CAfile "${CP_PKI_DIR}/etcd-ca.crt" "${CP_PKI_DIR}/etcd-server.crt" >/dev/null 2>&1; then
+    issue_etcd_cert etcd-server etcd-server "serverAuth,clientAuth" "DNS:localhost,IP:127.0.0.1,IP:::1" "${CP_SERVING_CERT_DAYS}"
+  fi
+  issue_etcd_cert etcd-client-apiserver  kube-apiserver           clientAuth "" "${CP_INTERNAL_CERT_DAYS}"
+  issue_etcd_cert etcd-client-supervisor control-plane-supervisor clientAuth "" "${CP_INTERNAL_CERT_DAYS}"
 
   # ---- client certificates --------------------------------------------------
   # admin: O=system:masters, which RBAC treats as superuser.
@@ -632,21 +627,59 @@ cert_within_policy() {
   cert_fresh "$1" "${min}" && ! cert_fresh "$1" $(( $2 * 86400 + 60 ))
 }
 
-# issue_client_cert NAME CN ORG DAYS [always]: with "always", mint every boot.
+# ensure_ca PREFIX CN: a self-signed CA at PREFIX.key/.crt, generated when
+# either file is missing (a crash between the two writes must not leave a
+# key without its certificate). Both files land atomically; the key is 0600.
+ensure_ca() {
+  local prefix="${CP_PKI_DIR}/$1" cn="$2"
+  [ -f "${prefix}.key" ] && [ -f "${prefix}.crt" ] && return 0
+  log "generating ${cn}"
+  openssl genrsa -out "${prefix}.key.tmp" 4096 2>/dev/null
+  chmod 600 "${prefix}.key.tmp"
+  openssl req -x509 -new -nodes -key "${prefix}.key.tmp" -sha256 -days 3650 \
+    -subj "/CN=${cn}" -out "${prefix}.crt.tmp" 2>/dev/null
+  mv -f "${prefix}.key.tmp" "${prefix}.key"
+  mv -f "${prefix}.crt.tmp" "${prefix}.crt"
+}
+
+# keypair_ok CRT KEY: both exist and the certificate carries the key's public key.
+keypair_ok() {
+  [ -f "$1" ] && [ -f "$2" ] \
+    && [ "$(openssl x509 -noout -pubkey -in "$1" 2>/dev/null)" = "$(openssl pkey -pubout -in "$2" 2>/dev/null)" ]
+}
+
+# sign_cert NAME CA SUBJ EKU SANS DAYS: a key and certificate at NAME.key/.crt
+# signed by CA (a prefix under the PKI dir). Written to temp names and moved
+# into place, so a crash leaves either the old pair or the new one.
+sign_cert() {
+  local name="${CP_PKI_DIR}/$1" ca="${CP_PKI_DIR}/$2" subj="$3" eku="$4" sans="$5" days="$6"
+  openssl genrsa -out "${name}.key.tmp" 2048 2>/dev/null
+  chmod 600 "${name}.key.tmp"
+  openssl req -new -key "${name}.key.tmp" -subj "${subj}" -out "${name}.csr" 2>/dev/null
+  openssl x509 -req -in "${name}.csr" -CA "${ca}.crt" -CAkey "${ca}.key" -CAcreateserial \
+    -out "${name}.crt.tmp" -days "${days}" -sha256 \
+    -extfile <(printf 'extendedKeyUsage=%s\n' "${eku}"; [ -z "${sans}" ] || printf 'subjectAltName=%s\n' "${sans}") 2>/dev/null
+  rm -f "${name}.csr"
+  mv -f "${name}.key.tmp" "${name}.key"
+  mv -f "${name}.crt.tmp" "${name}.crt"
+}
+
+# issue_etcd_cert NAME CN EKU SANS DAYS: a certificate from the etcd CA.
+issue_etcd_cert() {
+  log "issuing etcd certificate $1 (CN=$2, $5 days)"
+  sign_cert "$1" etcd-ca "/CN=$2" "$3" "$4" "$5"
+}
+
+# issue_client_cert NAME CN ORG DAYS [always]: a Kubernetes client identity
+# from the cluster CA; reissued when outside policy, or every boot with "always".
 issue_client_cert() {
   local name="$1" cn="$2" org="$3" days="$4" mode="${5:-policy}"
   if [ "${mode}" != "always" ]; then
-    cert_within_policy "${CP_PKI_DIR}/${name}.crt" "${days}" && return 0
+    cert_within_policy "${CP_PKI_DIR}/${name}.crt" "${days}" \
+      && keypair_ok "${CP_PKI_DIR}/${name}.crt" "${CP_PKI_DIR}/${name}.key" && return 0
   fi
   log "issuing client certificate ${name} (CN=${cn}, O=${org}, ${days} days)"
-  openssl genrsa -out "${CP_PKI_DIR}/${name}.key" 2048 2>/dev/null
-  openssl req -new -key "${CP_PKI_DIR}/${name}.key" \
-    -subj "/O=${org}/CN=${cn}" -out "${CP_PKI_DIR}/${name}.csr" 2>/dev/null
-  openssl x509 -req -in "${CP_PKI_DIR}/${name}.csr" \
-    -CA "${CP_PKI_DIR}/ca.crt" -CAkey "${CP_PKI_DIR}/ca.key" -CAcreateserial \
-    -out "${CP_PKI_DIR}/${name}.crt" -days "${days}" -sha256 \
-    -extfile <(printf 'extendedKeyUsage=clientAuth\n') 2>/dev/null
-  rm -f "${CP_PKI_DIR}/${name}.csr"
+  sign_cert "${name}" ca "/O=${org}/CN=${cn}" clientAuth "" "${days}"
 }
 
 write_kubeconfig() {
@@ -809,13 +842,19 @@ detect_memory_limit() {
 }
 
 ETCD_SNAPSHOT_DIR="${CP_STATE_DIR}/snapshots"
-ETCD_ENDPOINT="http://127.0.0.1:${CP_ETCD_CLIENT_PORT}"
+ETCD_ENDPOINT="https://127.0.0.1:${CP_ETCD_CLIENT_PORT}"
+ETCD_PEER_URL="https://127.0.0.1:${CP_ETCD_PEER_PORT}"
+# The supervisor's own etcd client identity (minted every boot in bootstrap_pki).
+ETCDCTL_TLS=(--cacert="${CP_PKI_DIR}/etcd-ca.crt"
+             --cert="${CP_PKI_DIR}/etcd-client-supervisor.crt" --key="${CP_PKI_DIR}/etcd-client-supervisor.key")
 # Long timeouts for the maintenance calls (a defrag or snapshot of a database
 # near the quota), short ones for the probes that gate or poll. etcdctl keeps
 # retrying a refused connection until the command timeout, so a pass against
 # a dead etcd takes up to that long per call; it runs in the background.
-etcdctl_maint() { "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" --dial-timeout 5s --command-timeout 180s "$@"; }
-etcdctl_probe() { "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" --dial-timeout 2s --command-timeout 5s "$@"; }
+etcdctl_maint() { "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" "${ETCDCTL_TLS[@]}" --dial-timeout 5s --command-timeout 180s "$@"; }
+etcdctl_probe() { "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" "${ETCDCTL_TLS[@]}" --dial-timeout 2s --command-timeout 5s "$@"; }
+# etcd wants TLS1.2/TLS1.3 where kube-apiserver wants VersionTLS12/VersionTLS13.
+etcd_tls_min_version() { case "${CP_TLS_MIN_VERSION}" in VersionTLS13) echo TLS1.3 ;; *) echo TLS1.2 ;; esac; }
 # etcd_status_field NAME -> the integer field NAME of `endpoint status`, or
 # "" when etcd does not answer. Never fails: callers run under set -e.
 etcd_status_field() {
@@ -915,6 +954,23 @@ etcd_maintenance() {
   fi
 }
 
+# --initial-* flags are read only when the data directory is created, so a
+# state root from before peer TLS still records http:// as the member's peer
+# URL. Harmless for a single member, but keep the record true.
+etcd_update_peer_url() {
+  local line id urls
+  line="$(etcdctl_probe member list 2>/dev/null | grep ', control-plane, ' | head -1)" || true
+  [ -n "${line}" ] || return 0
+  id="$(printf '%s' "${line}" | cut -d, -f1 | tr -d ' ')"
+  urls="$(printf '%s' "${line}" | cut -d, -f4 | tr -d ' ')"
+  [ "${urls}" != "${ETCD_PEER_URL}" ] || return 0
+  if etcdctl_maint member update "${id}" --peer-urls="${ETCD_PEER_URL}" >/dev/null 2>&1; then
+    log "etcd member peer URL updated from ${urls} to ${ETCD_PEER_URL}"
+  else
+    log "WARNING: could not update the etcd member peer URL from ${urls} to ${ETCD_PEER_URL}"
+  fi
+}
+
 # After boot the pass runs as a background job so the supervise loop keeps
 # its cadence; one at a time.
 MAINT_PID=""
@@ -941,11 +997,20 @@ start_etcd() {
   start_bg etcd "${CP_BIN_DIR}/etcd" \
     --name control-plane \
     --data-dir "${CP_ETCD_DATA_DIR}" \
-    --listen-client-urls "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
-    --advertise-client-urls "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
-    --listen-peer-urls "http://127.0.0.1:${CP_ETCD_PEER_PORT}" \
-    --initial-advertise-peer-urls "http://127.0.0.1:${CP_ETCD_PEER_PORT}" \
-    --initial-cluster "control-plane=http://127.0.0.1:${CP_ETCD_PEER_PORT}" \
+    --listen-client-urls "https://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --advertise-client-urls "https://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --cert-file "${CP_PKI_DIR}/etcd-server.crt" \
+    --key-file "${CP_PKI_DIR}/etcd-server.key" \
+    --trusted-ca-file "${CP_PKI_DIR}/etcd-ca.crt" \
+    --client-cert-auth \
+    --listen-peer-urls "${ETCD_PEER_URL}" \
+    --initial-advertise-peer-urls "${ETCD_PEER_URL}" \
+    --initial-cluster "control-plane=${ETCD_PEER_URL}" \
+    --peer-cert-file "${CP_PKI_DIR}/etcd-server.crt" \
+    --peer-key-file "${CP_PKI_DIR}/etcd-server.key" \
+    --peer-trusted-ca-file "${CP_PKI_DIR}/etcd-ca.crt" \
+    --peer-client-cert-auth \
+    --tls-min-version "$(etcd_tls_min_version)" \
     --initial-cluster-state new \
     --auto-compaction-retention 1 \
     --quota-backend-bytes "${CP_ETCD_QUOTA_BYTES}" \
@@ -956,6 +1021,7 @@ start_etcd() {
   # the previous run (endpoint health reports an alarmed member unhealthy,
   # which would otherwise wedge the boot). "healthy" then demands the real thing.
   wait_ready "etcd serving" "${CP_READY_TIMEOUT}" etcdctl_probe endpoint status
+  etcd_update_peer_url
   etcd_maintenance boot || log "WARNING: etcd maintenance (boot) did not complete"
   # Healthy means no alarm. Booting on through a NOSPACE alarm was tried and
   # does not work: crossplane core init needs writes and fails five attempts
@@ -1129,7 +1195,10 @@ start_apiserver() {
   local extra=()
   mapfile -t extra < <(apiserver_audit_flags; apiserver_token_flags)
   start_bg kube-apiserver "${CP_BIN_DIR}/kube-apiserver" \
-    --etcd-servers "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --etcd-servers "https://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --etcd-cafile "${CP_PKI_DIR}/etcd-ca.crt" \
+    --etcd-certfile "${CP_PKI_DIR}/etcd-client-apiserver.crt" \
+    --etcd-keyfile "${CP_PKI_DIR}/etcd-client-apiserver.key" \
     --bind-address "${CP_APISERVER_BIND_ADDRESS}" \
     --secure-port "${CP_APISERVER_PORT}" \
     --advertise-address "${CP_APISERVER_ADVERTISE_ADDRESS}" \
@@ -1577,7 +1646,8 @@ main() {
     fi
     if [ $((tick % 720)) -eq 0 ]; then
       local c
-      for c in admin-internal controller-manager apiserver; do
+      for c in admin-internal controller-manager apiserver \
+               etcd-server etcd-client-apiserver etcd-client-supervisor; do
         cert_fresh "${CP_PKI_DIR}/${c}.crt" $(( 7 * 86400 )) \
           || { log "certificate ${c} expires within 7 days -- restarting to reissue"; exit 1; }
       done
