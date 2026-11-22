@@ -165,9 +165,7 @@ COPY --from=crossplane-build /out/webhookconfigurations/ ${CP_HOME}/crds/webhook
 # CP_STATE_DIR is the one persistent mount (etcd, PKI, VERSION); the why and
 # the guards are documented at CP_STATE_DIR in control-plane.sh. Mount the
 # platform volume exactly here. CP_REQUIRE_PERSISTENT makes a forgotten mount
-# fail the boot. The container starts as root (no USER below) purely so the
-# supervisor can chown a root-owned platform volume to CP_RUN_UID before it
-# re-execs itself unprivileged.
+# fail the boot. Starts as root by design; see Step -2 in control-plane.sh.
 ENV CP_STATE_DIR=${CP_HOME}/state
 ENV CP_REQUIRE_PERSISTENT=true
 ENV CP_RUN_UID=${USER_ID}
@@ -178,8 +176,8 @@ RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/cache ${CP_HOME}/tf ${CP_S
 
 VOLUME ${CP_STATE_DIR}
 
-# Deliberately no USER: control-plane.sh drops to CP_RUN_UID itself after the
-# volume chown. Set CP_STAY_ROOT=true to opt out (not recommended).
+# Deliberately no USER: control-plane.sh (Step -2) drops to CP_RUN_UID itself
+# after taking ownership of the volume.
 
 # 6443 kube-apiserver (put a Railway *TCP* proxy in front: HTTP domains
 #      terminate TLS at the edge and this API server serves its own TLS).

@@ -84,10 +84,15 @@ Keeping only etcd persistent, as Phase 1 did, meant every redeploy minted a new 
 and invalidated every kubeconfig ever issued (finding B1 of the [Phase 1 review](phase-1-review.md)).
 
 Ownership first: Railway mounts volumes root-owned, so the image starts as root (no `USER`), and
-the supervisor's very first step chowns the state root and the ephemeral directories to `CP_RUN_UID`
-(default 65532; recursive only when the owner differs, so a healthy boot costs one `stat`), then
-re-execs itself through `su-exec` as that uid with the same environment. Everything after that line,
-etcd and the API server included, runs unprivileged. `CP_STAY_ROOT=true` opts out, with a warning.
+the supervisor's very first step takes ownership of the state root and the ephemeral directories for
+`CP_RUN_UID:CP_RUN_GID` (default 65532), then re-execs itself through `su-exec` as that uid with the
+same environment. A tree is chowned recursively only when some inode in it has a different owner or
+group (a healthy tree costs one short `find`; `CP_FORCE_CHOWN=true` forces it), which also repairs
+root-owned files left by an earlier root-run boot. Before touching anything as root the supervisor
+refuses a uid or gid of 0, a non-numeric value, a path that resolves to `/` or a system directory,
+and a layout where the state root is or contains `CP_HOME`; a sentinel in the environment makes a
+second pass through the root phase fatal. Everything after the re-exec, etcd and the API server
+included, runs unprivileged. `CP_STAY_ROOT=true` opts out, with a warning.
 
 Guards at boot, in order: the root must not be `CP_HOME` or contain the ephemeral `log/`, `run/` or
 `cache/`; it must be writable by the running uid; it is forced to mode 0700 and everything the

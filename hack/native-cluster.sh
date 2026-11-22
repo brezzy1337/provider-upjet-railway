@@ -17,6 +17,13 @@
 #   hack/native-cluster.sh down    # stop everything still holding .work/native
 #   hack/native-cluster.sh clean   # down, then remove state (keeps binaries)
 #
+# Root path (what the image does on Railway): chown .work/native/state to root
+# to imitate a platform mount, then
+#   sudo -E env PATH="$PATH" hack/native-cluster.sh up
+# The supervisor chowns the state root back to the checkout owner (CP_RUN_UID
+# defaults to that uid here) and re-execs itself unprivileged; `verify` then
+# asserts that no component runs as uid 0.
+#
 # State lives in .work/native (gitignored). Set NATIVE_WORK to relocate.
 # ==============================================================================
 set -euo pipefail
@@ -170,13 +177,24 @@ stage_crds() {
   rm -rf "${HOME_DIR}/crds/railway"
   mkdir -p "${HOME_DIR}/crds/railway"
   cp package/crds/*.yaml "${HOME_DIR}/crds/railway/"
+  # Under a root run (see header) these files were just written by root; hand
+  # them to the uid the supervisor will drop to, so a healthy boot needs no chown.
+  if [ "$(id -u)" = "0" ] && [ -n "${CP_RUN_UID:-}" ]; then
+    chown -R "${CP_RUN_UID}:${CP_RUN_GID:-${CP_RUN_UID}}" "${HOME_DIR}"
+  fi
 }
 
 export_env() {
   export CP_HOME="${HOME_DIR}"
   export CP_BIN_DIR="${BIN}"
   # etcd + pki + VERSION under one root, like the image
-  export CP_STATE_DIR="${NATIVE_WORK}/state"
+  export CP_STATE_DIR="${CP_STATE_DIR:-${NATIVE_WORK}/state}"
+  # When started as root, drop to the checkout's owner (not 65532, which could
+  # not traverse the repository) unless the caller chose otherwise.
+  # The gid comes from that user's primary group, not from the directory: a
+  # codespace checkout is often user:root, and the supervisor refuses gid 0.
+  export CP_RUN_UID="${CP_RUN_UID:-$(stat -c %u "${REPO}")}"
+  export CP_RUN_GID="${CP_RUN_GID:-$(id -g "${CP_RUN_UID}" 2>/dev/null || printf '%s' "${CP_RUN_UID}")}"
   export CP_CRD_DIRS="${HOME_DIR}/crds/railway"
   export CP_CROSSPLANE_CRDS_DIR="${HOME_DIR}/crds/crossplane"
   export CP_WEBHOOK_CONFIGS_DIR="${HOME_DIR}/crds/webhookconfigurations"
@@ -189,8 +207,8 @@ export_env() {
 up() {
   need_tools
   [ -x "$BIN/provider" ] || build
-  stage_crds
   export_env
+  stage_crds
   say "booting control plane (Ctrl-C to stop)"
   exec cluster/images/control-plane/control-plane.sh
 }
@@ -251,6 +269,9 @@ verify() {
     printf '%s\n' "${ident_now}" > "${ident_file}"
     check "cluster identity recorded for later restart comparison" test -s "${ident_file}"
   fi
+  # B2: nothing in the control plane may run as root, however it was started.
+  check "no control-plane process runs as uid 0" bash -c \
+    "pids=\$(pgrep -f '${NATIVE_WORK}/bin/'); [ -n \"\$pids\" ] && ! ps -o uid= -p \$pids | grep -qx ' *0'"
   check "etcd healthy" env ETCDCTL_API=3 "$BIN/etcdctl" \
     --endpoints "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" endpoint health
   check "apiserver /readyz" "${k[@]}" get --raw=/readyz

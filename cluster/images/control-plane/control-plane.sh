@@ -59,6 +59,8 @@ CP_REQUIRE_PERSISTENT="${CP_REQUIRE_PERSISTENT:-false}"
 CP_RUN_UID="${CP_RUN_UID:-65532}"
 CP_RUN_GID="${CP_RUN_GID:-${CP_RUN_UID}}"
 CP_STAY_ROOT="${CP_STAY_ROOT:-false}"
+# Force the recursive chown even when no mismatched file is found.
+CP_FORCE_CHOWN="${CP_FORCE_CHOWN:-false}"
 CP_KCM_PORT="${CP_KCM_PORT:-10257}"   # kube-controller-manager secure/health port, loopback only
 CP_ETCD_CLIENT_PORT="${CP_ETCD_CLIENT_PORT:-2379}"
 CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-2380}"
@@ -202,30 +204,83 @@ kc() { "${CP_BIN_DIR}/kubectl" --kubeconfig "${KUBECONFIG_INTERNAL}" "$@"; }
 # never fix that, so the image starts as root, chowns the state root and the
 # ephemeral dirs to CP_RUN_UID, and re-execs this same script as that uid with
 # the same arguments and environment. The whole control plane then runs
-# unprivileged. The chown is recursive only when the state root is not already
-# owned by the target uid (an interim root-run deployment leaves root-owned
-# pki/ and etcd/ behind; a healthy one costs a single stat).
+# unprivileged. The chown is recursive only for a tree in which some inode is
+# not owned by the target uid:gid (an interim root-run deployment leaves
+# root-owned pki/ and etcd/ behind); a healthy tree costs one short find.
 # ------------------------------------------------------------------------------
+# Layout guard, shared by the root phase (so nothing is chowned recursively on
+# a misconfigured path) and prepare_state_dir.
+check_layout() {
+  case "${CP_STATE_DIR%/}" in
+    ""|"/") fail "CP_STATE_DIR must be a real directory, not '${CP_STATE_DIR}'" ;;
+    "${CP_HOME%/}") fail "CP_STATE_DIR must not equal CP_HOME (${CP_HOME}); mount the volume at a subdirectory such as ${CP_HOME}/state" ;;
+  esac
+  local d
+  for d in "${CP_LOG_DIR}" "${CP_RUN_DIR}" "${CP_HOME}/cache"; do
+    case "${d%/}/" in "${CP_STATE_DIR%/}/"*) fail "CP_STATE_DIR (${CP_STATE_DIR}) must not contain ephemeral dir ${d}" ;; esac
+  done
+}
+
+# safe_root_path DIR: refuse to run root-time mkdir/chown on anything that is
+# not a plain data directory: /, a system tree, or anything holding CP_BIN_DIR.
+safe_root_path() {
+  local d r b
+  d="$1"; r="$(readlink -f "$d" 2>/dev/null || printf '%s' "$d")"; b="$(readlink -f "${CP_BIN_DIR}" 2>/dev/null || printf '%s' "${CP_BIN_DIR}")"
+  case "${r}" in
+    ""|/|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/boot|/boot/*|/root|/root/*)
+      fail "refusing to take ownership of ${d} (resolves to '${r}'); CP_STATE_DIR/CP_HOME/CP_LOG_DIR/CP_RUN_DIR must be plain data directories" ;;
+  esac
+  case "${b}/" in "${r%/}/"*) fail "refusing to take ownership of ${d}: it contains CP_BIN_DIR (${CP_BIN_DIR})" ;; esac
+}
+
+# own_tree DIR: chown -R DIR to CP_RUN_UID:CP_RUN_GID if any inode in it (on
+# the same filesystem) has a different owner or group, or if CP_FORCE_CHOWN.
+# A healthy tree costs one short find; a tree left root-owned by an earlier
+# root-run boot gets fixed wholesale. -xdev keeps a chown of CP_HOME from
+# descending into the state volume mounted under it (that one is done on its own).
+own_tree() {
+  local d="$1"
+  [ -d "$d" ] || return 0
+  if [ "${CP_FORCE_CHOWN}" = "true" ] \
+     || find "$d" -xdev \( ! -user "${CP_RUN_UID}" -o ! -group "${CP_RUN_GID}" \) -print -quit 2>/dev/null | grep -q .; then
+    log "chown -R ${CP_RUN_UID}:${CP_RUN_GID} $d"
+    chown -hR "${CP_RUN_UID}:${CP_RUN_GID}" "$d"   # -h: never follow a symlink operand
+  fi
+}
+
 drop_privileges_if_root() {
   [ "$(id -u)" = "0" ] || return 0
   if [ "${CP_STAY_ROOT}" = "true" ]; then
-    log "WARNING: running the control plane as root because CP_STAY_ROOT=true"
+    log "WARNING: CP_STAY_ROOT=true: everything, the internet-facing API server included, runs as root"
     return 0
   fi
+  # System tools first while we are root; the harness prepends its own bin dir.
+  PATH="/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+  [ -z "${CP_PRIVS_DROPPED:-}" ] \
+    || fail "still uid 0 after dropping privileges to ${CP_RUN_UID}:${CP_RUN_GID}; refusing to loop. Set CP_STAY_ROOT=true only if you accept running as root"
+  [[ "${CP_RUN_UID}" =~ ^[0-9]+$ ]] && [[ "${CP_RUN_GID}" =~ ^[0-9]+$ ]] \
+    || fail "CP_RUN_UID and CP_RUN_GID must be numeric (got '${CP_RUN_UID}' / '${CP_RUN_GID}')"
+  { [ "${CP_RUN_UID}" != "0" ] && [ "${CP_RUN_GID}" != "0" ]; } \
+    || fail "CP_RUN_UID/CP_RUN_GID=0 would keep root privileges; set CP_STAY_ROOT=true if that is really what you want"
   command -v su-exec >/dev/null 2>&1 \
     || fail "running as root but su-exec is not installed (apk add su-exec); set CP_STAY_ROOT=true only if you accept running everything as root"
-  log "started as root: taking ownership of ${CP_STATE_DIR} and ${CP_HOME} for ${CP_RUN_UID}:${CP_RUN_GID}, then dropping privileges"
-  mkdir -p "${CP_STATE_DIR}" "${CP_HOME}" "${CP_LOG_DIR}" "${CP_RUN_DIR}" "${CP_HOME}/cache" "${CP_HOME}/tf"
+  check_layout
+  log "started as root: taking ownership for ${CP_RUN_UID}:${CP_RUN_GID}, then dropping privileges"
+  # Create only what the unprivileged process could not create itself (the
+  # mount and its parents); main() makes the ephemeral dirs after the drop.
   local d
-  for d in "${CP_STATE_DIR}" "${CP_HOME}" /terraform; do
-    [ -d "$d" ] || continue
-    if [ "$(stat -c %u "$d")" != "${CP_RUN_UID}" ] || [ "${CP_FORCE_CHOWN:-false}" = "true" ]; then
-      log "chown -R ${CP_RUN_UID}:${CP_RUN_GID} $d"
-      chown -R "${CP_RUN_UID}:${CP_RUN_GID}" "$d"
-    fi
+  for d in "${CP_STATE_DIR}" "${CP_HOME}" "${CP_LOG_DIR}" "${CP_RUN_DIR}"; do
+    safe_root_path "$d"
   done
-  chmod 700 "${CP_STATE_DIR}"
-  exec su-exec "${CP_RUN_UID}:${CP_RUN_GID}" env HOME="${CP_HOME}" "$0" "$@"
+  for d in "${CP_STATE_DIR}" "${CP_HOME}" "${CP_LOG_DIR}" "${CP_RUN_DIR}"; do
+    mkdir -p "$d"
+  done
+  own_tree "${CP_STATE_DIR}"
+  own_tree "${CP_HOME}"
+  own_tree "${CP_LOG_DIR}"
+  own_tree "${CP_RUN_DIR}"
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  exec su-exec "${CP_RUN_UID}:${CP_RUN_GID}" env HOME="${CP_HOME}" CP_PRIVS_DROPPED=1 "${self}" "$@"
 }
 
 # ------------------------------------------------------------------------------
@@ -255,18 +310,12 @@ version_lt() {
 minor_of() { local v; v="$(version_core "$1")"; v="${v#v}"; printf '%s' "${v#*.}" | cut -d. -f1; }
 
 prepare_state_dir() {
-  # Guard the layout itself before touching anything.
-  case "${CP_STATE_DIR%/}" in
-    "${CP_HOME%/}") fail "CP_STATE_DIR must not equal CP_HOME (${CP_HOME}); mount the volume at a subdirectory such as ${CP_HOME}/state" ;;
-  esac
+  check_layout
   local d
-  for d in "${CP_LOG_DIR}" "${CP_RUN_DIR}" "${CP_HOME}/cache"; do
-    case "${d%/}/" in "${CP_STATE_DIR%/}/"*) fail "CP_STATE_DIR (${CP_STATE_DIR}) must not contain ephemeral dir ${d}" ;; esac
-  done
 
   mkdir -p "${CP_STATE_DIR}" 2>/dev/null || true
   [ -d "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} does not exist and cannot be created"
-  [ -w "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} is not writable by uid $(id -u). Start the container as root (the image default) so the supervisor can chown the mount and drop to CP_RUN_UID, or chown it to $(id -u) yourself"
+  [ -w "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} is not writable by uid $(id -u) (root-owned mount? see Step -2: start as root and the supervisor chowns it)"
   chmod 700 "${CP_STATE_DIR}" 2>/dev/null || true
   [ "$(stat -c %a "${CP_STATE_DIR}")" = "700" ] || fail "state dir ${CP_STATE_DIR} is mode $(stat -c %a "${CP_STATE_DIR}"), not 700, and chmod failed (owner uid $(stat -c %u "${CP_STATE_DIR}"), we are $(id -u))"
   mkdir -p "${CP_PKI_DIR}" "${CP_ETCD_DATA_DIR}"

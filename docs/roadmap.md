@@ -1,6 +1,6 @@
 # Roadmap and status
 
-_Last updated 2026-11-21._
+_Last updated 2026-11-22._
 
 ## End goal
 
@@ -54,10 +54,10 @@ the volume, volume ownership, secrets encryption and audit, token handling, etcd
 ### Phase 2: deploy to Railway. Next
 
 Service from the image, one volume mounted at `CP_STATE_DIR` (etcd data, PKI and `VERSION` stamp;
-B1, done 2026-11-21 in PR #5), the container starting as root only to chown that volume before
-dropping to an unprivileged uid (B2, done 2026-11-22 in PR #6), TCP proxy on 6443, env vars for the
-Railway token and API-server credential material. Still to do before the first deploy: B3 secrets
-encryption, audit log and shorter credentials, B4 token handling, B5 etcd quota and memory limits. First spike after that: a composition function as a supervised process,
+B1, done 2026-11-21 in PR #5; ownership of that volume handled by the image itself, B2, done
+2026-11-22 in PR #6), TCP proxy on 6443, env vars for the Railway token and API-server credential
+material. Still to do before the first deploy: B3 secrets encryption, audit log and shorter
+credentials, B4 token handling, B5 etcd quota and memory limits. First spike after that: a composition function as a supervised process,
 since every XRD depends on it. Done when the `Project` smoke test passes over the internet.
 Consider provisioning the service with this provider once it exists.
 
