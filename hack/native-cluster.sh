@@ -359,22 +359,39 @@ verify() {
   # environment inside single-quoted bash -c scripts, so the probes never put
   # it on a command line either.
   local ns="${CP_CROSSPLANE_NAMESPACE:-crossplane-system}"
-  check "RAILWAY_TOKEN is in no control-plane component's environment (descendants included)" bash -c '
+  # Same trim as the supervisor, so a padded value compares equal; exported so
+  # the probes below see it (a plain shell variable would not reach them).
+  if [ -n "${RAILWAY_TOKEN:-}" ]; then
+    RAILWAY_TOKEN="${RAILWAY_TOKEN#"${RAILWAY_TOKEN%%[![:space:]]*}"}"
+    RAILWAY_TOKEN="${RAILWAY_TOKEN%"${RAILWAY_TOKEN##*[![:space:]]}"}"
+    export RAILWAY_TOKEN
+  fi
+  # Every process under the supervisor (components and, when present, the
+  # terraform processes the provider forks; Go keeps argv[0] as "terraform",
+  # so a path match would miss them) must lack RAILWAY_TOKEN. Fail closed: no
+  # supervisor, no descendants or an unreadable environ is a FAIL, not a pass.
+  check "RAILWAY_TOKEN is in no process under the supervisor (components and their children)" bash -c '
     descend() { local c; for c in $(pgrep -P "$1" || true); do echo "$c"; descend "$c"; done; }
-    pids=$(pgrep -f "$1"); [ -n "$pids" ] || exit 1
-    # Terraform shows up as plain "terraform init", not by its path (Go keeps
-    # argv[0] as given), so walk each component'"'"'s children too.
-    for p in $pids; do pids="$pids $(descend "$p")"; done
+    sup=$(pgrep -f "$1" | grep -vx "$$" | head -1); [ -n "$sup" ] || { echo "no supervisor" >&2; exit 1; }
+    pids=$(descend "$sup"); [ -n "$pids" ] || { echo "no processes under supervisor $sup" >&2; exit 1; }
     for p in $pids; do
-      [ "$p" = "$$" ] && continue    # this probe matches its own argv
-      if tr "\0" "\n" < "/proc/$p/environ" 2>/dev/null | grep -q "^RAILWAY_TOKEN="; then
+      e=$(tr "\0" "\n" < "/proc/$p/environ") || { echo "cannot read environ of pid $p" >&2; exit 1; }
+      if printf "%s\n" "$e" | grep -q "^RAILWAY_TOKEN="; then
         echo "pid $p: $(tr "\0" " " < "/proc/$p/cmdline" | cut -c1-80)" >&2; exit 1
       fi
-    done' _ "${NATIVE_WORK}/"
+    done' _ "cluster/images/control-plane/control-plane.sh"
   if [ -n "${RAILWAY_TOKEN:-}" ]; then
-    check "railway-creds Secret holds exactly {\"token\":\"<RAILWAY_TOKEN>\"}" bash -c '
+    # Positive control for the documented residual: the supervisor'"'"'s own
+    # exec-time environment still holds the token (bash cannot scrub it). If
+    # this ever fails, the residual was closed and the architecture page is stale.
+    check "supervisor's own environ still holds RAILWAY_TOKEN (documented residual, pinned)" bash -c '
+      sup=$(pgrep -f "$1" | grep -vx "$$" | head -1); [ -n "$sup" ] || exit 1
+      tr "\0" "\n" < "/proc/$sup/environ" | grep -qx "RAILWAY_TOKEN=${RAILWAY_TOKEN}"' _ "cluster/images/control-plane/control-plane.sh"
+    check "railway-creds Secret holds exactly {\"token\":\"<RAILWAY_TOKEN>\"} (verify needs the same RAILWAY_TOKEN as up)" bash -c '
       got=$("$1" --kubeconfig "$2" -n "$3" get secret railway-creds -o "go-template={{index .data \"credentials\"}}" | base64 -d)
       [ "$got" = "{\"token\":\"${RAILWAY_TOKEN}\"}" ]' _ "$BIN/kubectl" "$KC" "$ns"
+    check "railway-creds carries no last-applied-configuration annotation (server-side apply)" bash -c \
+      "! '$BIN/kubectl' --kubeconfig '$KC' -n '$ns' get secret railway-creds -o jsonpath='{.metadata.annotations}' | grep -q last-applied-configuration"
     check "ProviderConfig/default points at railway-creds" bash -c \
       "'$BIN/kubectl' --kubeconfig '$KC' get providerconfig.railway.crossplane.io default -o jsonpath='{.spec.credentials.secretRef.name}' | grep -qx railway-creds"
     check "RAILWAY_TOKEN value is on no process command line" bash -c '
@@ -386,7 +403,7 @@ verify() {
     check "RAILWAY_TOKEN value appears in no log under CP_LOG_DIR (audit log included)" bash -c '
       ! grep -rqF -f <(printf "%s\n" "${RAILWAY_TOKEN}") "$1"' _ "${CP_LOG_DIR}"
   else
-    printf 'SKIP  railway-creds Secret, ProviderConfig, command-line and log checks (RAILWAY_TOKEN unset for verify)\n'
+    printf 'SKIP  railway-creds Secret, annotation, ProviderConfig, command-line, log and residual checks (RAILWAY_TOKEN unset for verify)\n'
   fi
 
   # Owner-reference cascading deletion is the garbage collector's job, and the

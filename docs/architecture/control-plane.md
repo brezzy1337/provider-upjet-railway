@@ -43,7 +43,8 @@ TCP proxy on 6443 with the proxy hostname in its serving certificate. Authentica
 bearer token or client certificates. Anonymous access is off.
 
 **Secrets.** Cloud credentials arrive as Railway environment variables and are written into
-`ProviderConfig` Secrets by the boot script. Nothing is baked into the image.
+`ProviderConfig` Secrets by the boot script, which removes them from the environment before any
+component starts (see Secrets, audit and credential lifetimes). Nothing is baked into the image.
 
 **Keep the API server small.** Use family providers, never monoliths: `provider-aws-eks` plus
 `provider-aws-ec2` plus `provider-aws-iam`, `provider-gcp-container` plus `provider-gcp-compute`, and
@@ -165,21 +166,30 @@ revocation path, so `CP_ADMIN_TOKEN_ENABLED` is `false` in the image: no token f
 API server, no token kubeconfig is written, and a token file left by an earlier boot is removed. The
 native harness keeps it on. When on, `CP_ADMIN_TOKEN` rotates it as described above.
 
-**The Railway token.** `RAILWAY_TOKEN` is read once at the top of the boot, right after the
-privilege drop and before any component starts: whitespace is stripped, anything outside
-`[A-Za-z0-9-]` is refused with a fatal error that does not echo the value, and the variable is
-removed from the environment, so etcd, the API server, the controller manager, Crossplane, the
-provider and the terraform processes it forks never inherit it (B4). The `railway-creds` Secret is
-built from that value by a builtin `printf` piped into `kubectl create secret
---from-file=credentials=/dev/stdin`, so the token is on no command line and in no file; the
-character check is what makes the hand-built JSON safe (the image has no `jq`). The token is never
-logged, and a boot without it warns and leaves any Secret from an earlier boot in place. One copy
-remains: bash's `unset` does not scrub a process's own exec-time environment block, so
-`/proc/<supervisor pid>/environ` holds the token for the life of the container. Everything in the
-container runs as one uid and holds the cluster-admin kubeconfig that can read the Secret, so that
-copy grants nothing extra; scrubbing it would take a re-exec of the supervisor with the token handed
-over on a pipe, which is not worth the moving parts today. The harness `verify` checks all of this
-when run with the same `RAILWAY_TOKEN` as `up`.
+**The Railway token.** `RAILWAY_TOKEN` is read once before any component starts, right after the
+privilege drop: leading and trailing whitespace is dropped, anything else outside `[A-Za-z0-9-]`
+(interior whitespace included) is refused with a fatal error that does not echo the value, and the
+variable is removed from the environment, so etcd, the API server, the controller manager,
+Crossplane, the provider and the terraform processes it forks never inherit it (B4). Refusal is
+fail-fast: a malformed value stops the boot, and on Railway that means a restart loop until the
+variable is fixed, the same trade as `CP_ENCRYPTION_KEY`. The `railway-creds` Secret is built from
+the value by a builtin `printf` piped into `kubectl create secret --from-file=credentials=/dev/stdin`
+and written with server-side apply, so the token is on no command line, in no file, and not
+duplicated into a last-applied-configuration annotation; the character check is what makes the
+hand-built JSON safe (the image has no `jq`). kubectl's diagnostics on a failed write are logged
+with the token and its base64 form masked. A boot without a token warns and leaves any Secret from
+an earlier boot in place.
+
+Two copies of the token remain and are accepted. The root phase's short-lived helpers (`find`,
+`chown`, `su-exec`) run before the drop and inherit it; they run as root, which can read anything
+anyway. And bash's `unset` does not scrub a process's own exec-time environment block, so
+`/proc/<supervisor pid>/environ` holds the token for the life of the container. Every process in
+the container runs as the same uid and can read the cluster-admin kubeconfig, and with it the Secret,
+so that copy gives a same-uid process no extra reach. The justification is the single-uid model: if
+the provider ever gets its own uid, or etcd client authentication separates privileges, scrub it, which
+takes a re-exec of the supervisor with the token handed over on a pipe. The harness pins the residual
+with a positive control, so closing it without updating this page fails `verify`. The `verify`
+checks for all of this run when it is given the same `RAILWAY_TOKEN` as `up`.
 
 Still open from B3: etcd listens on loopback without client authentication, so any process in the
 container can read and write etcd directly. Client certificates for etcd, or a Unix socket, are the

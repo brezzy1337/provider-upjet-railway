@@ -59,8 +59,8 @@ B1, done 2026-11-21 in PR #5; ownership of that volume handled by the image itse
 the Railway token out of every component's environment, B4, done 2026-11-22 in PR #8), TCP proxy on
 6443, env vars for the Railway token, `CP_ENCRYPTION_KEY` and API-server credential material. Still
 to do before the first deploy: B5 etcd quota and memory limits; etcd client authentication is the B3
-leftover. First spike after that: a composition function as a supervised process,
-since every XRD depends on it. Done when the `Project` smoke test passes over the internet.
+leftover. First spike after that: a composition function as a supervised process, since every XRD
+depends on it. Done when the `Project` smoke test passes over the internet.
 Consider provisioning the service with this provider once it exists.
 
 ### Phase 3: first cloud, DigitalOcean
