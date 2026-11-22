@@ -29,6 +29,10 @@
 # just fails its reconciles. Pass the same value to `verify` to turn on the
 # checks that need it (Secret contents, no trace in ps or logs).
 #
+# Memory: this host has no cgroup limit, so the harness passes a 4 GiB
+# CP_MEMORY_LIMIT_BYTES by default to exercise the GOMEMLIMIT path; set it
+# empty (CP_MEMORY_LIMIT_BYTES=) to test cgroup detection itself.
+#
 # State lives in .work/native (gitignored). Set NATIVE_WORK to relocate.
 # ==============================================================================
 set -euo pipefail
@@ -103,11 +107,12 @@ build() {
       "https://dl.k8s.io/release/${KUBERNETES_VERSION}/bin/${os}/${arch}/kubectl"
     chmod +x "$BIN/kubectl"
   fi
-  if [ ! -x "$BIN/etcd" ]; then
+  if [ ! -x "$BIN/etcd" ] || [ ! -x "$BIN/etcdutl" ]; then
     say "fetching etcd ${ETCD_VERSION}"
     curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-${os}-${arch}.tar.gz" \
       | tar -xz -C "$BIN" --strip-components=1 \
-          "etcd-${ETCD_VERSION}-${os}-${arch}/etcd" "etcd-${ETCD_VERSION}-${os}-${arch}/etcdctl"
+          "etcd-${ETCD_VERSION}-${os}-${arch}/etcd" "etcd-${ETCD_VERSION}-${os}-${arch}/etcdctl" \
+          "etcd-${ETCD_VERSION}-${os}-${arch}/etcdutl"
   fi
   if [ ! -x "$BIN/terraform" ]; then
     say "fetching terraform ${TERRAFORM_VERSION}"
@@ -202,6 +207,10 @@ export_env() {
   export CP_LOG_DIR="${CP_LOG_DIR:-${HOME_DIR}/log}"
   export CP_AUDIT_LOG_PATH="${CP_AUDIT_LOG_PATH:-${CP_LOG_DIR}/audit.log}"
   export CP_CLIENT_CERT_DAYS="${CP_CLIENT_CERT_DAYS:-90}"
+  export CP_ETCD_QUOTA_BYTES="${CP_ETCD_QUOTA_BYTES:-2147483648}"
+  export CP_ETCD_SNAPSHOT_KEEP="${CP_ETCD_SNAPSHOT_KEEP:-2}"
+  # Unset: 4 GiB. Empty: let the supervisor read the (absent) cgroup limit.
+  export CP_MEMORY_LIMIT_BYTES="${CP_MEMORY_LIMIT_BYTES-4294967296}"
   export CP_RUN_UID="${CP_RUN_UID:-$(stat -c %u "${REPO}")}"
   export CP_RUN_GID="${CP_RUN_GID:-$(id -g "${CP_RUN_UID}" 2>/dev/null || printf '%s' "${CP_RUN_UID}")}"
   export CP_CRD_DIRS="${HOME_DIR}/crds/railway"
@@ -215,7 +224,7 @@ export_env() {
 
 up() {
   need_tools
-  [ -x "$BIN/provider" ] || build
+  { [ -x "$BIN/provider" ] && [ -x "$BIN/etcdutl" ]; } || build
   export_env
   stage_crds
   say "booting control plane (Ctrl-C to stop)"
@@ -405,6 +414,46 @@ verify() {
   else
     printf 'SKIP  railway-creds Secret, annotation, ProviderConfig, command-line, log and residual checks (RAILWAY_TOKEN unset for verify)\n'
   fi
+
+  # B5: quota on etcd, snapshots on the volume, GOMEMLIMIT on every Go process.
+  local sup_pat="cluster/images/control-plane/control-plane.sh"
+  check "etcd runs with --quota-backend-bytes ${CP_ETCD_QUOTA_BYTES}" bash -c '
+    p=$(pgrep -f "^$1/bin/etcd " | head -1); [ -n "$p" ] || exit 1
+    tr "\0" "\n" < "/proc/$p/cmdline" | grep -A1 -x -- --quota-backend-bytes | grep -qx "$2"' _ "${NATIVE_WORK}" "${CP_ETCD_QUOTA_BYTES}"
+  check "etcd has no alarm raised" bash -c \
+    "[ -z \"\$(ETCDCTL_API=3 '$BIN/etcdctl' --endpoints http://127.0.0.1:${CP_ETCD_CLIENT_PORT} alarm list)\" ]"
+  if [ -n "${CP_MEMORY_LIMIT_BYTES:-}" ]; then
+    # Same table as gomemlimit_share in the supervisor; the sum must stay under the limit.
+    check "GOMEMLIMIT on every Go component is its share of CP_MEMORY_LIMIT_BYTES (sum under the limit)" bash -c '
+      limit=$2; sum=0
+      for spec in kube-apiserver=35 etcd=15 provider=15 kube-controller-manager=10 crossplane=10; do
+        n=${spec%=*}; pct=${spec#*=}
+        p=$(pgrep -f "^$1/bin/$n " | head -1); [ -n "$p" ] || { echo "no $n" >&2; exit 1; }
+        want="GOMEMLIMIT=$(( limit * pct / 100 / 1048576 ))MiB"
+        tr "\0" "\n" < "/proc/$p/environ" | grep -qx "$want" || { echo "$n lacks $want" >&2; exit 1; }
+        sum=$(( sum + limit * pct / 100 ))
+      done
+      [ "$sum" -lt "$limit" ]' _ "${NATIVE_WORK}" "${CP_MEMORY_LIMIT_BYTES}"
+  else
+    printf 'SKIP  GOMEMLIMIT check (CP_MEMORY_LIMIT_BYTES empty: cgroup detection mode)\n'
+  fi
+  local snapdir="${CP_STATE_DIR}/snapshots"
+  check "a boot snapshot exists under state/snapshots, mode 0600" bash -c \
+    "f=\$(ls -1 '${snapdir}'/etcd-*.db 2>/dev/null | sort | tail -1); [ -n \"\$f\" ] && [ \"\$(stat -c %a \"\$f\")\" = 600 ]"
+  check "SIGUSR1 to the supervisor produces a new snapshot that etcdutl can read" bash -c '
+    sup=$(pgrep -f "$1" | grep -vx "$$" | head -1); [ -n "$sup" ] || exit 1
+    last=$(ls -1 "$2"/etcd-*.db 2>/dev/null | sort | tail -1)
+    sleep 1   # snapshot names have one-second resolution
+    kill -USR1 "$sup" || exit 1
+    for i in $(seq 1 60); do
+      new=$(ls -1 "$2"/etcd-*.db 2>/dev/null | sort | tail -1)
+      [ -n "$new" ] && [ "$new" != "$last" ] && [ ! -e "$new.part" ] && break
+      sleep 1
+    done
+    [ -n "$new" ] && [ "$new" != "$last" ] || { echo "no new snapshot" >&2; exit 1; }
+    "$3" snapshot status "$new" -w table | grep -q -i revision' _ "${sup_pat}" "${snapdir}" "$BIN/etcdutl"
+  check "snapshots are pruned to CP_ETCD_SNAPSHOT_KEEP (${CP_ETCD_SNAPSHOT_KEEP})" bash -c \
+    "[ \"\$(ls -1 '${snapdir}'/etcd-*.db | wc -l)\" -le ${CP_ETCD_SNAPSHOT_KEEP} ]"
 
   # Owner-reference cascading deletion is the garbage collector's job, and the
   # garbage collector lives in kube-controller-manager. Prove it actually runs.
