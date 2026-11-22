@@ -19,7 +19,7 @@ the control-plane service itself and the user application. See
 | Build and unit tests | Passed 2026-11-20 on Go 1.26.11: `go build`, `go test`, `golangci-lint` with 0 issues. The patched Terraform provider builds from `hack/upstream/` and its tests pass. |
 | Live verification | `Project` create → visible in Railway → delete → gone, via kind + Crossplane 2.2.1 + the provider out-of-cluster (2026-08-25, repeated through the native control plane 2026-08-26). No other kind has been exercised live. |
 | Upstream dependency | Blocked on [PR #93](https://github.com/terraform-community-providers/terraform-provider-railway/pull/93) (open, no activity since 2026-08-25). Upstream shipped 0.6.3 on 2026-10-19 **without** the fix. We build from a patch; see [The not-found patch](upstream/not-found-patch.md). |
-| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5), B2 (PR #6), B3 (PR #7), B4 (PR #8) and B5 (PR #9) done; see Phase 2 below for what remains. |
+| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5), B2 (PR #6), B3 (PR #7), B4 (PR #8), B5 (PR #9) and etcd client authentication (PR #10) done; the first deploy is next, see Phase 2 below. |
 | Package publishing | No xpkg or image has been pushed to a registry yet. CI workflows exist from the Upjet template but have not been exercised for a release. |
 
 ## Decisions
@@ -57,11 +57,11 @@ Service from the image, one volume mounted at `CP_STATE_DIR` (etcd data, PKI and
 B1, done 2026-11-21 in PR #5; ownership of that volume handled by the image itself, B2, done
 2026-11-22 in PR #6; Secrets at rest, audit and credential lifetimes, B3, done 2026-11-22 in PR #7;
 the Railway token out of every component's environment, B4, done 2026-11-22 in PR #8; etcd quota,
-snapshots and GOMEMLIMIT, B5, done 2026-11-22 in PR #9), TCP proxy on 6443, env vars for the Railway
-token, `CP_ENCRYPTION_KEY` and API-server credential material. Still to do before the first deploy:
-etcd client authentication, the B3 leftover. First spike after that: a composition function as a
-supervised process, since every XRD depends on it. Done when the `Project` smoke test passes over
-the internet.
+snapshots and GOMEMLIMIT, B5, done 2026-11-22 in PR #9; etcd client authentication, the B3 leftover,
+done 2026-11-22 in PR #10), TCP proxy on 6443, env vars for the Railway token, `CP_ENCRYPTION_KEY`
+and API-server credential material. Nothing from the Phase 1 review blocks the first deploy any
+more. First spike after it: a composition function as a supervised process, since every XRD depends
+on it. Done when the `Project` smoke test passes over the internet.
 Consider provisioning the service with this provider once it exists.
 
 ### Phase 3: first cloud, DigitalOcean

@@ -191,9 +191,19 @@ takes a re-exec of the supervisor with the token handed over on a pipe. The harn
 with a positive control, so closing it without updating this page fails `verify`. The `verify`
 checks for all of this run when it is given the same `RAILWAY_TOKEN` as `up`.
 
-Still open from B3: etcd listens on loopback without client authentication, so any process in the
-container can read and write etcd directly. Client certificates for etcd, or a Unix socket, are the
-remaining item.
+**etcd client authentication.** etcd's loopback listener takes TLS only and demands a client
+certificate signed by a CA of its own, `pki/etcd-ca`, which signs nothing else: a certificate from the
+cluster CA, `admin-internal` included, is refused. The server certificate covers `localhost`,
+`127.0.0.1` and `::1` and follows the serving-certificate policy (reissued within 30 days of expiry);
+the two client identities, the API server's and the supervisor's own `etcdctl`, are minted every boot
+like the other in-container identities and never leave the container. The peer listener stays on
+loopback HTTP: a single member has no peers, and raft traffic from anything that is not a known
+member is dropped. Existing state migrates on the first boot: the CA and certificates are generated
+and etcd restarts on the same data over TLS. What this does and does not buy, plainly: it closes the
+network path, so nothing that merely reaches loopback can read or write etcd, and it is the
+prerequisite for running the provider under a uid of its own. In today's single-uid container every
+process can read the client key files, so it does not yet separate the provider from etcd; that
+separation is the uid split, which is now possible.
 
 ## Capacity: etcd quota, snapshots and memory
 
@@ -249,7 +259,8 @@ etcdutl snapshot restore state/snapshots/<file> --data-dir state/etcd --name con
 ```
 
 and start the service. The PKI on the same volume still matches the restored data (what B1 bought;
-etcd itself uses plain HTTP on loopback, so no etcd certificate is involved). A restore rewinds the
+`etcdutl` works on the file offline, so no etcd certificate is involved, and the etcd CA on the same
+volume still signs the running member's certificates). A restore rewinds the
 cluster: managed resources created after the snapshot vanish from the API while the Railway objects
 they created still exist, and Crossplane will not adopt them, so reconcile against Railway by hand. A
 snapshot taken before an encryption-key rotation holds Secrets under the old key: boot with that key

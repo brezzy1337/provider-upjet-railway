@@ -26,5 +26,5 @@ report that produced them.
 
 | Date | Summary |
 |------|---------|
-| [2026-11-22](2026-11-22.md) | Phase 2 B2: start as root to own the volume, then drop privileges via `su-exec`; session 2: B3, secrets at rest, audit, 90-day exported credentials; session 3: B4, the Railway token out of every component's environment; session 4: B5, etcd quota, snapshots on the volume, GOMEMLIMIT per process |
+| [2026-11-22](2026-11-22.md) | Phase 2 B2: start as root to own the volume, then drop privileges via `su-exec`; session 2: B3, secrets at rest, audit, 90-day exported credentials; session 3: B4, the Railway token out of every component's environment; session 4: B5, etcd quota, snapshots on the volume, GOMEMLIMIT per process; session 5: etcd client authentication, the last Phase 1 finding |
 | [2026-11-21](2026-11-21.md) | Toolchain restored, GitBook docs live, `/ship` pipeline in use, Phase 1 control plane merged and reviewed; session 2: Phase 2 B1, one persistent state root |

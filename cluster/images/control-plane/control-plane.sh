@@ -579,6 +579,27 @@ bootstrap_pki() {
     printf '%s' "${sans}" > "${CP_PKI_DIR}/apiserver.sans"
   fi
 
+  # ---- etcd PKI ---------------------------------------------------------------
+  # etcd requires a client certificate on its loopback listener (the B3
+  # leftover). A CA of its own: the cluster CA signs Kubernetes identities, and
+  # none of those may also open etcd. The server certificate covers loopback
+  # only and follows the serving-cert policy; the two client identities (the
+  # API server, the supervisor's etcdctl) are minted every boot like the other
+  # in-container identities. Peers stay on loopback HTTP: a single member has
+  # no peers, and raft traffic from anything but a known member is dropped.
+  if [ ! -f "${CP_PKI_DIR}/etcd-ca.key" ]; then
+    log "generating etcd CA"
+    openssl genrsa -out "${CP_PKI_DIR}/etcd-ca.key" 4096 2>/dev/null
+    openssl req -x509 -new -nodes -key "${CP_PKI_DIR}/etcd-ca.key" -sha256 -days 3650 \
+      -subj "/CN=etcd-ca" -out "${CP_PKI_DIR}/etcd-ca.crt" 2>/dev/null
+  fi
+  if ! cert_within_policy "${CP_PKI_DIR}/etcd-server.crt" "${CP_SERVING_CERT_DAYS}" $(( 30 * 86400 )) \
+     || ! openssl verify -CAfile "${CP_PKI_DIR}/etcd-ca.crt" "${CP_PKI_DIR}/etcd-server.crt" >/dev/null 2>&1; then
+    issue_etcd_cert etcd-server etcd-server "serverAuth,clientAuth" "DNS:localhost,IP:127.0.0.1,IP:::1" "${CP_SERVING_CERT_DAYS}"
+  fi
+  issue_etcd_cert etcd-client-apiserver  kube-apiserver           clientAuth "" "${CP_INTERNAL_CERT_DAYS}"
+  issue_etcd_cert etcd-client-supervisor control-plane-supervisor clientAuth "" "${CP_INTERNAL_CERT_DAYS}"
+
   # ---- client certificates --------------------------------------------------
   # admin: O=system:masters, which RBAC treats as superuser.
   # controller-manager: a distinct identity, also system:masters for simplicity
@@ -633,6 +654,20 @@ cert_within_policy() {
 }
 
 # issue_client_cert NAME CN ORG DAYS [always]: with "always", mint every boot.
+# issue_etcd_cert NAME CN EKU SANS DAYS: a certificate from the etcd CA.
+issue_etcd_cert() {
+  local name="$1" cn="$2" eku="$3" sans="$4" days="$5"
+  log "issuing etcd certificate ${name} (CN=${cn}, ${days} days)"
+  openssl genrsa -out "${CP_PKI_DIR}/${name}.key" 2048 2>/dev/null
+  openssl req -new -key "${CP_PKI_DIR}/${name}.key" \
+    -subj "/CN=${cn}" -out "${CP_PKI_DIR}/${name}.csr" 2>/dev/null
+  openssl x509 -req -in "${CP_PKI_DIR}/${name}.csr" \
+    -CA "${CP_PKI_DIR}/etcd-ca.crt" -CAkey "${CP_PKI_DIR}/etcd-ca.key" -CAcreateserial \
+    -out "${CP_PKI_DIR}/${name}.crt" -days "${days}" -sha256 \
+    -extfile <(printf 'extendedKeyUsage=%s\n' "${eku}"; [ -z "${sans}" ] || printf 'subjectAltName=%s\n' "${sans}") 2>/dev/null
+  rm -f "${CP_PKI_DIR}/${name}.csr"
+}
+
 issue_client_cert() {
   local name="$1" cn="$2" org="$3" days="$4" mode="${5:-policy}"
   if [ "${mode}" != "always" ]; then
@@ -809,13 +844,24 @@ detect_memory_limit() {
 }
 
 ETCD_SNAPSHOT_DIR="${CP_STATE_DIR}/snapshots"
-ETCD_ENDPOINT="http://127.0.0.1:${CP_ETCD_CLIENT_PORT}"
+ETCD_ENDPOINT="https://127.0.0.1:${CP_ETCD_CLIENT_PORT}"
+# The supervisor's own etcd client identity (minted every boot in bootstrap_pki).
+etcdctl_tls_flags() {
+  printf '%s\n' --cacert "${CP_PKI_DIR}/etcd-ca.crt" \
+    --cert "${CP_PKI_DIR}/etcd-client-supervisor.crt" --key "${CP_PKI_DIR}/etcd-client-supervisor.key"
+}
 # Long timeouts for the maintenance calls (a defrag or snapshot of a database
 # near the quota), short ones for the probes that gate or poll. etcdctl keeps
 # retrying a refused connection until the command timeout, so a pass against
 # a dead etcd takes up to that long per call; it runs in the background.
-etcdctl_maint() { "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" --dial-timeout 5s --command-timeout 180s "$@"; }
-etcdctl_probe() { "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" --dial-timeout 2s --command-timeout 5s "$@"; }
+etcdctl_maint() {
+  local -a tls; mapfile -t tls < <(etcdctl_tls_flags)
+  "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" "${tls[@]}" --dial-timeout 5s --command-timeout 180s "$@"
+}
+etcdctl_probe() {
+  local -a tls; mapfile -t tls < <(etcdctl_tls_flags)
+  "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" "${tls[@]}" --dial-timeout 2s --command-timeout 5s "$@"
+}
 # etcd_status_field NAME -> the integer field NAME of `endpoint status`, or
 # "" when etcd does not answer. Never fails: callers run under set -e.
 etcd_status_field() {
@@ -941,8 +987,12 @@ start_etcd() {
   start_bg etcd "${CP_BIN_DIR}/etcd" \
     --name control-plane \
     --data-dir "${CP_ETCD_DATA_DIR}" \
-    --listen-client-urls "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
-    --advertise-client-urls "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --listen-client-urls "https://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --advertise-client-urls "https://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --cert-file "${CP_PKI_DIR}/etcd-server.crt" \
+    --key-file "${CP_PKI_DIR}/etcd-server.key" \
+    --trusted-ca-file "${CP_PKI_DIR}/etcd-ca.crt" \
+    --client-cert-auth \
     --listen-peer-urls "http://127.0.0.1:${CP_ETCD_PEER_PORT}" \
     --initial-advertise-peer-urls "http://127.0.0.1:${CP_ETCD_PEER_PORT}" \
     --initial-cluster "control-plane=http://127.0.0.1:${CP_ETCD_PEER_PORT}" \
@@ -1129,7 +1179,10 @@ start_apiserver() {
   local extra=()
   mapfile -t extra < <(apiserver_audit_flags; apiserver_token_flags)
   start_bg kube-apiserver "${CP_BIN_DIR}/kube-apiserver" \
-    --etcd-servers "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --etcd-servers "https://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
+    --etcd-cafile "${CP_PKI_DIR}/etcd-ca.crt" \
+    --etcd-certfile "${CP_PKI_DIR}/etcd-client-apiserver.crt" \
+    --etcd-keyfile "${CP_PKI_DIR}/etcd-client-apiserver.key" \
     --bind-address "${CP_APISERVER_BIND_ADDRESS}" \
     --secure-port "${CP_APISERVER_PORT}" \
     --advertise-address "${CP_APISERVER_ADVERTISE_ADDRESS}" \
@@ -1577,7 +1630,7 @@ main() {
     fi
     if [ $((tick % 720)) -eq 0 ]; then
       local c
-      for c in admin-internal controller-manager apiserver; do
+      for c in admin-internal controller-manager apiserver etcd-server etcd-client-apiserver etcd-client-supervisor; do
         cert_fresh "${CP_PKI_DIR}/${c}.crt" $(( 7 * 86400 )) \
           || { log "certificate ${c} expires within 7 days -- restarting to reissue"; exit 1; }
       done
