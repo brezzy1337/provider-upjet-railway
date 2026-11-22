@@ -160,16 +160,13 @@ COPY --from=crossplane-build /out/crds/                 ${CP_HOME}/crds/crosspla
 COPY --from=crossplane-build /out/webhookconfigurations/ ${CP_HOME}/crds/webhookconfigurations/
 
 # ---- writable state ---------------------------------------------------------
-# CP_STATE_DIR is the ONE persistent mount: etcd data, the PKI (cluster CA, SA
-# signing key, admin credentials) and a VERSION stamp all live under it, so a
-# redeploy keeps the cluster identity together with its data. Mount the
-# platform volume exactly here (Railway: service volume mount path; the VOLUME
-# instruction below documents it but Railway does not read it).
-# Railway mounts volumes root-owned and this image runs as an unprivileged
-# USER, so a chown from the start command cannot work: run with
-# RAILWAY_RUN_UID=0 until B2 (start as root, chown, drop privileges) lands. The
-# supervisor fails loudly, naming this, if it cannot write the state dir.
+# CP_STATE_DIR is the one persistent mount (etcd, PKI, VERSION); the why and
+# the guards are documented at CP_STATE_DIR in control-plane.sh. Mount the
+# platform volume exactly here. CP_REQUIRE_PERSISTENT makes a forgotten mount
+# fail the boot. Railway mounts volumes root-owned: chown the mount to
+# ${USER_ID}, or, interim until B2 lands, run with RAILWAY_RUN_UID=0.
 ENV CP_STATE_DIR=${CP_HOME}/state
+ENV CP_REQUIRE_PERSISTENT=true
 RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/cache ${CP_HOME}/tf ${CP_STATE_DIR} \
     && chmod +x /usr/local/bin/control-plane.sh \
     && chmod 700 ${CP_STATE_DIR} \

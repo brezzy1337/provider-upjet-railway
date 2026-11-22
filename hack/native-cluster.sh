@@ -53,7 +53,7 @@ say() { printf '\n=== %s\n' "$*" >&2; }
 # mid-PKI with a bare "shutting down".
 need_tools() {
   local missing=() t
-  for t in openssl curl ip hostname base64 git tar unzip; do
+  for t in openssl curl ip hostname base64 stat git tar unzip; do
     command -v "$t" >/dev/null 2>&1 || missing+=("$t")
   done
   [ ${#missing[@]} -eq 0 ] || {
@@ -175,7 +175,8 @@ stage_crds() {
 export_env() {
   export CP_HOME="${HOME_DIR}"
   export CP_BIN_DIR="${BIN}"
-  export CP_STATE_DIR="${NATIVE_WORK}/state"   # etcd + pki + VERSION, like the image
+  # etcd + pki + VERSION under one root, like the image
+  export CP_STATE_DIR="${NATIVE_WORK}/state"
   export CP_CRD_DIRS="${HOME_DIR}/crds/railway"
   export CP_CROSSPLANE_CRDS_DIR="${HOME_DIR}/crds/crossplane"
   export CP_WEBHOOK_CONFIGS_DIR="${HOME_DIR}/crds/webhookconfigurations"
@@ -238,6 +239,18 @@ verify() {
   check "state root holds pki, etcd and VERSION" bash -c \
     "test -f '${CP_STATE_DIR}/pki/ca.crt' && test -d '${CP_STATE_DIR}/etcd/member' && grep -q '^kubernetes=v' '${CP_STATE_DIR}/VERSION'"
   check "state root is private (0700)" bash -c "test \"\$(stat -c %a '${CP_STATE_DIR}')\" = 700"
+  check "VERSION stamp has non-empty etcd= and kubernetes= values" bash -c \
+    "grep -qE '^etcd=[0-9]' '${CP_STATE_DIR}/VERSION' && grep -qE '^kubernetes=v[0-9]' '${CP_STATE_DIR}/VERSION'"
+  # The property B1 exists for: cluster identity survives down/up. The first
+  # verify records it; every later verify against the same state compares.
+  local ident_file="${HOME_DIR}/identity.sha256" ident_now
+  ident_now="$(cat "${CP_STATE_DIR}/pki/ca.crt" "${CP_STATE_DIR}/pki/tokens.csv" | sha256sum | cut -c1-64)"
+  if [ -f "${ident_file}" ]; then
+    check "cluster identity (CA + admin token) unchanged since first verify" test "$(cat "${ident_file}")" = "${ident_now}"
+  else
+    printf '%s\n' "${ident_now}" > "${ident_file}"
+    check "cluster identity recorded for later restart comparison" test -s "${ident_file}"
+  fi
   check "etcd healthy" env ETCDCTL_API=3 "$BIN/etcdctl" \
     --endpoints "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" endpoint health
   check "apiserver /readyz" "${k[@]}" get --raw=/readyz

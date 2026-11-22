@@ -88,8 +88,8 @@ consolidated, verified set. Severity reflects impact on the next phase, not on m
 
 | # | Finding | Why it matters | Fix |
 |---|---------|----------------|-----|
-| B1 | **Fixed 2026-11-21 (Phase 2, first change).** Was: PKI on the ephemeral filesystem; only etcd on the volume. Every redeploy minted a new cluster CA, service-account key and admin token while etcd kept Secrets and SA tokens signed by the old ones; every issued kubeconfig went stale. The 2026-08-25 restart test passed only because the native harness keeps both directories on disk. | | Now: `CP_STATE_DIR` (default `/var/lib/control-plane/state`) is the one mount, holding `etcd/`, `pki/` and a `VERSION` stamp; `umask 077` and mode 0700; the supervisor refuses to start an image whose etcd or Kubernetes is older than the stamp unless `CP_ALLOW_DOWNGRADE=true`, warns if `CP_PKI_DIR`/`CP_ETCD_DATA_DIR` are overridden onto a different filesystem, and names `RAILWAY_RUN_UID=0` when the mount is not writable. `CP_ADMIN_TOKEN` set in the environment now rotates the stored token. Caches stay ephemeral. |
-| B2 | **Volume ownership.** The image runs as uid 65532; Railway mounts volumes root-owned. | First boot fails the writability check; a chown from the start command cannot work for a non-root `USER`. | Start as root, `chown` the state root, drop privileges with `su-exec` (`apk add su-exec`, not in the image today); minimum viable: document `RAILWAY_RUN_UID=0`. |
+| B1 | **PKI on the ephemeral filesystem; only etcd on the volume.** `CP_PKI_DIR` defaulted to `/var/lib/control-plane/pki`; the only `VOLUME` was `/var/lib/etcd`. **Fixed 2026-11-21 (PR #5).** | Every redeploy minted a new cluster CA, service-account key and admin token while etcd kept Secrets and SA tokens signed by the old ones; every issued kubeconfig went stale. The 2026-08-25 restart test passed only because the native harness keeps both directories on disk. | `CP_STATE_DIR` is the one mount for `etcd/`, `pki/` and a `VERSION` high-water stamp; see the state-root section of [Architecture](control-plane.md) and Session 2 of the [2026-11-21 report](../reports/2026-11-21.md). |
+| B2 | **Volume ownership.** The image runs as uid 65532; Railway mounts volumes root-owned. | First boot fails the writability check; a chown from the start command cannot work for a non-root `USER`. Interim: `RAILWAY_RUN_UID=0`, which the supervisor names in its error. | Start as root, `chown -R` the whole state root (including `pki/` and `etcd/` created by any earlier root-run boot, or the drop to 65532 cannot read them), then drop privileges with `su-exec` (`apk add su-exec`, not in the image today). |
 | B3 | **Secrets unencrypted in etcd, no audit log, 10-year admin credentials.** No `--encryption-provider-config`, no `--audit-policy-file`; the admin client cert, CA and static bearer token all live 3650 days with no revocation path. | The Railway workspace token sits in plaintext on the volume; a leaked kubeconfig is permanent cluster-admin on an internet-facing endpoint. | Add an encryption provider with a key kept off the volume; audit at Metadata level to stdout; shorten client-cert validity and reissue on boot; make the bearer-token kubeconfig opt-in. |
 | B4 | **`RAILWAY_TOKEN` handling.** It stays in the supervisor's environment (inherited by every child), is interpolated into JSON by hand, and passes through a `kubectl` command line. | Readable from `/proc/*/environ` and `ps` inside the container; breaks on a quote or backslash. | Read it into a local and `unset` it; build the Secret via `--from-file=/dev/stdin` with `jq -n --arg`; start the other components before it is read, or under `env -u`. |
 | B5 | **etcd quota and memory.** `--quota-backend-bytes` is 8 GiB, likely larger than the volume; no defrag, no snapshot, no `GOMEMLIMIT` on any Go process. | Disk-full on the volume risks a corrupted etcd; an OOM kill picks an arbitrary victim. | `CP_ETCD_QUOTA_BYTES` defaulting to about 2 GiB, periodic `etcdctl defrag` and `snapshot save` to the volume, `GOMEMLIMIT` per process derived from the container limit. |
@@ -139,7 +139,7 @@ consolidated, verified set. Severity reflects impact on the next phase, not on m
    cost is no Usage protection. A hand-written `EndpointSlice` at the container's own IP is the
    untested fix.
 3. **Where the Railway TCP proxy hostname enters the serving certificate.** The supervisor reissues
-   the serving cert when `CP_APISERVER_CERT_SANS` changes, which only works once B1 is fixed.
+   the serving cert when `CP_APISERVER_CERT_SANS` changes, which works now that B1 is fixed.
 
 ## Reproducing the verification
 
@@ -147,7 +147,7 @@ consolidated, verified set. Severity reflects impact on the next phase, not on m
 sudo apk add openssl iproute2 coreutils curl git tar unzip   # Alpine; the harness checks these
 hack/native-cluster.sh build        # several minutes the first time
 hack/native-cluster.sh up           # foreground; Ctrl-C to stop
-hack/native-cluster.sh verify       # in another shell, 16 assertions
+hack/native-cluster.sh verify       # in another shell, 21 checks (19 without go on PATH)
 hack/native-cluster.sh down
 ```
 

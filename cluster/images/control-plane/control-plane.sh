@@ -45,8 +45,13 @@ CP_STATE_DIR="${CP_STATE_DIR:-${CP_HOME}/state}"
 CP_PKI_DIR="${CP_PKI_DIR:-${CP_STATE_DIR}/pki}"
 CP_ETCD_DATA_DIR="${CP_ETCD_DATA_DIR:-${CP_STATE_DIR}/etcd}"
 # Refuse to start an older image on newer stored state (etcd and kube-apiserver
-# do not support downgrade). Set to true to override once, knowingly.
+# do not support downgrade). Set to true to override once, knowingly; the stamp
+# keeps its high-water mark, so every later boot of the older image needs it too.
 CP_ALLOW_DOWNGRADE="${CP_ALLOW_DOWNGRADE:-false}"
+# When true, refuse to boot if the state root is on the same filesystem as
+# CP_HOME, i.e. no volume is mounted there. The image sets this; the native
+# harness, which has no mount, leaves it unset and gets an informational line.
+CP_REQUIRE_PERSISTENT="${CP_REQUIRE_PERSISTENT:-false}"
 CP_KCM_PORT="${CP_KCM_PORT:-10257}"   # kube-controller-manager secure/health port, loopback only
 CP_ETCD_CLIENT_PORT="${CP_ETCD_CLIENT_PORT:-2379}"
 CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-2380}"
@@ -192,64 +197,110 @@ kc() { "${CP_BIN_DIR}/kubectl" --kubeconfig "${KUBECONFIG_INTERNAL}" "$@"; }
 # before etcd or the API server get a chance to corrupt it.
 # ------------------------------------------------------------------------------
 component_versions() {
-  printf 'etcd=%s\n' "$("${CP_BIN_DIR}/etcd" --version 2>/dev/null | awk '/etcd Version/{print $3}')"
-  printf 'kubernetes=%s\n' "$("${CP_BIN_DIR}/kube-apiserver" --version 2>/dev/null | awk '{print $2}')"
+  printf 'etcd=%s\n' "$("${CP_BIN_DIR}/etcd" --version 2>/dev/null | awk '/etcd Version/{print $3; exit}')"
+  printf 'kubernetes=%s\n' "$("${CP_BIN_DIR}/kube-apiserver" --version 2>/dev/null | awk 'NR==1{print $2}')"
 }
 
-# usage: version_lt A B  -> true when A sorts strictly before B (sort -V)
-version_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+# kv "<multi-line k=v text>" key  -> value
+kv() { printf '%s\n' "$1" | awk -F= -v k="$2" '$1==k{print $2; exit}'; }
+
+# Pre-release suffixes (v1.35.8-rc.1) sort AFTER the release in sort -V, so
+# compare the numeric core only; rc -> GA is then not a downgrade.
+version_core() { local v="${1%%-*}"; printf '%s' "${v%%+*}"; }
+# version_lt A B -> true when A sorts strictly before B
+version_lt() {
+  local a b; a="$(version_core "$1")"; b="$(version_core "$2")"
+  [ "$a" != "$b" ] && [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -1)" = "$a" ]
+}
+minor_of() { local v; v="$(version_core "$1")"; v="${v#v}"; printf '%s' "${v#*.}" | cut -d. -f1; }
 
 prepare_state_dir() {
+  # Guard the layout itself before touching anything.
+  case "${CP_STATE_DIR%/}" in
+    "${CP_HOME%/}") fail "CP_STATE_DIR must not equal CP_HOME (${CP_HOME}); mount the volume at a subdirectory such as ${CP_HOME}/state" ;;
+  esac
+  local d
+  for d in "${CP_LOG_DIR}" "${CP_RUN_DIR}" "${CP_HOME}/cache"; do
+    case "${d%/}/" in "${CP_STATE_DIR%/}/"*) fail "CP_STATE_DIR (${CP_STATE_DIR}) must not contain ephemeral dir ${d}" ;; esac
+  done
+
   mkdir -p "${CP_STATE_DIR}" 2>/dev/null || true
   [ -d "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} does not exist and cannot be created"
-  [ -w "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} is not writable by uid $(id -u). Railway mounts volumes root-owned: run with RAILWAY_RUN_UID=0, or chown the mount to $(id -u) first"
+  [ -w "${CP_STATE_DIR}" ] || fail "state dir ${CP_STATE_DIR} is not writable by uid $(id -u). The platform mounted it root-owned: chown the mount to $(id -u), or (interim, until B2 lands) run with RAILWAY_RUN_UID=0"
   chmod 700 "${CP_STATE_DIR}" 2>/dev/null || true
+  [ "$(stat -c %a "${CP_STATE_DIR}")" = "700" ] || fail "state dir ${CP_STATE_DIR} is mode $(stat -c %a "${CP_STATE_DIR}"), not 700, and chmod failed (owner uid $(stat -c %u "${CP_STATE_DIR}"), we are $(id -u))"
   mkdir -p "${CP_PKI_DIR}" "${CP_ETCD_DATA_DIR}"
+  for d in "${CP_PKI_DIR}" "${CP_ETCD_DATA_DIR}"; do
+    [ -w "$d" ] || fail "$d is not writable by uid $(id -u)"
+  done
+  # Re-tighten modes on state created by an earlier boot with a looser umask.
+  chmod -R go-rwx "${CP_PKI_DIR}" "${CP_ETCD_DATA_DIR}" 2>/dev/null || true
 
-  # The whole point is that pki and etcd share the volume. Warn (not fail) if an
-  # override split them, because that silently recreates the Phase 1 bug.
-  local dev_state dev_pki dev_etcd
-  dev_state="$(stat -c %d "${CP_STATE_DIR}")"
-  dev_pki="$(stat -c %d "${CP_PKI_DIR}")"
-  dev_etcd="$(stat -c %d "${CP_ETCD_DATA_DIR}")"
+  # Is anything actually mounted here? If the state root shares a filesystem
+  # with CP_HOME it is on the ephemeral layer and B1 is back. The image sets
+  # CP_REQUIRE_PERSISTENT=true so a forgotten volume fails the boot.
+  local dev_state dev_home dev_pki dev_etcd
+  dev_state="$(stat -c %d "${CP_STATE_DIR}")"; dev_home="$(stat -c %d "${CP_HOME}")"
+  if [ "${dev_state}" = "${dev_home}" ]; then
+    if [ "${CP_REQUIRE_PERSISTENT}" = "true" ]; then
+      fail "${CP_STATE_DIR} is on the same filesystem as ${CP_HOME}: no volume is mounted there, so state would not survive a redeploy. Mount the service volume at ${CP_STATE_DIR}, or set CP_REQUIRE_PERSISTENT=false for a throwaway run"
+    fi
+    log "note: ${CP_STATE_DIR} is on the same filesystem as ${CP_HOME} (no volume mounted); fine for a local or throwaway run"
+  fi
+  dev_pki="$(stat -c %d "${CP_PKI_DIR}")"; dev_etcd="$(stat -c %d "${CP_ETCD_DATA_DIR}")"
   if [ "${dev_pki}" != "${dev_state}" ] || [ "${dev_etcd}" != "${dev_state}" ]; then
     log "WARNING: CP_PKI_DIR (${CP_PKI_DIR}) and CP_ETCD_DATA_DIR (${CP_ETCD_DATA_DIR}) are not on the same filesystem as CP_STATE_DIR (${CP_STATE_DIR})."
     log "         A redeploy that keeps one but not the other invalidates every issued kubeconfig."
   fi
 
-  local stamp="${CP_STATE_DIR}/VERSION" current stored k cur old
-  current="$(component_versions)"
-  if [ -f "${stamp}" ]; then
-    stored="$(cat "${stamp}")"
-    for k in etcd kubernetes; do
-      cur="$(printf '%s\n' "${current}" | awk -F= -v k="$k" '$1==k{print $2}')"
-      old="$(printf '%s\n' "${stored}"  | awk -F= -v k="$k" '$1==k{print $2}')"
-      [ -n "${cur}" ] && [ -n "${old}" ] || continue
-      if version_lt "${cur}" "${old}"; then
-        if [ "${CP_ALLOW_DOWNGRADE}" = "true" ]; then
-          log "WARNING: ${k} ${cur} is older than the ${old} that wrote ${stamp}; continuing because CP_ALLOW_DOWNGRADE=true"
-        else
-          fail "${k} ${cur} in this image is older than ${old} recorded in ${stamp}. Downgrades are unsupported; deploy an image >= ${old}, or set CP_ALLOW_DOWNGRADE=true if you accept the risk"
-        fi
-      elif version_lt "${old}" "${cur}"; then
-        log "state written by ${k} ${old}, now running ${cur} (upgrade)"
-      fi
-    done
-  else
-    log "new state root at ${CP_STATE_DIR}"
+  # Partially populated root. etcd data without the PKI that signed what is in
+  # it is exactly the B1 failure: refuse rather than mint a new CA over it.
+  if [ -d "${CP_ETCD_DATA_DIR}/member" ] && [ ! -f "${CP_PKI_DIR}/ca.crt" ]; then
+    fail "etcd data exists under ${CP_ETCD_DATA_DIR} but ${CP_PKI_DIR}/ca.crt is missing. Restore the pki/ directory from backup, or move the etcd data away to start a fresh cluster"
   fi
-  printf '%s\n' "${current}" > "${stamp}"
-  log "state root ${CP_STATE_DIR} ready: $(printf '%s' "${current}" | tr '\n' ' ')"
+  if [ -f "${CP_PKI_DIR}/ca.crt" ] && [ ! -d "${CP_ETCD_DATA_DIR}/member" ]; then
+    log "PKI present but no etcd data: same cluster identity, fresh (empty) etcd"
+  fi
+
+  # VERSION stamp: a high-water mark of the etcd and Kubernetes versions that
+  # have ever written this state. An image older than the mark is refused.
+  local stamp="${CP_STATE_DIR}/VERSION" current stored k cur old keep=""
+  current="$(component_versions)"
+  for k in etcd kubernetes; do
+    cur="$(kv "${current}" "$k")"
+    [ -n "${cur}" ] || fail "could not determine the ${k} version from its binary; refusing to run with a blind downgrade guard"
+  done
+  stored=""; [ -f "${stamp}" ] && stored="$(cat "${stamp}")"
+  for k in etcd kubernetes; do
+    cur="$(kv "${current}" "$k")"; old="$(kv "${stored}" "$k")"
+    if [ -n "${old}" ] && version_lt "${cur}" "${old}"; then
+      if [ "${CP_ALLOW_DOWNGRADE}" = "true" ]; then
+        log "WARNING: ${k} ${cur} is older than the ${old} that wrote ${stamp}; continuing because CP_ALLOW_DOWNGRADE=true (the stamp keeps ${old})"
+      else
+        fail "${k} ${cur} in this image is older than ${old} recorded in ${stamp}. Downgrades are unsupported; deploy an image >= ${old}, or set CP_ALLOW_DOWNGRADE=true if you accept the risk"
+      fi
+      keep="${keep}${k}=${old}"$'\n'
+    else
+      [ -n "${old}" ] && version_lt "${old}" "${cur}" && log "state written by ${k} ${old}, now running ${cur} (upgrade)"
+      if [ "$k" = "kubernetes" ] && [ -n "${old}" ]; then
+        local dm; dm=$(( $(minor_of "${cur}") - $(minor_of "${old}") ))
+        [ "${dm}" -le 1 ] || log "WARNING: Kubernetes minor version jumped by ${dm} (${old} -> ${cur}); upstream supports one minor at a time"
+      fi
+      keep="${keep}${k}=${cur}"$'\n'
+    fi
+  done
+  [ -n "${stored}" ] || log "new state root at ${CP_STATE_DIR}"
+  printf '%s' "${keep}" > "${stamp}.tmp" && mv -f "${stamp}.tmp" "${stamp}"
+  log "state root ${CP_STATE_DIR} ready: $(printf '%s' "${keep}" | tr '\n' ' ')"
 }
 
 # ------------------------------------------------------------------------------
 # Step 0: PKI + auth material
 #
-# Written under $CP_PKI_DIR, which lives in the persistent state root next to
-# etcd. Material found there is reused, so a restart or redeploy keeps the same
-# CA, SA signing key and admin credentials, and every issued kubeconfig stays
-# valid. The serving certificate is regenerated whenever the requested SAN set
-# changes (e.g. once the Railway TCP proxy hostname is known).
+# Written under $CP_PKI_DIR in the persistent state root (see CP_STATE_DIR).
+# Material found there is reused; the serving certificate is regenerated
+# whenever the requested SAN set changes (e.g. once the Railway TCP proxy
+# hostname is known).
 # ------------------------------------------------------------------------------
 # All local addresses, one per line. `hostname -I` is GNU; busybox only has -i.
 host_addrs() {
@@ -380,11 +431,13 @@ bootstrap_pki() {
   # Convenient for clients that cannot carry a client certificate. NEVER
   # anonymous: --anonymous-auth=false is passed to the apiserver.
   # Persisted with the PKI. If CP_ADMIN_TOKEN is set in the environment it wins,
-  # so rotating the platform variable rotates the token on the next boot;
-  # unset, the stored token is reused (or generated on first boot).
+  # so changing the platform variable rotates the token on the next boot. Unset,
+  # the stored token is reused (or generated on first boot) -- so removing the
+  # variable does NOT rotate; set a new value to rotate. The value is never
+  # logged (see CP_LOG_ADMIN_TOKEN).
   local tok="${CP_ADMIN_TOKEN:-}"
-  if [ -n "${tok}" ] && ! [[ "${tok}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    fail "CP_ADMIN_TOKEN must match ^[A-Za-z0-9._-]+$ (it is written into tokens.csv)"
+  if [ -n "${tok}" ] && ! [[ "${tok}" =~ ^[A-Za-z0-9._-]{32,}$ ]]; then
+    fail "CP_ADMIN_TOKEN must be at least 32 characters of [A-Za-z0-9._-] (it is a cluster-admin bearer token written into tokens.csv)"
   fi
   if [ -z "${tok}" ] && [ -f "${CP_PKI_DIR}/tokens.csv" ]; then
     tok="$(cut -d, -f1 "${CP_PKI_DIR}/tokens.csv")"
@@ -474,12 +527,8 @@ EOF
 # Step 1: etcd
 # ------------------------------------------------------------------------------
 start_etcd() {
-  # On a platform-mounted volume the directory may exist already and be owned by
-  # root while this container runs as 65532. Fail here with something readable
-  # rather than deep inside etcd.
-  mkdir -p "${CP_ETCD_DATA_DIR}" 2>/dev/null || true
-  [ -d "${CP_ETCD_DATA_DIR}" ] || fail "etcd data dir ${CP_ETCD_DATA_DIR} does not exist and cannot be created"
-  [ -w "${CP_ETCD_DATA_DIR}" ] || fail "etcd data dir ${CP_ETCD_DATA_DIR} is not writable by uid $(id -u) -- see the state dir check above"
+  # Existence, ownership and mode of ${CP_ETCD_DATA_DIR} were checked in
+  # prepare_state_dir.
   start_bg etcd "${CP_BIN_DIR}/etcd" \
     --name control-plane \
     --data-dir "${CP_ETCD_DATA_DIR}" \

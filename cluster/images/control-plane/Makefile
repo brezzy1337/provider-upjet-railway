@@ -19,7 +19,8 @@ ROOT        := $(shell git -C $(CURDIR) rev-parse --show-toplevel)
 DOCKERFILE  := cluster/images/control-plane/Dockerfile
 
 # Container-side paths/ports, kept here so `run` matches the Dockerfile.
-STATE_DIR ?= /var/lib/control-plane/state   # etcd + pki + VERSION; the one volume
+# The one volume: etcd + pki + VERSION. Must match ENV CP_STATE_DIR in the Dockerfile.
+STATE_DIR ?= /var/lib/control-plane/state
 APISERVER_PORT ?= 6443
 KUBECONFIG_OUT ?= $(ROOT)/.work/control-plane.kubeconfig
 
