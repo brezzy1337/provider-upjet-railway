@@ -132,7 +132,7 @@ a different key is refused unless the previous key is passed as `CP_ENCRYPTION_K
 case the supervisor re-encrypts every Secret under the new key after the API server is up and moves
 the stamp. First enablement follows the same path, so Secrets written before encryption was on are
 rewritten too. A volume snapshot without the key yields ciphertext for Secrets; everything else in
-etcd is plaintext, as in any Kubernetes cluster.
+etcd is unencrypted at rest, as in any Kubernetes cluster.
 
 **Audit.** With `CP_AUDIT_ENABLED` (default on) the API server writes a JSON audit log to
 `CP_AUDIT_LOG_PATH` (default `log/audit.log`, rotated at 20 MB, three backups, seven days). The
@@ -191,19 +191,26 @@ takes a re-exec of the supervisor with the token handed over on a pipe. The harn
 with a positive control, so closing it without updating this page fails `verify`. The `verify`
 checks for all of this run when it is given the same `RAILWAY_TOKEN` as `up`.
 
-**etcd client authentication.** etcd's loopback listener takes TLS only and demands a client
-certificate signed by a CA of its own, `pki/etcd-ca`, which signs nothing else: a certificate from the
-cluster CA, `admin-internal` included, is refused. The server certificate covers `localhost`,
-`127.0.0.1` and `::1` and follows the serving-certificate policy (reissued within 30 days of expiry);
-the two client identities, the API server's and the supervisor's own `etcdctl`, are minted every boot
-like the other in-container identities and never leave the container. The peer listener stays on
-loopback HTTP: a single member has no peers, and raft traffic from anything that is not a known
-member is dropped. Existing state migrates on the first boot: the CA and certificates are generated
-and etcd restarts on the same data over TLS. What this does and does not buy, plainly: it closes the
-network path, so nothing that merely reaches loopback can read or write etcd, and it is the
+**etcd client authentication.** Both of etcd's loopback listeners, client and peer, take TLS only
+and demand a client certificate signed by a CA of its own, `pki/etcd-ca`, which signs nothing else:
+a certificate from the cluster CA, `admin-internal` included, is refused. One server certificate
+covers `localhost`, `127.0.0.1` and `::1` for both ports and follows the serving-certificate policy
+(reissued within 30 days of expiry, or when its key no longer matches); the two client identities,
+the API server's and the supervisor's own `etcdctl`, are minted every boot like the other
+in-container identities and never leave the container. Keys and certificates are written to temp
+names and moved into place, and a CA is regenerated when either of its files is missing, so a crash
+mid-issue cannot wedge the next boot. Existing state migrates on the first boot: the CA and
+certificates are generated, etcd restarts on the same data over TLS, and the member's recorded peer
+URL is updated to `https` (the `--initial-*` flags are read only when the data directory is created).
+Rotation is deliberate and simple: remove `etcd-ca.crt` and `etcd-ca.key` and reboot; every etcd
+certificate is reissued and the data stays readable. Until then a leaked client certificate stays
+valid, there being no revocation. What this does and does not buy, plainly: it closes the network
+path, so nothing that merely reaches loopback can read, write or disrupt etcd, and it is a
 prerequisite for running the provider under a uid of its own. In today's single-uid container every
-process can read the client key files, so it does not yet separate the provider from etcd; that
-separation is the uid split, which is now possible.
+process can read the client key files and `etcd-ca.key` itself, so it does not yet separate the
+provider from etcd. That separation needs the uid split proper: per-component ownership of the key
+files and the etcd data directory, a PKI directory the provider cannot traverse, and a reduced RBAC
+identity for the provider in place of `system:masters`.
 
 ## Capacity: etcd quota, snapshots and memory
 
@@ -255,7 +262,7 @@ run, as the service user or followed by `chown -R` to `CP_RUN_UID` and `chmod 70
 
 ```
 etcdutl snapshot restore state/snapshots/<file> --data-dir state/etcd --name control-plane \
-  --initial-cluster control-plane=http://127.0.0.1:2380 --initial-advertise-peer-urls http://127.0.0.1:2380
+  --initial-cluster control-plane=https://127.0.0.1:2380 --initial-advertise-peer-urls https://127.0.0.1:2380
 ```
 
 and start the service. The PKI on the same volume still matches the restored data (what B1 bought;

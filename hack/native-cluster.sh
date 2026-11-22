@@ -431,8 +431,7 @@ verify() {
     p=$(pgrep -f "^$1/bin/etcd " | head -1); [ -n "$p" ] || exit 1
     tr "\0" "\n" < "/proc/$p/cmdline" | grep -A1 -x -- --quota-backend-bytes | grep -qx "$2"' _ "${NATIVE_WORK}" "${CP_ETCD_QUOTA_BYTES}"
   check "etcd has no alarm raised" bash -c "$(declare -f ectl); BIN='$BIN'"'
-    [ -z "$(ectl alarm list)" ]'
-
+    out=$(ectl alarm list) || exit 1; [ -z "$out" ]'
   if [ -n "${CP_MEMORY_LIMIT_BYTES:-}" ]; then
     # Same table as gomemlimit_share in the supervisor; the sum must stay under the limit.
     check "GOMEMLIMIT on every Go component is its share of CP_MEMORY_LIMIT_BYTES (sum under the limit)" bash -c '
@@ -468,15 +467,36 @@ verify() {
   check "snapshots are pruned to CP_ETCD_SNAPSHOT_KEEP (${CP_ETCD_SNAPSHOT_KEEP})" bash -c '
     [ "$(ls -1 "$1"/etcd-*.db | wc -l)" -le "$2" ]' _ "${snapdir}" "${CP_ETCD_SNAPSHOT_KEEP}"
 
-  # etcd client authentication (the B3 leftover): the loopback listener takes
-  # TLS only, demands a client certificate, and trusts only the etcd CA.
-  local pki="${CP_STATE_DIR}/pki" ep="https://127.0.0.1:${CP_ETCD_CLIENT_PORT}"
-  check "etcd refuses a plaintext client" bash -c \
-    '! "$1" --endpoints "http://127.0.0.1:$2" --dial-timeout 2s --command-timeout 5s endpoint status >/dev/null 2>&1' _ "$BIN/etcdctl" "${CP_ETCD_CLIENT_PORT}"
-  check "etcd refuses a TLS client without a certificate" bash -c \
-    '! "$1" --endpoints "$2" --cacert "$3/etcd-ca.crt" --dial-timeout 2s --command-timeout 5s endpoint status >/dev/null 2>&1' _ "$BIN/etcdctl" "$ep" "$pki"
-  check "etcd refuses a client certificate from the cluster CA (admin-internal)" bash -c \
-    '! "$1" --endpoints "$2" --cacert "$3/etcd-ca.crt" --cert "$3/admin-internal.crt" --key "$3/admin-internal.key" --dial-timeout 2s --command-timeout 5s endpoint status >/dev/null 2>&1' _ "$BIN/etcdctl" "$ep" "$pki"
+  # etcd client authentication (the B3 leftover): both loopback listeners take
+  # TLS only, demand a client certificate, and trust only the etcd CA. The
+  # refusals are asserted by cause (curl's TLS alert text), never by a timeout,
+  # and each port gets a positive control with the supervisor's identity first.
+  local pki="${CP_STATE_DIR}/pki"
+  tls_refused() {   # tls_refused URL [curl identity flags...]: a TLS-level refusal, not a timeout
+    local url="$1"; shift
+    local err; err="$(curl -sS --http1.1 --max-time 5 --cacert "${pki}/etcd-ca.crt" "$@" "$url" 2>&1 >/dev/null)" && return 1
+    printf '%s' "$err" | grep -qiE 'alert|handshake|certificate' && ! printf '%s' "$err" | grep -qi 'timed out'
+  }
+  plaintext_dropped() {   # a TLS-only listener closes a plaintext request without any HTTP reply (curl 52/56), never a timeout (28)
+    local code rc; code="$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "$1")"; rc=$?
+    [ "$code" = "000" ] && { [ "$rc" -eq 52 ] || [ "$rc" -eq 56 ]; }
+  }
+  check "etcd client port serves /health to the supervisor's certificate" bash -c "$(declare -f ectl)"'
+    curl -fsS --max-time 5 --cacert "$1/etcd-ca.crt" --cert "$1/etcd-client-supervisor.crt" --key "$1/etcd-client-supervisor.key" \
+      "https://127.0.0.1:$2/health" | grep -q "\"health\":\"true\""' _ "$pki" "${CP_ETCD_CLIENT_PORT}"
+  check "etcd client port drops a plaintext request without an HTTP reply" bash -c "$(declare -f plaintext_dropped)"'
+    plaintext_dropped "http://127.0.0.1:$1/health"' _ "${CP_ETCD_CLIENT_PORT}"
+  check "etcd client port refuses a TLS client without a certificate (TLS alert)" bash -c "pki='$pki'; $(declare -f tls_refused)"'
+    tls_refused "https://127.0.0.1:$1/health"' _ "${CP_ETCD_CLIENT_PORT}"
+  check "etcd client port refuses a certificate from the cluster CA, admin-internal (TLS alert)" bash -c "pki='$pki'; $(declare -f tls_refused)"'
+    [ -r "$pki/admin-internal.key" ] && tls_refused "https://127.0.0.1:$1/health" --cert "$pki/admin-internal.crt" --key "$pki/admin-internal.key"' _ "${CP_ETCD_CLIENT_PORT}"
+  check "etcd peer port serves /members to the etcd-CA identity and refuses plaintext and certificate-less clients" bash -c "pki='$pki'; $(declare -f tls_refused plaintext_dropped)"'
+    curl -fsS --http1.1 --max-time 5 --cacert "$pki/etcd-ca.crt" --cert "$pki/etcd-client-supervisor.crt" --key "$pki/etcd-client-supervisor.key" \
+      "https://127.0.0.1:$1/members" | grep -q control-plane || { echo "positive control failed" >&2; exit 1; }
+    plaintext_dropped "http://127.0.0.1:$1/members" || { echo "plaintext not dropped" >&2; exit 1; }
+    tls_refused "https://127.0.0.1:$1/members"' _ "${CP_ETCD_PEER_PORT}"
+  check "etcd member record carries the https peer URL" bash -c "$(declare -f ectl); BIN='$BIN'"'
+    ectl member list | grep ", control-plane, " | grep -q ", https://127.0.0.1:$1, "' _ "${CP_ETCD_PEER_PORT}"
   check "etcd server certificate is signed by the etcd CA and not by the cluster CA" bash -c \
     'openssl verify -CAfile "$1/etcd-ca.crt" "$1/etcd-server.crt" >/dev/null 2>&1 && ! openssl verify -CAfile "$1/ca.crt" "$1/etcd-server.crt" >/dev/null 2>&1' _ "$pki"
   check "kube-apiserver reaches etcd over https with its own client certificate" bash -c '
