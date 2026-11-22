@@ -73,8 +73,9 @@ Lessons that changed the design, in brief (the full list is in
 
 ## Phases
 
-See the [roadmap](../roadmap.md). Phase 1 is done; Phase 2 (deploy to Railway, smoke test over the
-internet) is next; Phase 3 adds DigitalOcean, then EKS and GKE.
+See the [roadmap](../roadmap.md). Phase 1 is done ([Phase 1 review](phase-1-review.md)); Phase 2's
+hardening, every finding of that review, is done ([Phase 2 review](phase-2-review.md)) and the deploy
+to Railway with the smoke test over the internet is next; Phase 3 adds DigitalOcean, then EKS and GKE.
 
 ## The state root
 
