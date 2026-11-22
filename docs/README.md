@@ -30,7 +30,7 @@ All kinds live in `railway.crossplane.io/v1alpha1` (cluster-scoped) and `railway
 
 The provider is the first building block of a
 [Crossplane control plane hosted on Railway](architecture/control-plane.md) (and its
-[Phase 1 review](architecture/phase-1-review.md)): a nodeless Kubernetes
+[Phase 1 review](architecture/phase-1-review.md) and [Phase 2 review](architecture/phase-2-review.md)): a nodeless Kubernetes
 API server plus Crossplane running inside a single Railway service, provisioning Kubernetes clusters
 on DigitalOcean, AWS and GCP from cloud-agnostic claims. This provider lets that control plane manage
 Railway itself, including, eventually, its own hosting.

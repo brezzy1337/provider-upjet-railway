@@ -1,7 +1,8 @@
 # Phase 1 review: the nodeless control-plane image
 
 _Last updated 2026-11-21. Reviewed against commit `3e52d25` of branch `phase-1/control-plane-image`,
-merged to `main` the same day via PR #3 with the fixes listed below._
+merged to `main` the same day via PR #3 with the fixes listed below. Every finding marked "Must fix"
+below was fixed in Phase 2; the [Phase 2 review](phase-2-review.md) records how._
 
 ## What Phase 1 delivered
 
