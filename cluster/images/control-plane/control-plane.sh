@@ -5,7 +5,7 @@
 # Boots, in order, gating every step on the previous one being READY (not merely
 # started):
 #
-#   1. etcd
+#   1. etcd                    (then a maintenance pass: defrag, snapshot)
 #   2. kube-apiserver          (own end-to-end TLS on $CP_APISERVER_PORT)
 #   3. kube-controller-manager (optional; garbage collector + namespace only)
 #   4. CRDs                    (Crossplane core via `crossplane core init`,
@@ -142,16 +142,21 @@ TERRAFORM_PROVIDER_VERSION="${TERRAFORM_PROVIDER_VERSION:-0.6.2}"
 # ---- B5: etcd quota, snapshots, memory ---------------------------------------
 # Rationale and behaviour: docs/architecture/control-plane.md, "Capacity: etcd
 # quota, snapshots and memory". Only what each variable does is noted here.
-# etcd backend quota in bytes (100 MiB to 8 GiB). Must fit the volume.
-CP_ETCD_QUOTA_BYTES="${CP_ETCD_QUOTA_BYTES:-2147483648}"
-# Seconds between maintenance runs (defrag, snapshot, prune); 0 disables the
-# periodic run. SIGUSR1 to the supervisor runs one immediately.
+# etcd backend quota: "auto" (half the state-root filesystem, at most 2 GiB)
+# or an integer number of bytes from 100 MiB to 8 GiB that must fit the volume.
+CP_ETCD_QUOTA_BYTES="${CP_ETCD_QUOTA_BYTES:-auto}"
+# Seconds between maintenance passes (defrag when fragmented, snapshot,
+# prune), rounded up to the 5 s tick; 0 disables the periodic pass. SIGUSR1
+# runs one now (at most once a minute). An alarm is polled for every 60 s
+# regardless and triggers a recovery pass at most every 10 minutes.
 CP_ETCD_MAINTENANCE_INTERVAL="${CP_ETCD_MAINTENANCE_INTERVAL:-21600}"
-# Snapshots kept under CP_STATE_DIR/snapshots, newest first.
+# Snapshots kept under CP_STATE_DIR/snapshots, newest first; 0 takes none.
 CP_ETCD_SNAPSHOT_KEEP="${CP_ETCD_SNAPSHOT_KEEP:-2}"
 # Container memory limit in bytes from which each Go component's GOMEMLIMIT is
 # derived. Empty: read the cgroup (v2 memory.max, then v1); no limit there
-# means no GOMEMLIMIT. false in CP_GOMEMLIMIT_ENABLED sets none.
+# means no GOMEMLIMIT. false in CP_GOMEMLIMIT_ENABLED sets none. The share of
+# one component is overridden with CP_GOMEMLIMIT_PCT_<NAME>, e.g.
+# CP_GOMEMLIMIT_PCT_KUBE_APISERVER=50 (names upper-cased, dashes to underscores).
 CP_MEMORY_LIMIT_BYTES="${CP_MEMORY_LIMIT_BYTES:-}"
 CP_GOMEMLIMIT_ENABLED="${CP_GOMEMLIMIT_ENABLED:-true}"
 
@@ -207,9 +212,9 @@ start_bg() {
     [ "${share}" -eq 0 ] || prefix=(env "GOMEMLIMIT=$(( MEMORY_LIMIT_BYTES * share / 100 / 1048576 ))MiB")
   fi
   if command -v setsid >/dev/null 2>&1; then
-    setsid "${prefix[@]}" "$@" >>"${CP_LOG_DIR}/${name}.log" 2>&1 &
+    setsid ${prefix[@]+"${prefix[@]}"} "$@" >>"${CP_LOG_DIR}/${name}.log" 2>&1 &
   else
-    "${prefix[@]}" "$@" >>"${CP_LOG_DIR}/${name}.log" 2>&1 &
+    ${prefix[@]+"${prefix[@]}"} "$@" >>"${CP_LOG_DIR}/${name}.log" 2>&1 &
   fi
   local pid=$!
   PIDS+=("$pid")
@@ -231,6 +236,12 @@ shutdown() {
   trap - EXIT TERM INT
   log "shutting down"
   local i pid t
+  # A maintenance pass in flight (background subshell plus its etcdctl) goes
+  # first; etcd is about to stop under it anyway.
+  if [ -n "${MAINT_PID:-}" ] && kill -0 "${MAINT_PID}" 2>/dev/null; then
+    pkill -TERM -P "${MAINT_PID}" 2>/dev/null || true
+    kill -TERM "${MAINT_PID}" 2>/dev/null || true
+  fi
   for (( i=${#PIDS[@]}-1; i>=0; i-- )); do
     pid="${PIDS[$i]}"
     kill -0 "$pid" 2>/dev/null || continue
@@ -696,52 +707,84 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Step 1: etcd
-# ------------------------------------------------------------------------------
-# ------------------------------------------------------------------------------
-# B5: capacity. etcd's quota must fit the volume, the database is defragmented
-# and snapshotted to the volume on a schedule, and every Go process gets a
-# GOMEMLIMIT. See docs/architecture/control-plane.md, "Capacity".
+# Step 1a: capacity (B5)
+#
+# etcd's quota must fit the volume; the database is defragmented when it is
+# fragmented and snapshotted to the volume by a maintenance pass; a NOSPACE
+# alarm is polled for and recovered from; every Go process gets a GOMEMLIMIT.
+# After boot the pass runs in the background from the supervise loop, so a
+# slow or hung etcd never blocks signal handling or death detection. See
+# docs/architecture/control-plane.md, "Capacity: etcd quota, snapshots and
+# memory".
 # ------------------------------------------------------------------------------
 # fs_bytes DIR -> "<total> <available>" bytes of the filesystem holding DIR.
 fs_bytes() { df -Pk "$1" | awk 'NR==2{print $2*1024, $4*1024}'; }
 mib() { printf '%s' "$(( $1 / 1048576 ))"; }
 
+ETCD_QUOTA_MIN=104857600     # 100 MiB
+ETCD_QUOTA_MAX=8589934592    # 8 GiB, etcd's own ceiling
 check_capacity() {
-  [[ "${CP_ETCD_QUOTA_BYTES}" =~ ^[0-9]+$ ]] \
-    && [ "${CP_ETCD_QUOTA_BYTES}" -ge 104857600 ] && [ "${CP_ETCD_QUOTA_BYTES}" -le 8589934592 ] \
-    || fail "CP_ETCD_QUOTA_BYTES must be an integer between 104857600 (100 MiB) and 8589934592 (8 GiB), got '${CP_ETCD_QUOTA_BYTES}'"
   [[ "${CP_ETCD_MAINTENANCE_INTERVAL}" =~ ^[0-9]+$ ]] && [[ "${CP_ETCD_SNAPSHOT_KEEP}" =~ ^[0-9]+$ ]] \
     || fail "CP_ETCD_MAINTENANCE_INTERVAL and CP_ETCD_SNAPSHOT_KEEP must be integers (got '${CP_ETCD_MAINTENANCE_INTERVAL}' / '${CP_ETCD_SNAPSHOT_KEEP}')"
-  local total avail; read -r total avail < <(fs_bytes "${CP_STATE_DIR}")
+  local total avail how=""
+  read -r total avail < <(fs_bytes "${CP_STATE_DIR}") && [[ "${total}" =~ ^[0-9]+$ ]] \
+    || fail "cannot read the size of the filesystem under ${CP_STATE_DIR} (df)"
   # Disk-full under etcd is how databases get corrupted; the quota exists so
-  # etcd refuses writes first. A volume smaller than the quota defeats that.
-  if [ "${total}" -lt "${CP_ETCD_QUOTA_BYTES}" ]; then
-    fail "the filesystem under ${CP_STATE_DIR} is $(mib "${total}") MiB, smaller than CP_ETCD_QUOTA_BYTES ($(mib "${CP_ETCD_QUOTA_BYTES}") MiB): etcd would hit disk-full before its quota. Lower the quota or use a larger volume"
-  elif [ "${avail}" -lt "${CP_ETCD_QUOTA_BYTES}" ]; then
-    log "WARNING: only $(mib "${avail}") MiB free under ${CP_STATE_DIR}; etcd cannot grow to its quota ($(mib "${CP_ETCD_QUOTA_BYTES}") MiB) without filling the volume"
+  # etcd refuses writes first. The other half of the volume is for the WAL, a
+  # defrag copy and the snapshots.
+  if [ "${CP_ETCD_QUOTA_BYTES}" = "auto" ]; then
+    CP_ETCD_QUOTA_BYTES=$(( total / 2 / 1048576 * 1048576 ))
+    [ "${CP_ETCD_QUOTA_BYTES}" -le 2147483648 ] || CP_ETCD_QUOTA_BYTES=2147483648
+    [ "${CP_ETCD_QUOTA_BYTES}" -ge "${ETCD_QUOTA_MIN}" ] \
+      || fail "the filesystem under ${CP_STATE_DIR} is $(mib "${total}") MiB; half of it is under the 100 MiB minimum etcd quota. Use a larger volume"
+    how=" (auto)"
+  else
+    [[ "${CP_ETCD_QUOTA_BYTES}" =~ ^[0-9]+$ ]] \
+      && [ "${CP_ETCD_QUOTA_BYTES}" -ge "${ETCD_QUOTA_MIN}" ] && [ "${CP_ETCD_QUOTA_BYTES}" -le "${ETCD_QUOTA_MAX}" ] \
+      || fail "CP_ETCD_QUOTA_BYTES must be 'auto' or an integer between ${ETCD_QUOTA_MIN} (100 MiB) and ${ETCD_QUOTA_MAX} (8 GiB), got '${CP_ETCD_QUOTA_BYTES}'"
+    [ "${total}" -ge "${CP_ETCD_QUOTA_BYTES}" ] \
+      || fail "the filesystem under ${CP_STATE_DIR} is $(mib "${total}") MiB, smaller than CP_ETCD_QUOTA_BYTES ($(mib "${CP_ETCD_QUOTA_BYTES}") MiB): etcd would hit disk-full before its quota. Lower the quota, set it to auto, or use a larger volume"
+    [ "${total}" -ge $(( CP_ETCD_QUOTA_BYTES * 2 )) ] \
+      || log "WARNING: the filesystem under ${CP_STATE_DIR} ($(mib "${total}") MiB) is under twice the quota; a defrag copy and snapshots of a database at the quota would not fit"
   fi
-  log "etcd quota $(mib "${CP_ETCD_QUOTA_BYTES}") MiB on a $(mib "${total}") MiB filesystem ($(mib "${avail}") MiB free); maintenance every ${CP_ETCD_MAINTENANCE_INTERVAL}s keeping ${CP_ETCD_SNAPSHOT_KEEP} snapshot(s)"
+  [ "${avail}" -ge "${CP_ETCD_QUOTA_BYTES}" ] \
+    || log "WARNING: only $(mib "${avail}") MiB free under ${CP_STATE_DIR}; etcd cannot grow to its quota ($(mib "${CP_ETCD_QUOTA_BYTES}") MiB) without filling the volume"
+  log "etcd quota $(mib "${CP_ETCD_QUOTA_BYTES}") MiB${how} on a $(mib "${total}") MiB filesystem ($(mib "${avail}") MiB free); maintenance every ${CP_ETCD_MAINTENANCE_INTERVAL}s keeping ${CP_ETCD_SNAPSHOT_KEEP} snapshot(s)"
 }
 
 # Share of the container memory limit each component gets as GOMEMLIMIT, in
 # percent: 85 in total, the rest for bash, the page cache and the terraform
 # processes (which inherit the provider's value). GOMEMLIMIT is a soft limit:
-# it makes a Go runtime collect harder as it approaches, not die.
+# it makes a Go runtime collect harder as it approaches, not die. Prints the
+# variable name and returns 1 on a malformed CP_GOMEMLIMIT_PCT_<NAME> override.
+GOMEMLIMIT_COMPONENTS="kube-apiserver etcd provider-upjet-railway kube-controller-manager crossplane"
 gomemlimit_share() {
+  local pct var ov
   case "$1" in
-    kube-apiserver)          echo 35 ;;
-    etcd)                    echo 15 ;;
-    provider-upjet-railway)  echo 15 ;;
-    kube-controller-manager) echo 10 ;;
-    crossplane)              echo 10 ;;
-    *)                       echo 0 ;;
+    kube-apiserver)          pct=35 ;;
+    etcd)                    pct=15 ;;
+    provider-upjet-railway)  pct=15 ;;
+    kube-controller-manager) pct=10 ;;
+    crossplane)              pct=10 ;;
+    *)                       pct=0 ;;
   esac
+  var="CP_GOMEMLIMIT_PCT_$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
+  ov="${!var:-}"
+  if [ -n "${ov}" ]; then
+    [[ "${ov}" =~ ^[0-9]+$ ]] && [ "${ov}" -le 100 ] || { printf '%s' "${var}"; return 1; }
+    pct="${ov}"
+  fi
+  printf '%s' "${pct}"
 }
 
 MEMORY_LIMIT_BYTES=""
 detect_memory_limit() {
-  local v="${CP_MEMORY_LIMIT_BYTES}" src="CP_MEMORY_LIMIT_BYTES"
+  local v="${CP_MEMORY_LIMIT_BYTES}" src="CP_MEMORY_LIMIT_BYTES" n share sum=0 shares=""
+  for n in ${GOMEMLIMIT_COMPONENTS}; do
+    share="$(gomemlimit_share "${n}")" || fail "${share} must be a percentage (0-100)"
+    sum=$(( sum + share )); shares="${shares}${shares:+, }${n} ${share}%"
+  done
+  [ "${sum}" -le 100 ] || fail "GOMEMLIMIT shares add up to ${sum}% (${shares}); keep the total at or under 100"
   if [ -n "${v}" ]; then
     [[ "${v}" =~ ^[0-9]+$ ]] || fail "CP_MEMORY_LIMIT_BYTES must be an integer number of bytes, got '${v}'"
   else
@@ -757,79 +800,141 @@ detect_memory_limit() {
   if [ "${CP_GOMEMLIMIT_ENABLED}" != "true" ]; then
     log "GOMEMLIMIT disabled (CP_GOMEMLIMIT_ENABLED=false)"
   elif [ -z "${v}" ]; then
-    log "no container memory limit found (cgroup unlimited and CP_MEMORY_LIMIT_BYTES unset): GOMEMLIMIT not set"
+    log "WARNING: no container memory limit found (cgroup unlimited or not visible, CP_MEMORY_LIMIT_BYTES unset): GOMEMLIMIT not set. Pass CP_MEMORY_LIMIT_BYTES on platforms that do not expose the limit"
   else
     [ "${v}" -ge 1073741824 ] \
       || log "WARNING: memory limit is $(mib "${v}") MiB; the control plane was not tested under 1 GiB"
-    log "memory limit $(mib "${v}") MiB (${src}); GOMEMLIMIT: kube-apiserver 35%, etcd 15%, provider 15%, controller-manager 10%, crossplane 10%"
+    log "memory limit $(mib "${v}") MiB (${src}); GOMEMLIMIT shares: ${shares}"
   fi
 }
 
 ETCD_SNAPSHOT_DIR="${CP_STATE_DIR}/snapshots"
-etcdctl_m() {
-  "${CP_BIN_DIR}/etcdctl" --endpoints "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
-    --dial-timeout 5s --command-timeout 120s "$@"
+ETCD_ENDPOINT="http://127.0.0.1:${CP_ETCD_CLIENT_PORT}"
+# Long timeouts for the maintenance calls (a defrag or snapshot of a database
+# near the quota), short ones for the probes that gate or poll. etcdctl keeps
+# retrying a refused connection until the command timeout, so a pass against
+# a dead etcd takes up to that long per call; it runs in the background.
+etcdctl_maint() { "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" --dial-timeout 5s --command-timeout 180s "$@"; }
+etcdctl_probe() { "${CP_BIN_DIR}/etcdctl" --endpoints "${ETCD_ENDPOINT}" --dial-timeout 2s --command-timeout 5s "$@"; }
+# etcd_status_field NAME -> the integer field NAME of `endpoint status`, or
+# "" when etcd does not answer. Never fails: callers run under set -e.
+etcd_status_field() {
+  local v
+  v="$(etcdctl_probe endpoint status -w json 2>/dev/null | grep -o "\"$1\":[0-9]*" | head -1 | cut -d: -f2 || true)"
+  [[ "${v}" =~ ^[0-9]+$ ]] && printf '%s' "${v}" || true
 }
-etcd_db_bytes() {
-  etcdctl_m endpoint status -w json 2>/dev/null | grep -o '"dbSize":[0-9]*' | head -1 | cut -d: -f2
+etcd_alarms() { etcdctl_probe alarm list 2>/dev/null || true; }
+# True when the alarm list holds nothing but NOSPACE, the one alarm this
+# script may clear. CORRUPT and anything else stay raised for a human.
+alarms_only_nospace() {
+  [ -n "$1" ] && ! printf '%s\n' "$1" | grep 'alarm:' | grep -qv 'alarm:NOSPACE'
 }
 
-# Defragment (kube-apiserver compacts every 5 min; defrag is what gives the
-# space back), clear a stale NOSPACE alarm, snapshot to the volume and prune.
-# Never fatal: a failed run is logged and the next one retries. Runs once
-# after etcd is ready (before the API server, so nothing is writing), then
-# every CP_ETCD_MAINTENANCE_INTERVAL seconds and on SIGUSR1.
+# The maintenance pass. Compaction is normally the API server's job (every 5
+# min); under NOSPACE its compactor cannot write its bookkeeping key, so the
+# pass compacts itself when an alarm is active. Defrag is what returns space
+# to the filesystem; it stalls etcd and needs a copy's worth of free space,
+# so it runs only when fragmented (or alarmed) and when the space is there.
+# Then: prune to KEEP-1, snapshot, so the directory never exceeds KEEP. The
+# boot pass skips the snapshot when one under an hour old exists, so a crash
+# loop cannot rotate every good snapshot away. Every caller invokes this as
+# `etcd_maintenance ... || ...`, which also turns errexit off inside it:
+# nothing in here may take the supervisor down.
 etcd_maintenance() {
-  local reason="$1" before after alarms avail f rev
-  before="$(etcd_db_bytes)"; before="${before:-0}"
-  alarms="$(etcdctl_m alarm list 2>/dev/null || true)"
+  local reason="$1" before inuse frag after alarms avail f rev want n newest
+  before="$(etcd_status_field dbSize)"; before="${before:-0}"
+  inuse="$(etcd_status_field dbSizeInUse)"; inuse="${inuse:-${before}}"
+  frag=$(( before - inuse )); [ "${frag}" -ge 0 ] || frag=0
+  alarms="$(etcd_alarms)"
   if [ -n "${alarms}" ]; then
-    # Under NOSPACE the API server cannot compact: its compactor first writes
-    # a compact_rev_key, and that Put is refused. Compact here, to the current
-    # revision, so the defrag below can actually give space back. Watchers see
-    # a "too old resource version" once and re-list.
-    rev="$(etcdctl_m endpoint status -w json 2>/dev/null | grep -o '"revision":[0-9]*' | head -1 | cut -d: -f2)"
+    rev="$(etcd_status_field revision)"
     if [ -n "${rev}" ]; then
-      etcdctl_m compact --physical "${rev}" >/dev/null 2>&1 \
-        && log "etcd alarm active (${alarms}): compacted to revision ${rev} before defrag" \
-        || log "WARNING: etcd compaction to revision ${rev} failed (${reason})"
+      # Kubernetes tolerates a third-party compaction: watchers see one "too
+      # old resource version" and re-list; the apiserver's own compactor
+      # handles ErrCompacted.
+      if etcdctl_maint compact --physical "${rev}" >/dev/null 2>&1; then
+        log "etcd alarm active (${alarms}): compacted to revision ${rev} before defrag"
+      else
+        log "WARNING: etcd compaction to revision ${rev} failed (${reason})"
+      fi
     fi
   fi
-  etcdctl_m defrag >/dev/null 2>&1 || log "WARNING: etcd defrag failed (${reason})"
-  after="$(etcd_db_bytes)"; after="${after:-${before}}"
+  read -r _ avail < <(fs_bytes "${CP_STATE_DIR}") || avail=0
+  if [ -n "${alarms}" ] || [ "${frag}" -ge 104857600 ] || { [ "${before}" -gt 0 ] && [ $(( frag * 4 )) -ge "${before}" ]; }; then
+    if [ "${avail}" -ge "${before}" ]; then
+      etcdctl_maint defrag >/dev/null 2>&1 || log "WARNING: etcd defrag failed (${reason})"
+    else
+      log "WARNING: skipping etcd defrag: it needs $(mib "${before}") MiB free under ${CP_STATE_DIR} and only $(mib "${avail}") MiB is"
+    fi
+  fi
+  after="$(etcd_status_field dbSize)"; after="${after:-${before}}"
   if [ -n "${alarms}" ]; then
-    if [ "${after}" -lt $(( CP_ETCD_QUOTA_BYTES * 9 / 10 )) ]; then
-      if etcdctl_m alarm disarm >/dev/null 2>&1; then
-        log "etcd alarm cleared after defrag (${after} bytes in use): ${alarms}"
+    if ! alarms_only_nospace "${alarms}"; then
+      log "WARNING: etcd alarm that is not NOSPACE, leaving it raised: ${alarms}"
+    elif [ "${after}" -lt $(( CP_ETCD_QUOTA_BYTES * 9 / 10 )) ]; then
+      if etcdctl_maint alarm disarm >/dev/null 2>&1; then
+        log "etcd alarm cleared after defrag ($(mib "${after}") MiB in use): ${alarms}"
       else
         log "WARNING: could not disarm etcd alarm: ${alarms}"
       fi
     else
-      log "WARNING: etcd alarm active with the database at $(mib "${after}") MiB of a $(mib "${CP_ETCD_QUOTA_BYTES}") MiB quota: ${alarms}. etcd refuses writes until space is freed: delete objects, wait for compaction, then SIGUSR1 this process"
+      log "WARNING: etcd alarm active with the database at $(mib "${after}") MiB of a $(mib "${CP_ETCD_QUOTA_BYTES}") MiB quota: ${alarms}. Writes are refused until space is freed: delete objects (the alarm poll recovers within 10 minutes); if the plane cannot boot, raise CP_ETCD_QUOTA_BYTES or restore a snapshot"
     fi
   fi
   mkdir -p "${ETCD_SNAPSHOT_DIR}"; chmod 700 "${ETCD_SNAPSHOT_DIR}"   # a default ACL can beat umask
-  read -r _ avail < <(fs_bytes "${CP_STATE_DIR}")
+  local -a snaps=()
+  mapfile -t snaps < <(printf '%s\n' "${ETCD_SNAPSHOT_DIR}"/etcd-*.db | sort -r)
+  [ -e "${snaps[0]:-}" ] || snaps=()
+  if [ "${CP_ETCD_SNAPSHOT_KEEP}" -eq 0 ]; then
+    [ "${#snaps[@]}" -eq 0 ] || rm -f -- "${snaps[@]}"
+    log "etcd maintenance (${reason}): db $(mib "${before}") -> $(mib "${after}") MiB; snapshots disabled (CP_ETCD_SNAPSHOT_KEEP=0)"
+    return 0
+  fi
+  newest="${snaps[0]:-}"
+  if [ "${reason}" = "boot" ] && [ -n "${newest}" ] \
+     && [ $(( $(date +%s) - $(stat -c %Y "${newest}" 2>/dev/null || echo 0) )) -lt 3600 ]; then
+    log "etcd maintenance (boot): db $(mib "${before}") -> $(mib "${after}") MiB; keeping $(basename "${newest}") (under an hour old) instead of a new snapshot"
+    return 0
+  fi
+  n=$(( CP_ETCD_SNAPSHOT_KEEP - 1 ))
+  [ "${#snaps[@]}" -le "${n}" ] || rm -f -- "${snaps[@]:${n}}"
+  read -r _ avail < <(fs_bytes "${CP_STATE_DIR}") || avail=0
   # Headroom: the snapshot itself plus the database growing meanwhile.
-  if [ "${avail}" -lt $(( after * 2 + 67108864 )) ]; then
-    log "WARNING: skipping the etcd snapshot: $(mib "${avail}") MiB free under ${CP_STATE_DIR}, want $(mib $(( after * 2 + 67108864 ))) MiB"
+  want=$(( after * 2 + 67108864 ))
+  f="${ETCD_SNAPSHOT_DIR}/etcd-$(date -u +%Y%m%dT%H%M%SZ).db"
+  if [ "${avail}" -lt "${want}" ]; then
+    log "WARNING: skipping the etcd snapshot: $(mib "${avail}") MiB free under ${CP_STATE_DIR}, want $(mib "${want}") MiB"
+  elif [ -e "${f}" ]; then
+    log "etcd maintenance (${reason}): a snapshot was taken this same second, not taking another"
+  elif etcdctl_maint snapshot save "${f}" >/dev/null 2>&1; then
+    chmod 600 "${f}"
+    log "etcd maintenance (${reason}): db $(mib "${before}") -> $(mib "${after}") MiB (fragmentation was $(mib "${frag}") MiB); snapshot $(basename "${f}") ($(mib "$(stat -c %s "${f}" || echo 0)") MiB), keeping ${CP_ETCD_SNAPSHOT_KEEP}; $(mib "${avail}") MiB free"
   else
-    f="${ETCD_SNAPSHOT_DIR}/etcd-$(date -u +%Y%m%dT%H%M%SZ).db"
-    if etcdctl_m snapshot save "${f}" >/dev/null 2>&1; then
-      chmod 600 "${f}"
-      local old
-      for old in $(ls -1 "${ETCD_SNAPSHOT_DIR}"/etcd-*.db | sort -r | tail -n +$(( CP_ETCD_SNAPSHOT_KEEP + 1 ))); do
-        rm -f "${old}"
-      done
-      log "etcd maintenance (${reason}): db $(mib "${before}") -> $(mib "${after}") MiB after defrag; snapshot $(basename "${f}") ($(mib "$(stat -c %s "${f}")") MiB), keeping ${CP_ETCD_SNAPSHOT_KEEP}; $(mib "${avail}") MiB free"
-    else
-      rm -f "${f}" "${f}.part"
-      log "WARNING: etcd snapshot save failed (${reason})"
-    fi
+    rm -f -- "${f}" "${f}.part"
+    log "WARNING: etcd snapshot save failed (${reason})"
   fi
 }
-MAINTENANCE_NOW=0
 
+# After boot the pass runs as a background job so the supervise loop keeps
+# its cadence; one at a time.
+MAINT_PID=""
+MAINTENANCE_LAST=0
+MAINTENANCE_NOW=0
+ALARM_PASS_LAST=0
+run_maintenance() {
+  local reason="$1"
+  if [ -n "${MAINT_PID}" ] && kill -0 "${MAINT_PID}" 2>/dev/null; then
+    log "etcd maintenance (${reason}): the previous pass (pid ${MAINT_PID}) is still running, not starting another"
+    return 0
+  fi
+  ( etcd_maintenance "${reason}" || log "WARNING: etcd maintenance (${reason}) did not complete" ) &
+  MAINT_PID=$!
+  MAINTENANCE_LAST=$(date +%s)
+}
+
+# ------------------------------------------------------------------------------
+# Step 1: etcd
+# ------------------------------------------------------------------------------
 start_etcd() {
   # Existence, ownership and mode of ${CP_ETCD_DATA_DIR} were checked in
   # prepare_state_dir.
@@ -850,9 +955,24 @@ start_etcd() {
   # so the maintenance pass gets a chance to clear a NOSPACE alarm left by
   # the previous run (endpoint health reports an alarmed member unhealthy,
   # which would otherwise wedge the boot). "healthy" then demands the real thing.
-  wait_ready "etcd serving" "${CP_READY_TIMEOUT}" etcdctl_m endpoint status
-  etcd_maintenance boot
-  wait_ready "etcd healthy (no alarm)" 30 etcdctl_m endpoint health
+  wait_ready "etcd serving" "${CP_READY_TIMEOUT}" etcdctl_probe endpoint status
+  etcd_maintenance boot || log "WARNING: etcd maintenance (boot) did not complete"
+  # Healthy means no alarm. Booting on through a NOSPACE alarm was tried and
+  # does not work: crossplane core init needs writes and fails five attempts
+  # later with a worse message. So an alarm the pass could not clear (live
+  # data above 90% of the quota, or CORRUPT) stops the boot here, with the
+  # ways out.
+  local t alarms
+  for t in $(seq 1 30); do etcdctl_probe endpoint health >/dev/null 2>&1 && break; sleep 1; done
+  if etcdctl_probe endpoint health >/dev/null 2>&1; then
+    log "READY: etcd healthy (no alarm)"
+  else
+    alarms="$(etcd_alarms)"
+    if alarms_only_nospace "${alarms}"; then
+      fail "etcd is still under a NOSPACE alarm after compaction and defrag: live data fills over 90% of the $(mib "${CP_ETCD_QUOTA_BYTES}") MiB quota. Raise CP_ETCD_QUOTA_BYTES (the volume permitting) and redeploy, then delete objects; or restore an older snapshot from ${ETCD_SNAPSHOT_DIR}"
+    fi
+    fail "etcd is not healthy after maintenance (${alarms:-no alarm reported}); see ${CP_LOG_DIR}/etcd.log"
+  fi
 }
 
 # ------------------------------------------------------------------------------
@@ -1426,7 +1546,8 @@ main() {
 
   # Supervise: if any component dies, take the whole container down so the
   # platform restarts it. Partial control planes are worse than dead ones.
-  local i tick=0 maint_ticks=$(( CP_ETCD_MAINTENANCE_INTERVAL / 5 ))
+  # Quantised to the 5 s tick, rounded up; 0 disables the periodic run.
+  local i tick=0 maint_ticks=$(( (CP_ETCD_MAINTENANCE_INTERVAL + 4) / 5 ))
   while true; do
     for i in "${!PIDS[@]}"; do
       if ! kill -0 "${PIDS[$i]}" 2>/dev/null; then
@@ -1440,9 +1561,19 @@ main() {
     # boot path reissues them. A silently expiring plane is worse than a restart.
     tick=$((tick+1))
     if [ "${MAINTENANCE_NOW}" -eq 1 ]; then
-      MAINTENANCE_NOW=0; etcd_maintenance signal
+      MAINTENANCE_NOW=0
+      if [ $(( $(date +%s) - MAINTENANCE_LAST )) -lt 60 ]; then
+        log "etcd maintenance (signal): ignored, the last pass started under 60 s ago"
+      else
+        run_maintenance signal
+      fi
+    elif [ $((tick % 12)) -eq 0 ] && [ -n "$(etcd_alarms)" ] \
+         && [ $(( $(date +%s) - ALARM_PASS_LAST )) -ge 600 ]; then
+      # Every 60 s: an alarm gets a recovery pass, at most every 10 minutes.
+      ALARM_PASS_LAST=$(date +%s)
+      run_maintenance alarm
     elif [ "${maint_ticks}" -gt 0 ] && [ $((tick % maint_ticks)) -eq 0 ]; then
-      etcd_maintenance periodic
+      run_maintenance periodic
     fi
     if [ $((tick % 720)) -eq 0 ]; then
       local c

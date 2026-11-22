@@ -197,46 +197,76 @@ remaining item.
 
 ## Capacity: etcd quota, snapshots and memory
 
-**etcd quota.** `--quota-backend-bytes` is `CP_ETCD_QUOTA_BYTES`, default 2 GiB; Phase 1 shipped
-etcd's 8 GiB maximum, larger than a small Railway volume (finding B5 of the
-[Phase 1 review](phase-1-review.md)). The quota is what makes etcd refuse writes, with a NOSPACE
-alarm, before the volume fills; a database that hits disk-full instead is how etcd gets corrupted.
-At boot the supervisor refuses to run when the filesystem under the state root is smaller than the
-quota, warns when less than the quota is free, and logs quota, filesystem size and free space.
-Values outside 100 MiB to 8 GiB are refused. Kubernetes objects are small, so 2 GiB is far more than
-this plane will hold; lower it for a small volume.
+**etcd quota.** `--quota-backend-bytes` is `CP_ETCD_QUOTA_BYTES`. The default, `auto`, is half the
+filesystem under the state root, at most 2 GiB (Phase 1 shipped etcd's 8 GiB maximum, larger than a
+small Railway volume; finding B5 of the [Phase 1 review](phase-1-review.md)); the other half is for
+the write-ahead log, a defrag copy and the snapshots. The quota is what makes etcd refuse writes,
+with a NOSPACE alarm, before the volume fills; a database that hits disk-full instead is how etcd
+gets corrupted. An explicit value must lie between 100 MiB and 8 GiB and fit the filesystem, or the
+boot fails; under twice the quota, or with less than the quota free, the boot warns. A Railway Hobby
+volume (5 GB) gets a 2 GiB quota; a 0.5 GB volume gets 256 MiB, which is still far more than this
+plane's objects need. The quota, filesystem size and free space are logged at boot.
 
-**Maintenance.** The API server compacts etcd every five minutes (its default), which frees old
-revisions inside the database but returns nothing to the filesystem; `etcdctl defrag` does. The
-supervisor runs a maintenance pass once etcd is ready and before the API server starts (nothing is
-writing, and the snapshot it takes is the state as the previous run left it), then every
-`CP_ETCD_MAINTENANCE_INTERVAL` seconds (default 6 h; 0 disables the periodic run), and whenever it
-receives `SIGUSR1`. A pass defragments, checks alarms, writes `etcdctl snapshot save` to
-`state/snapshots/etcd-<UTC time>.db` (file 0600, directory 0700) and keeps the newest
-`CP_ETCD_SNAPSHOT_KEEP` (default 2). The snapshot is skipped with a warning when free space is under
-twice the database size plus 64 MiB. A NOSPACE alarm is disarmed automatically once defrag has the
-database under 90% of the quota; otherwise the pass logs what to do (delete objects, wait for
-compaction, send `SIGUSR1`). Maintenance never fails the boot; problems are logged and the next pass
-retries. The pass runs inside the supervise loop, so a defrag delays component-death detection by its
-own duration: milliseconds at this plane's sizes, seconds near the quota.
+**Maintenance.** A pass defragments the database when it is fragmented (a quarter or more of the
+file, or over 100 MiB, is free inside it) and there is a copy's worth of free space, prunes the
+snapshot directory to `CP_ETCD_SNAPSHOT_KEEP - 1` files, then writes `etcdctl snapshot save` to
+`state/snapshots/etcd-<UTC time>.db` (file 0600, directory 0700) unless free space is under twice
+the database size plus 64 MiB. It runs once after etcd answers and before the API server starts
+(nothing is writing, and the snapshot is the state as the previous run left it), then every
+`CP_ETCD_MAINTENANCE_INTERVAL` seconds (default 6 h, quantised to the 5 s supervise tick; 0
+disables it), and whenever the supervisor receives `SIGUSR1` (at most once a minute). After boot the
+pass is a background job, one at a time, so a slow or hung etcd never delays signal handling or the
+component-death check; a pass still running at shutdown is stopped first. The boot pass takes no new
+snapshot while one under an hour old exists, so a crash loop cannot rotate every good snapshot away.
+`CP_ETCD_SNAPSHOT_KEEP=0` takes none. The pass never fails the boot or the supervisor: every error is
+a logged warning and the next pass retries. In the harness the boot pass on a 91 MiB database took
+under a second; nothing larger has been measured.
 
-**Restore.** The image ships `etcdutl`. To restore a snapshot: stop the service, move `state/etcd`
-aside, run `etcdutl snapshot restore state/snapshots/<file> --data-dir state/etcd --name control-plane
---initial-cluster control-plane=http://127.0.0.1:2380 --initial-advertise-peer-urls
-http://127.0.0.1:2380`, and start the service. The PKI on the same volume still matches the restored
-data, which is what B1 bought. A snapshot taken before an encryption-key rotation holds Secrets under
-the old key: boot with that key as `CP_ENCRYPTION_KEY_PREVIOUS` and remove `state/ENCRYPTION` so the
-Secrets are re-encrypted under the current key. The restore path is not exercised end to end yet;
-`etcdutl snapshot status` on every harness snapshot is.
+**The NOSPACE alarm.** When the database reaches the quota, etcd raises `NOSPACE` and refuses every
+write except deletes. The API server cannot repair this on its own: its compactor first writes a
+bookkeeping key, and that write is refused, so the space freed by deleting objects is never
+reclaimed (observed: 500 s after deleting everything, the database had not shrunk). The supervisor
+polls the alarm list every 60 s and, at most every 10 minutes, runs a recovery pass: compact to the
+current revision (Kubernetes tolerates this; watchers re-list once), defragment, and disarm the
+alarm once the database is under 90% of the quota. Only `NOSPACE` is ever cleared; a `CORRUPT` alarm
+stays raised for a human. On a running plane that is the whole recovery: delete objects and wait
+for the next poll. At boot, an etcd still alarmed after the pass stops the boot with the ways out,
+because live data then fills over 90% of the quota and nothing later in the boot can proceed without
+writes (booting on through the alarm was tried: `crossplane core init` fails five attempts later).
+The ways out are to raise `CP_ETCD_QUOTA_BYTES` (the volume permitting) and redeploy, after which
+the boot pass clears the alarm and objects can be deleted, or to restore an older snapshot. etcd's
+own `--auto-compaction-retention 1` would compact within the hour; the pass does not wait for it.
 
-**Memory.** Every component is a Go process, and a container at its memory limit gets an OOM kill of
-whichever process the kernel picks. Each component is started with `GOMEMLIMIT` set to a fixed share
-of the container's limit: kube-apiserver 35%, etcd 15%, the provider 15%, kube-controller-manager
-10%, Crossplane 10%, leaving 15% for bash, the page cache and the terraform processes the provider
-forks (they inherit the provider's value). The limit comes from `CP_MEMORY_LIMIT_BYTES` or, when that
-is unset, from the cgroup (`memory.max`, then the v1 file); with no limit anywhere nothing is set and
-the boot log says so. `CP_GOMEMLIMIT_ENABLED=false` turns it off. GOMEMLIMIT is a soft limit: the
-runtime collects harder as it nears it and can still exceed it, so the shares are back-pressure, not
-a guarantee, and sizing the container stays the operator's job; a limit under 1 GiB logs a warning.
-etcd's database is memory-mapped, so a database near a 2 GiB quota also means up to 2 GiB of page
-cache. The native harness host has no cgroup limit and passes 4 GiB by default.
+**Restore.** The image ships `etcdutl`. Snapshots live on the same volume as the database, so they
+are a rollback aid, not a backup: anything that takes the volume takes them, and any volume backup
+or export includes them (Secrets inside are secretbox ciphertext, everything else is plaintext).
+Copy them off the volume for a real backup. To restore: stop the service, move `state/etcd` aside,
+run, as the service user or followed by `chown -R` to `CP_RUN_UID` and `chmod 700`,
+
+```
+etcdutl snapshot restore state/snapshots/<file> --data-dir state/etcd --name control-plane \
+  --initial-cluster control-plane=http://127.0.0.1:2380 --initial-advertise-peer-urls http://127.0.0.1:2380
+```
+
+and start the service. The PKI on the same volume still matches the restored data (what B1 bought;
+etcd itself uses plain HTTP on loopback, so no etcd certificate is involved). A restore rewinds the
+cluster: managed resources created after the snapshot vanish from the API while the Railway objects
+they created still exist, and Crossplane will not adopt them, so reconcile against Railway by hand. A
+snapshot taken before an encryption-key rotation holds Secrets under the old key: boot with that key
+as `CP_ENCRYPTION_KEY_PREVIOUS` and remove `state/ENCRYPTION` so they are re-encrypted. The restore
+path is not exercised end to end yet; `etcdutl snapshot status` on every harness snapshot is.
+
+**Memory.** Every component is a Go process, and a container at its memory limit gets an OOM kill
+of whichever process the kernel picks. Each component is started with `GOMEMLIMIT` set to a share of
+the container's limit: kube-apiserver 35%, etcd 15%, the provider 15%, kube-controller-manager 10%,
+Crossplane 10%, leaving 15% for bash and the page cache; `CP_GOMEMLIMIT_PCT_<NAME>` overrides one
+share, and the total must stay at or under 100. The limit comes from `CP_MEMORY_LIMIT_BYTES` or, when
+that is unset, from the cgroup (`memory.max`, then the v1 file), which works where the container
+sees its own cgroup; where it does not, the boot warns and sets nothing, and `CP_MEMORY_LIMIT_BYTES`
+is the supported override. `CP_GOMEMLIMIT_ENABLED=false` turns it off. Three limits to be plain
+about. GOMEMLIMIT is a GC hint, not a cap: a component whose live heap exceeds its share collects
+harder (the runtime caps that work at half its CPU) and can still grow, so real OOM protection is the
+container limit. The terraform processes the provider forks inherit the provider's value each, so
+their total is bounded only by the provider's reconcile concurrency. And etcd's database is
+memory-mapped, so a database near a 2 GiB quota also means up to 2 GiB of page cache. The native
+harness host has no cgroup limit and passes 4 GiB by default.

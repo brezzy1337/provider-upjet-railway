@@ -64,6 +64,10 @@ MIRROR="${NATIVE_WORK}/provider-mirror"
 PLUGIN_DIR="${MIRROR}/registry.terraform.io/terraform-community-providers/railway/${TERRAFORM_PROVIDER_VERSION}/linux_amd64"
 
 say() { printf '\n=== %s\n' "$*" >&2; }
+# The supervisor's pid: bash running the script with no arguments, which is
+# how both `up` and the image's re-exec leave it. Anchored, so a shell whose
+# command line merely mentions the path (such as this probe) does not match.
+sup_pid() { pgrep -f '^bash [^ ]*cluster/images/control-plane/control-plane\.sh$' | head -1; }
 
 # The supervisor shells out to these at boot; fail early instead of dying
 # mid-PKI with a bare "shutting down".
@@ -379,23 +383,24 @@ verify() {
   # terraform processes the provider forks; Go keeps argv[0] as "terraform",
   # so a path match would miss them) must lack RAILWAY_TOKEN. Fail closed: no
   # supervisor, no descendants or an unreadable environ is a FAIL, not a pass.
-  check "RAILWAY_TOKEN is in no process under the supervisor (components and their children)" bash -c '
+  check "RAILWAY_TOKEN is in no process under the supervisor (components and their children)" bash -c "$(declare -f sup_pid)"'
     descend() { local c; for c in $(pgrep -P "$1" || true); do echo "$c"; descend "$c"; done; }
-    sup=$(pgrep -f "$1" | grep -vx "$$" | head -1); [ -n "$sup" ] || { echo "no supervisor" >&2; exit 1; }
+    sup=$(sup_pid); [ -n "$sup" ] || { echo "no supervisor" >&2; exit 1; }
     pids=$(descend "$sup"); [ -n "$pids" ] || { echo "no processes under supervisor $sup" >&2; exit 1; }
     for p in $pids; do
       e=$(tr "\0" "\n" < "/proc/$p/environ") || { echo "cannot read environ of pid $p" >&2; exit 1; }
       if printf "%s\n" "$e" | grep -q "^RAILWAY_TOKEN="; then
         echo "pid $p: $(tr "\0" " " < "/proc/$p/cmdline" | cut -c1-80)" >&2; exit 1
       fi
-    done' _ "cluster/images/control-plane/control-plane.sh"
+    done'
   if [ -n "${RAILWAY_TOKEN:-}" ]; then
     # Positive control for the documented residual: the supervisor'"'"'s own
     # exec-time environment still holds the token (bash cannot scrub it). If
     # this ever fails, the residual was closed and the architecture page is stale.
-    check "supervisor's own environ still holds RAILWAY_TOKEN (documented residual, pinned)" bash -c '
-      sup=$(pgrep -f "$1" | grep -vx "$$" | head -1); [ -n "$sup" ] || exit 1
-      tr "\0" "\n" < "/proc/$sup/environ" | grep -qx "RAILWAY_TOKEN=${RAILWAY_TOKEN}"' _ "cluster/images/control-plane/control-plane.sh"
+    check "supervisor's own environ still holds RAILWAY_TOKEN (documented residual, pinned)" bash -c "$(declare -f sup_pid)"'
+      sup=$(sup_pid); [ -n "$sup" ] || exit 1
+      tr "\0" "\n" < "/proc/$sup/environ" | grep -qx "RAILWAY_TOKEN=${RAILWAY_TOKEN}"'
+
     check "railway-creds Secret holds exactly {\"token\":\"<RAILWAY_TOKEN>\"} (verify needs the same RAILWAY_TOKEN as up)" bash -c '
       got=$("$1" --kubeconfig "$2" -n "$3" get secret railway-creds -o "go-template={{index .data \"credentials\"}}" | base64 -d)
       [ "$got" = "{\"token\":\"${RAILWAY_TOKEN}\"}" ]' _ "$BIN/kubectl" "$KC" "$ns"
@@ -416,12 +421,11 @@ verify() {
   fi
 
   # B5: quota on etcd, snapshots on the volume, GOMEMLIMIT on every Go process.
-  local sup_pat="cluster/images/control-plane/control-plane.sh"
   check "etcd runs with --quota-backend-bytes ${CP_ETCD_QUOTA_BYTES}" bash -c '
     p=$(pgrep -f "^$1/bin/etcd " | head -1); [ -n "$p" ] || exit 1
     tr "\0" "\n" < "/proc/$p/cmdline" | grep -A1 -x -- --quota-backend-bytes | grep -qx "$2"' _ "${NATIVE_WORK}" "${CP_ETCD_QUOTA_BYTES}"
-  check "etcd has no alarm raised" bash -c \
-    "[ -z \"\$(ETCDCTL_API=3 '$BIN/etcdctl' --endpoints http://127.0.0.1:${CP_ETCD_CLIENT_PORT} alarm list)\" ]"
+  check "etcd has no alarm raised" bash -c '
+    [ -z "$("$1" --endpoints "http://127.0.0.1:$2" alarm list)" ]' _ "$BIN/etcdctl" "${CP_ETCD_CLIENT_PORT}"
   if [ -n "${CP_MEMORY_LIMIT_BYTES:-}" ]; then
     # Same table as gomemlimit_share in the supervisor; the sum must stay under the limit.
     check "GOMEMLIMIT on every Go component is its share of CP_MEMORY_LIMIT_BYTES (sum under the limit)" bash -c '
@@ -438,22 +442,24 @@ verify() {
     printf 'SKIP  GOMEMLIMIT check (CP_MEMORY_LIMIT_BYTES empty: cgroup detection mode)\n'
   fi
   local snapdir="${CP_STATE_DIR}/snapshots"
-  check "a boot snapshot exists under state/snapshots, mode 0600" bash -c \
-    "f=\$(ls -1 '${snapdir}'/etcd-*.db 2>/dev/null | sort | tail -1); [ -n \"\$f\" ] && [ \"\$(stat -c %a \"\$f\")\" = 600 ]"
-  check "SIGUSR1 to the supervisor produces a new snapshot that etcdutl can read" bash -c '
-    sup=$(pgrep -f "$1" | grep -vx "$$" | head -1); [ -n "$sup" ] || exit 1
-    last=$(ls -1 "$2"/etcd-*.db 2>/dev/null | sort | tail -1)
-    sleep 1   # snapshot names have one-second resolution
-    kill -USR1 "$sup" || exit 1
-    for i in $(seq 1 60); do
-      new=$(ls -1 "$2"/etcd-*.db 2>/dev/null | sort | tail -1)
+  check "a snapshot exists under state/snapshots in a 0700 directory, mode 0600" bash -c '
+    f=$(ls -1 "$1"/etcd-*.db 2>/dev/null | sort | tail -1); [ -n "$f" ] || exit 1
+    [ "$(stat -c %a "$1")" = 700 ] && [ "$(stat -c %a "$f")" = 600 ]' _ "${snapdir}"
+  # The pass runs in the background and SIGUSR1 is rate-limited to one a
+  # minute, so a verify run straight after a boot or another verify waits.
+  check "SIGUSR1 to the supervisor produces a new snapshot that etcdutl can read" bash -c "$(declare -f sup_pid)"'
+    sup=$(sup_pid); [ -n "$sup" ] || exit 1
+    last=$(ls -1 "$1"/etcd-*.db 2>/dev/null | sort | tail -1)
+    for i in $(seq 1 90); do
+      kill -USR1 "$sup" || exit 1
+      sleep 2
+      new=$(ls -1 "$1"/etcd-*.db 2>/dev/null | sort | tail -1)
       [ -n "$new" ] && [ "$new" != "$last" ] && [ ! -e "$new.part" ] && break
-      sleep 1
     done
     [ -n "$new" ] && [ "$new" != "$last" ] || { echo "no new snapshot" >&2; exit 1; }
-    "$3" snapshot status "$new" -w table | grep -q -i revision' _ "${sup_pat}" "${snapdir}" "$BIN/etcdutl"
-  check "snapshots are pruned to CP_ETCD_SNAPSHOT_KEEP (${CP_ETCD_SNAPSHOT_KEEP})" bash -c \
-    "[ \"\$(ls -1 '${snapdir}'/etcd-*.db | wc -l)\" -le ${CP_ETCD_SNAPSHOT_KEEP} ]"
+    "$2" snapshot status "$new" -w table | grep -q -i revision' _ "${snapdir}" "$BIN/etcdutl"
+  check "snapshots are pruned to CP_ETCD_SNAPSHOT_KEEP (${CP_ETCD_SNAPSHOT_KEEP})" bash -c '
+    [ "$(ls -1 "$1"/etcd-*.db | wc -l)" -le "$2" ]' _ "${snapdir}" "${CP_ETCD_SNAPSHOT_KEEP}"
 
   # Owner-reference cascading deletion is the garbage collector's job, and the
   # garbage collector lives in kube-controller-manager. Prove it actually runs.
