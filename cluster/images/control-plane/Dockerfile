@@ -44,7 +44,8 @@ RUN set -eux; \
     curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-${TARGETOS}-${TARGETARCH}.tar.gz" \
       | tar -xz --strip-components=1 \
           "etcd-${ETCD_VERSION}-${TARGETOS}-${TARGETARCH}/etcd" \
-          "etcd-${ETCD_VERSION}-${TARGETOS}-${TARGETARCH}/etcdctl"; \
+          "etcd-${ETCD_VERSION}-${TARGETOS}-${TARGETARCH}/etcdctl" \
+          "etcd-${ETCD_VERSION}-${TARGETOS}-${TARGETARCH}/etcdutl"; \
     curl -fsSLo terraform.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_${TARGETOS}_${TARGETARCH}.zip"; \
     unzip -q terraform.zip && rm terraform.zip; \
     chmod +x /out/*
