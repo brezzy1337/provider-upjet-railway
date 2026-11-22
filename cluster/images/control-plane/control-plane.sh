@@ -18,7 +18,8 @@
 # the package manager would create Deployments that could never be scheduled.
 #
 # Secrets are never baked into the image: $RAILWAY_TOKEN arrives as an
-# environment variable and is written into a Secret + ProviderConfig at boot.
+# environment variable, is read once and removed from the environment before
+# any component starts, and is written into a Secret + ProviderConfig at boot.
 #
 # The same script drives the container image and the native (Docker-less) proof
 # in hack/native-cluster.sh, so the flags proven there are the flags shipped.
@@ -1079,19 +1080,63 @@ start_crossplane() {
 # $RAILWAY_TOKEN must be a Railway *workspace or account* token. Project tokens
 # fail with "Not Authorized" because the Terraform provider only ever sends an
 # `Authorization: Bearer` header.
+#
+# B4: the token is taken out of the environment before any component starts
+# (take_railway_token, called from main()), so no component inherits it. Only
+# [A-Za-z0-9-] is accepted, which is what keeps the hand-built JSON below safe
+# (the image has no jq). Two copies remain and are accepted: the short-lived
+# root-phase helpers (find, chown, su-exec) run before the drop with it, and
+# bash's unset cannot scrub this process's own exec-time environment block, so
+# /proc/<supervisor pid>/environ keeps it. Why that is acceptable, and the
+# conditions under which it stops being so, are in
+# docs/architecture/control-plane.md, "Secrets, audit and credential lifetimes".
 # ------------------------------------------------------------------------------
+# take_railway_token VAR: move $RAILWAY_TOKEN into the variable named VAR and
+# unset it (same idiom as prepare_encryption). Leading and trailing whitespace
+# is dropped; anything else outside the character set, interior whitespace
+# included, is refused rather than silently repaired. Pure builtins, so the
+# value is handed to no child process here.
+take_railway_token() {
+  local _tok="${RAILWAY_TOKEN:-}"
+  unset RAILWAY_TOKEN
+  _tok="${_tok#"${_tok%%[![:space:]]*}"}"
+  _tok="${_tok%"${_tok##*[![:space:]]}"}"
+  # The value itself is never logged, not even when it is refused.
+  [ -z "${_tok}" ] || [[ "${_tok}" =~ ^[A-Za-z0-9-]+$ ]] \
+    || fail "RAILWAY_TOKEN contains characters outside [A-Za-z0-9-]; expected a Railway workspace or account token"
+  printf -v "$1" '%s' "${_tok}"
+}
+
 write_railway_credentials() {
-  if [ -z "${RAILWAY_TOKEN:-}" ]; then
+  local token="$1"
+  if [ -z "${token}" ]; then
     log "WARNING: RAILWAY_TOKEN is unset -- skipping Secret/ProviderConfig."
     log "         The provider will start but every reconcile will fail until"
-    log "         a ProviderConfig with valid credentials exists."
+    log "         a ProviderConfig with valid credentials exists (one written"
+    log "         by an earlier boot stays in place)."
     return 0
   fi
   log "writing railway-creds Secret and ProviderConfig/default"
-  kc -n "${CP_CROSSPLANE_NAMESPACE}" create secret generic railway-creds \
-    --from-literal=credentials="{\"token\":\"${RAILWAY_TOKEN}\"}" \
-    --dry-run=client -o yaml | kc apply -f - >/dev/null
-  kc apply -f - >/dev/null <<EOF
+  # printf is a builtin and kubectl reads the JSON from stdin, so the token is
+  # on no command line and in no file. Server-side apply, because client-side
+  # apply would store the data a second time in the last-applied-configuration
+  # annotation. kubectl's own diagnostics can echo the object it failed on, so
+  # they are captured and the token and its base64 form masked before logging.
+  local ns="${CP_CROSSPLANE_NAMESPACE}" err b64
+  if ! err="$( { printf '{"token":"%s"}' "${token}" \
+        | kc -n "${ns}" create secret generic railway-creds \
+            --from-file=credentials=/dev/stdin --dry-run=client -o yaml \
+        | kc apply --server-side --force-conflicts -f - >/dev/null; } 2>&1 )"; then
+    b64="$(printf '{"token":"%s"}' "${token}" | base64 | tr -d '\n')"
+    err="${err//"${token}"/<redacted>}"; err="${err//"${b64}"/<redacted>}"
+    log "kubectl: ${err}"
+    fail "could not write the railway-creds Secret"
+  fi
+  # A Secret written by a boot before B4 still carries the client-side
+  # annotation with the data in it; drop it. A no-op once it is gone.
+  kc -n "${ns}" annotate secret railway-creds kubectl.kubernetes.io/last-applied-configuration- >/dev/null \
+    || fail "could not remove the last-applied-configuration annotation from railway-creds"
+  kc apply -f - >/dev/null <<EOF || fail "could not write ProviderConfig/default"
 apiVersion: railway.crossplane.io/v1beta1
 kind: ProviderConfig
 metadata:
@@ -1152,6 +1197,9 @@ start_provider() {
 # ------------------------------------------------------------------------------
 main() {
   drop_privileges_if_root "$@"
+  # The Railway token leaves the environment before anything is started (B4).
+  local railway_token
+  take_railway_token railway_token
   mkdir -p "${CP_HOME}" "${CP_LOG_DIR}" "${CP_RUN_DIR}" "${CP_HOME}/cache"
   # Separate handlers so a platform stop exits 143/130; the EXIT trap then runs
   # shutdown with that status instead of whatever command happened to be running.
@@ -1187,7 +1235,7 @@ main() {
   start_controller_manager
   apply_crds
   start_crossplane
-  write_railway_credentials
+  write_railway_credentials "${railway_token}"
   start_provider
 
   log "=============================================================="
