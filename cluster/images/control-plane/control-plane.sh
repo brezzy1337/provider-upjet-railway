@@ -18,7 +18,8 @@
 # the package manager would create Deployments that could never be scheduled.
 #
 # Secrets are never baked into the image: $RAILWAY_TOKEN arrives as an
-# environment variable and is written into a Secret + ProviderConfig at boot.
+# environment variable, is read once and removed from the environment before
+# any component starts, and is written into a Secret + ProviderConfig at boot.
 #
 # The same script drives the container image and the native (Docker-less) proof
 # in hack/native-cluster.sh, so the flags proven there are the flags shipped.
@@ -1079,19 +1080,50 @@ start_crossplane() {
 # $RAILWAY_TOKEN must be a Railway *workspace or account* token. Project tokens
 # fail with "Not Authorized" because the Terraform provider only ever sends an
 # `Authorization: Bearer` header.
+#
+# B4: the token leaves the environment at the top of main(), before any
+# component starts, so neither etcd, the API server, Crossplane, the provider
+# nor the terraform processes it forks inherit it; it reaches kubectl on stdin,
+# never on a command line (ps) or on disk; and only [A-Za-z0-9-] is accepted,
+# so the JSON built below cannot be broken or escaped by the value. One copy
+# remains: bash's unset does not scrub this process's own exec-time environment
+# block, so /proc/<supervisor pid>/environ still holds the token. Everything
+# in the container runs as one uid and holds a cluster-admin kubeconfig that
+# can read the Secret anyway, so that copy adds no reach. Rationale in
+# docs/architecture/control-plane.md, "Secrets, audit and credential lifetimes".
 # ------------------------------------------------------------------------------
+# take_railway_token VAR: move $RAILWAY_TOKEN into the variable named VAR
+# (whitespace stripped, character set checked) and unset it. Pure builtins, so
+# the value is handed to no child process here.
+take_railway_token() {
+  local token="${RAILWAY_TOKEN:-}"
+  unset RAILWAY_TOKEN
+  token="${token//[[:space:]]/}"
+  # The value itself is never logged, not even when it is refused.
+  [ -z "${token}" ] || [[ "${token}" =~ ^[A-Za-z0-9-]+$ ]] \
+    || fail "RAILWAY_TOKEN contains characters outside [A-Za-z0-9-]; expected a Railway workspace or account token"
+  printf -v "$1" '%s' "${token}"
+}
+
 write_railway_credentials() {
-  if [ -z "${RAILWAY_TOKEN:-}" ]; then
+  local token="$1"
+  if [ -z "${token}" ]; then
     log "WARNING: RAILWAY_TOKEN is unset -- skipping Secret/ProviderConfig."
     log "         The provider will start but every reconcile will fail until"
-    log "         a ProviderConfig with valid credentials exists."
+    log "         a ProviderConfig with valid credentials exists (one written"
+    log "         by an earlier boot stays in place)."
     return 0
   fi
   log "writing railway-creds Secret and ProviderConfig/default"
-  kc -n "${CP_CROSSPLANE_NAMESPACE}" create secret generic railway-creds \
-    --from-literal=credentials="{\"token\":\"${RAILWAY_TOKEN}\"}" \
-    --dry-run=client -o yaml | kc apply -f - >/dev/null
-  kc apply -f - >/dev/null <<EOF
+  # printf is a builtin and kubectl reads the JSON from stdin, so the token is
+  # on no command line and in no file; take_railway_token guarantees the value
+  # needs no JSON escaping.
+  printf '{"token":"%s"}' "${token}" \
+    | kc -n "${CP_CROSSPLANE_NAMESPACE}" create secret generic railway-creds \
+        --from-file=credentials=/dev/stdin --dry-run=client -o yaml \
+    | kc apply -f - >/dev/null \
+    || fail "could not write the railway-creds Secret"
+  kc apply -f - >/dev/null <<EOF || fail "could not write ProviderConfig/default"
 apiVersion: railway.crossplane.io/v1beta1
 kind: ProviderConfig
 metadata:
@@ -1152,6 +1184,9 @@ start_provider() {
 # ------------------------------------------------------------------------------
 main() {
   drop_privileges_if_root "$@"
+  # B4: the Railway token leaves the environment before anything is started.
+  local railway_token
+  take_railway_token railway_token
   mkdir -p "${CP_HOME}" "${CP_LOG_DIR}" "${CP_RUN_DIR}" "${CP_HOME}/cache"
   # Separate handlers so a platform stop exits 143/130; the EXIT trap then runs
   # shutdown with that status instead of whatever command happened to be running.
@@ -1187,7 +1222,7 @@ main() {
   start_controller_manager
   apply_crds
   start_crossplane
-  write_railway_credentials
+  write_railway_credentials "${railway_token}"
   start_provider
 
   log "=============================================================="

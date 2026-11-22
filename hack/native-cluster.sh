@@ -24,6 +24,11 @@
 # defaults to that uid here) and re-execs itself unprivileged; `verify` then
 # asserts that no component runs as uid 0.
 #
+# RAILWAY_TOKEN: pass it to `up` as the image would receive it; a fake value
+# (RAILWAY_TOKEN=fake-token-for-b4-test) exercises the handling, the provider
+# just fails its reconciles. Pass the same value to `verify` to turn on the
+# checks that need it (Secret contents, no trace in ps or logs).
+#
 # State lives in .work/native (gitignored). Set NATIVE_WORK to relocate.
 # ==============================================================================
 set -euo pipefail
@@ -346,6 +351,43 @@ verify() {
   check "TLS 1.2 accepted and TLS 1.1 refused by the API server" bash -c \
     "curl -sk --tlsv1.2 --tls-max 1.2 -o /dev/null https://127.0.0.1:${CP_APISERVER_PORT}/ && ! curl -sk --tls-max 1.1 -o /dev/null https://127.0.0.1:${CP_APISERVER_PORT}/"
   kp delete secret "$probe" --ignore-not-found >/dev/null 2>&1 || true
+
+  # B4: the Railway token must be in no component's environment, on no command
+  # line and in no log, and the Secret made from it must hold exactly the JSON
+  # the provider expects. The value-dependent checks run when verify itself has
+  # RAILWAY_TOKEN set (to the value `up` was given); they read it from the
+  # environment inside single-quoted bash -c scripts, so the probes never put
+  # it on a command line either.
+  local ns="${CP_CROSSPLANE_NAMESPACE:-crossplane-system}"
+  check "RAILWAY_TOKEN is in no control-plane component's environment (descendants included)" bash -c '
+    descend() { local c; for c in $(pgrep -P "$1" || true); do echo "$c"; descend "$c"; done; }
+    pids=$(pgrep -f "$1"); [ -n "$pids" ] || exit 1
+    # Terraform shows up as plain "terraform init", not by its path (Go keeps
+    # argv[0] as given), so walk each component'"'"'s children too.
+    for p in $pids; do pids="$pids $(descend "$p")"; done
+    for p in $pids; do
+      [ "$p" = "$$" ] && continue    # this probe matches its own argv
+      if tr "\0" "\n" < "/proc/$p/environ" 2>/dev/null | grep -q "^RAILWAY_TOKEN="; then
+        echo "pid $p: $(tr "\0" " " < "/proc/$p/cmdline" | cut -c1-80)" >&2; exit 1
+      fi
+    done' _ "${NATIVE_WORK}/"
+  if [ -n "${RAILWAY_TOKEN:-}" ]; then
+    check "railway-creds Secret holds exactly {\"token\":\"<RAILWAY_TOKEN>\"}" bash -c '
+      got=$("$1" --kubeconfig "$2" -n "$3" get secret railway-creds -o "go-template={{index .data \"credentials\"}}" | base64 -d)
+      [ "$got" = "{\"token\":\"${RAILWAY_TOKEN}\"}" ]' _ "$BIN/kubectl" "$KC" "$ns"
+    check "ProviderConfig/default points at railway-creds" bash -c \
+      "'$BIN/kubectl' --kubeconfig '$KC' get providerconfig.railway.crossplane.io default -o jsonpath='{.spec.credentials.secretRef.name}' | grep -qx railway-creds"
+    check "RAILWAY_TOKEN value is on no process command line" bash -c '
+      for f in /proc/[0-9]*/cmdline; do
+        p=${f#/proc/}; p=${p%/cmdline}; [ "$p" = "$$" ] && continue
+        c=$(tr "\0" " " < "$f" 2>/dev/null) || continue
+        case "$c" in *"${RAILWAY_TOKEN}"*) echo "pid $p: ${c:0:80}" >&2; exit 1;; esac
+      done'
+    check "RAILWAY_TOKEN value appears in no log under CP_LOG_DIR (audit log included)" bash -c '
+      ! grep -rqF -f <(printf "%s\n" "${RAILWAY_TOKEN}") "$1"' _ "${CP_LOG_DIR}"
+  else
+    printf 'SKIP  railway-creds Secret, ProviderConfig, command-line and log checks (RAILWAY_TOKEN unset for verify)\n'
+  fi
 
   # Owner-reference cascading deletion is the garbage collector's job, and the
   # garbage collector lives in kube-controller-manager. Prove it actually runs.

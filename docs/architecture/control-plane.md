@@ -165,6 +165,22 @@ revocation path, so `CP_ADMIN_TOKEN_ENABLED` is `false` in the image: no token f
 API server, no token kubeconfig is written, and a token file left by an earlier boot is removed. The
 native harness keeps it on. When on, `CP_ADMIN_TOKEN` rotates it as described above.
 
+**The Railway token.** `RAILWAY_TOKEN` is read once at the top of the boot, right after the
+privilege drop and before any component starts: whitespace is stripped, anything outside
+`[A-Za-z0-9-]` is refused with a fatal error that does not echo the value, and the variable is
+removed from the environment, so etcd, the API server, the controller manager, Crossplane, the
+provider and the terraform processes it forks never inherit it (B4). The `railway-creds` Secret is
+built from that value by a builtin `printf` piped into `kubectl create secret
+--from-file=credentials=/dev/stdin`, so the token is on no command line and in no file; the
+character check is what makes the hand-built JSON safe (the image has no `jq`). The token is never
+logged, and a boot without it warns and leaves any Secret from an earlier boot in place. One copy
+remains: bash's `unset` does not scrub a process's own exec-time environment block, so
+`/proc/<supervisor pid>/environ` holds the token for the life of the container. Everything in the
+container runs as one uid and holds the cluster-admin kubeconfig that can read the Secret, so that
+copy grants nothing extra; scrubbing it would take a re-exec of the supervisor with the token handed
+over on a pipe, which is not worth the moving parts today. The harness `verify` checks all of this
+when run with the same `RAILWAY_TOKEN` as `up`.
+
 Still open from B3: etcd listens on loopback without client authentication, so any process in the
 container can read and write etcd directly. Client certificates for etcd, or a Unix socket, are the
 remaining item.
