@@ -19,7 +19,7 @@ the control-plane service itself and the user application. See
 | Build and unit tests | Passed 2026-11-20 on Go 1.26.11: `go build`, `go test`, `golangci-lint` with 0 issues. The patched Terraform provider builds from `hack/upstream/` and its tests pass. |
 | Live verification | `Project` create → visible in Railway → delete → gone, via kind + Crossplane 2.2.1 + the provider out-of-cluster (2026-08-25, repeated through the native control plane 2026-08-26). No other kind has been exercised live. |
 | Upstream dependency | Blocked on [PR #93](https://github.com/terraform-community-providers/terraform-provider-railway/pull/93) (open, no activity since 2026-08-25). Upstream shipped 0.6.3 on 2026-10-19 **without** the fix. We build from a patch; see [The not-found patch](upstream/not-found-patch.md). |
-| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5) and B2 (PR #6) done; see Phase 2 below for what remains. |
+| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5), B2 (PR #6) and B3 (PR #7) done; see Phase 2 below for what remains. |
 | Package publishing | No xpkg or image has been pushed to a registry yet. CI workflows exist from the Upjet template but have not been exercised for a release. |
 
 ## Decisions
@@ -55,9 +55,10 @@ the volume, volume ownership, secrets encryption and audit, token handling, etcd
 
 Service from the image, one volume mounted at `CP_STATE_DIR` (etcd data, PKI and `VERSION` stamp;
 B1, done 2026-11-21 in PR #5; ownership of that volume handled by the image itself, B2, done
-2026-11-22 in PR #6), TCP proxy on 6443, env vars for the Railway token and API-server credential
-material. Still to do before the first deploy: B3 secrets encryption, audit log and shorter
-credentials, B4 token handling, B5 etcd quota and memory limits. First spike after that: a composition function as a supervised process,
+2026-11-22 in PR #6), Secrets encrypted at rest with the key supplied from Railway's secret store,
+an audit log and 90-day client certificates (B3, done 2026-11-22 in PR #7), TCP proxy on 6443, env
+vars for the Railway token and API-server credential material. Still to do before the first deploy:
+B4 token handling, B5 etcd quota and memory limits; etcd client authentication is the B3 leftover. First spike after that: a composition function as a supervised process,
 since every XRD depends on it. Done when the `Project` smoke test passes over the internet.
 Consider provisioning the service with this provider once it exists.
 

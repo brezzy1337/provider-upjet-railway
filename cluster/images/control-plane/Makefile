@@ -46,11 +46,15 @@ build-multiarch:
 # RAILWAY_TOKEN must be a Railway workspace/account token -- project tokens are
 # rejected by the upstream Terraform provider, which only sends Bearer auth.
 # Without it the plane still boots; the provider just has no ProviderConfig.
+# CP_ENCRYPTION_KEY (openssl rand -base64 32) is required by the image; keep it
+# in your shell or a secret store, never on the volume.
 run:
 	docker run --rm -it --name $(IMAGE) \
 		-p $(APISERVER_PORT):$(APISERVER_PORT) \
 		-v $(IMAGE)-state:$(STATE_DIR) \
 		-e RAILWAY_TOKEN \
+		-e CP_ENCRYPTION_KEY \
+		-e CP_ENCRYPTION_KEY_PREVIOUS \
 		-e CP_APISERVER_CERT_SANS \
 		-e CP_EXTERNAL_URL \
 		$(IMAGE):$(TAG)

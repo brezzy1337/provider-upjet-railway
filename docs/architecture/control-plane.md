@@ -116,3 +116,40 @@ value is never logged unless `CP_LOG_ADMIN_TOKEN=true`.
 There is no migration from Phase 1 layouts: a volume at the old `/var/lib/etcd` is not adopted. No
 Railway deployment existed before this change.
 
+## Secrets, audit and credential lifetimes
+
+**Secrets at rest.** The API server encrypts `Secret` objects in etcd with secretbox
+(`--encryption-provider-config`). The key is 32 random bytes, base64, supplied as `CP_ENCRYPTION_KEY`
+from the platform's secret store; the image sets `CP_REQUIRE_EXTERNAL_KEY=true`, so a missing key
+fails the boot there, while the native harness generates one under `pki/` with a warning. The key
+itself never touches the volume when supplied externally: the EncryptionConfiguration is written
+under `run/` each boot. A fingerprint of the key in use is stamped at `state/ENCRYPTION`; a boot with
+a different key is refused unless the previous key is passed as `CP_ENCRYPTION_KEY_PREVIOUS`, in which
+case the supervisor re-encrypts every Secret under the new key after the API server is up and moves
+the stamp. First enablement follows the same path, so Secrets written before encryption was on are
+rewritten too. A volume snapshot without the key yields ciphertext for Secrets; everything else in
+etcd is plaintext, as in any Kubernetes cluster.
+
+**Audit.** With `CP_AUDIT_ENABLED` (default on) the API server writes a JSON audit log to
+`CP_AUDIT_LOG_PATH` (default `log/audit.log`, rotated at 20 MB, three backups, seven days). The
+policy records every write and every access to a Secret at `Metadata` level (who, what, when, never
+the body); reads of other resources and the health, discovery and metrics endpoints are not logged,
+since the controllers watch constantly. The log lives on the ephemeral filesystem; shipping it out is
+part of D6.
+
+**Credential lifetimes.** The admin and controller-manager client certificates are valid for
+`CP_CLIENT_CERT_DAYS` (default 90) and are reissued at boot once less than half that remains, so a
+kubeconfig handed to a person lives at most 90 days and is renewed transparently by a restart after
+the midpoint. The API server's serving certificate is valid for `CP_SERVING_CERT_DAYS` (default 365)
+and is reissued when its SAN set changes or within 30 days of expiry. The two CAs stay long-lived.
+`CP_TLS_MIN_VERSION` defaults to TLS 1.2.
+
+**Bearer token.** The static admin token is a cluster-admin credential with no expiry and no
+revocation path, so `CP_ADMIN_TOKEN_ENABLED` is `false` in the image and the token kubeconfig is not
+written there. The native harness keeps it on. When on, the token file is passed to the API server
+and `CP_ADMIN_TOKEN` rotates it as described above.
+
+Still open from B3: etcd listens on loopback without client authentication, so any process in the
+container can read and write etcd directly. Client certificates for etcd, or a Unix socket, are the
+remaining item.
+

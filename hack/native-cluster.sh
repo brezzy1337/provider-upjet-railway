@@ -320,6 +320,23 @@ verify() {
     "d=\$(mktemp -d); printf 'terraform {\n required_providers {\n railway = {\n source = \"terraform-community-providers/railway\"\n version = \"${TERRAFORM_PROVIDER_VERSION}\"\n }\n }\n}\n' > \$d/main.tf; \
      cd \$d && TF_CLI_CONFIG_FILE='${NATIVE_WORK}/terraformrc.hcl' '$BIN/terraform' init -no-color -input=false >/dev/null; rc=\$?; rm -rf \$d; exit \$rc"
 
+  # B3: Secrets are encrypted at rest, audited, and admin credentials are short.
+  check "secrets are encrypted at rest (secretbox) in etcd" bash -c "
+    '$BIN/kubectl' --kubeconfig '$KC' -n default delete secret b3-probe --ignore-not-found >/dev/null 2>&1
+    '$BIN/kubectl' --kubeconfig '$KC' -n default create secret generic b3-probe --from-literal=k=v >/dev/null 2>&1 || exit 1
+    v=\$(ETCDCTL_API=3 '$BIN/etcdctl' --endpoints http://127.0.0.1:${CP_ETCD_CLIENT_PORT} get /registry/secrets/default/b3-probe --print-value-only | head -c 24)
+    case \"\$v\" in k8s:enc:secretbox:v1:*) exit 0;; *) echo \"stored as: \$v\" >&2; exit 1;; esac"
+  check "encryption key fingerprint stamped in the state root" bash -c "grep -qE '^[0-9a-f]{16}\$' '${CP_STATE_DIR}/ENCRYPTION'"
+  check "audit log records the secret write at Metadata level" bash -c "
+    f='${CP_AUDIT_LOG_PATH:-${HOME_DIR}/log/audit.log}'; test -s \"\$f\" || exit 1
+    grep -q '\"name\":\"b3-probe\"' \"\$f\" && grep '\"name\":\"b3-probe\"' \"\$f\" | grep -q '\"level\":\"Metadata\"' && ! grep '\"name\":\"b3-probe\"' \"\$f\" | grep -q requestObject"
+  check "admin client certificate valid for at most ${CP_CLIENT_CERT_DAYS:-90} days" bash -c "
+    end=\$(date -d \"\$(openssl x509 -enddate -noout -in '${CP_STATE_DIR}/pki/admin.crt' | cut -d= -f2)\" +%s); now=\$(date +%s)
+    [ \$(( (end - now) / 86400 )) -le ${CP_CLIENT_CERT_DAYS:-90} ]"
+  check "TLS 1.1 refused by the API server" bash -c \
+    "! curl -sk --tls-max 1.1 https://127.0.0.1:${CP_APISERVER_PORT}/ >/dev/null 2>&1"
+  '$BIN/kubectl' --kubeconfig '$KC' -n default delete secret b3-probe --ignore-not-found >/dev/null 2>&1 || true
+
   # Owner-reference cascading deletion is the garbage collector's job, and the
   # garbage collector lives in kube-controller-manager. Prove it actually runs.
   check "garbage collector collects orphaned children" bash -c "$(declare -f gc_probe); \

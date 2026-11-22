@@ -61,6 +61,37 @@ CP_RUN_GID="${CP_RUN_GID:-${CP_RUN_UID}}"
 CP_STAY_ROOT="${CP_STAY_ROOT:-false}"
 # Force the recursive chown even when no mismatched file is found.
 CP_FORCE_CHOWN="${CP_FORCE_CHOWN:-false}"
+
+# ---- B3: secrets at rest, audit, credential lifetimes ------------------------
+# Secrets are encrypted in etcd with secretbox. The key (32 random bytes,
+# base64) should come from the platform's secret store so that a volume
+# snapshot alone does not yield the Secrets: `openssl rand -base64 32`. The
+# image sets CP_REQUIRE_EXTERNAL_KEY=true, so a missing key fails the boot
+# there; elsewhere a key is generated and kept under pki/ with a warning.
+# A fingerprint of the key in use is stamped in the state root, so a boot with
+# a different key is refused unless the old key is supplied as
+# CP_ENCRYPTION_KEY_PREVIOUS, in which case every Secret is re-encrypted with
+# the new key and the stamp moves.
+CP_ENCRYPTION_KEY="${CP_ENCRYPTION_KEY:-}"
+CP_ENCRYPTION_KEY_PREVIOUS="${CP_ENCRYPTION_KEY_PREVIOUS:-}"
+CP_REQUIRE_EXTERNAL_KEY="${CP_REQUIRE_EXTERNAL_KEY:-false}"
+# Audit: Metadata for every write and for any access to Secrets; reads and the
+# health/discovery endpoints are not logged. JSON lines, rotated by size.
+CP_AUDIT_ENABLED="${CP_AUDIT_ENABLED:-true}"
+CP_AUDIT_LOG_PATH="${CP_AUDIT_LOG_PATH:-${CP_LOG_DIR}/audit.log}"
+CP_AUDIT_LOG_MAXSIZE_MB="${CP_AUDIT_LOG_MAXSIZE_MB:-20}"
+CP_AUDIT_LOG_MAXBACKUP="${CP_AUDIT_LOG_MAXBACKUP:-3}"
+# Credential lifetimes. Client certs (admin, controller-manager) are reissued
+# at boot once less than half their validity remains, so a kubeconfig handed
+# out lives at most CP_CLIENT_CERT_DAYS and is renewed transparently on a
+# restart after the midpoint. The serving cert follows the same rule with a
+# 30-day window, on top of reissue when the SAN set changes. The CA stays long-lived.
+CP_CLIENT_CERT_DAYS="${CP_CLIENT_CERT_DAYS:-90}"
+CP_SERVING_CERT_DAYS="${CP_SERVING_CERT_DAYS:-365}"
+# The static admin bearer token is a long-lived cluster-admin credential with
+# no revocation path; prefer client certificates. The image sets this false.
+CP_ADMIN_TOKEN_ENABLED="${CP_ADMIN_TOKEN_ENABLED:-true}"
+CP_TLS_MIN_VERSION="${CP_TLS_MIN_VERSION:-VersionTLS12}"
 CP_KCM_PORT="${CP_KCM_PORT:-10257}"   # kube-controller-manager secure/health port, loopback only
 CP_ETCD_CLIENT_PORT="${CP_ETCD_CLIENT_PORT:-2379}"
 CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-2380}"
@@ -496,14 +527,16 @@ bootstrap_pki() {
   fi
 
   if [ ! -f "${CP_PKI_DIR}/apiserver.sans" ] || \
-     [ "$(cat "${CP_PKI_DIR}/apiserver.sans")" != "${sans}" ]; then
-    log "issuing apiserver serving certificate for ${sans}"
+     [ "$(cat "${CP_PKI_DIR}/apiserver.sans")" != "${sans}" ] || \
+     ! cert_fresh "${CP_PKI_DIR}/apiserver.crt" $(( 30 * 86400 )) || \
+     cert_fresh "${CP_PKI_DIR}/apiserver.crt" $(( CP_SERVING_CERT_DAYS * 86400 + 60 )); then
+    log "issuing apiserver serving certificate (${CP_SERVING_CERT_DAYS} days) for ${sans}"
     openssl genrsa -out "${CP_PKI_DIR}/apiserver.key" 2048 2>/dev/null
     openssl req -new -key "${CP_PKI_DIR}/apiserver.key" \
       -subj "/CN=kube-apiserver" -out "${CP_PKI_DIR}/apiserver.csr" 2>/dev/null
     openssl x509 -req -in "${CP_PKI_DIR}/apiserver.csr" \
       -CA "${CP_PKI_DIR}/ca.crt" -CAkey "${CP_PKI_DIR}/ca.key" -CAcreateserial \
-      -out "${CP_PKI_DIR}/apiserver.crt" -days 3650 -sha256 \
+      -out "${CP_PKI_DIR}/apiserver.crt" -days "${CP_SERVING_CERT_DAYS}" -sha256 \
       -extfile <(printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\n' "${sans}") 2>/dev/null
     rm -f "${CP_PKI_DIR}/apiserver.csr"
     printf '%s' "${sans}" > "${CP_PKI_DIR}/apiserver.sans"
@@ -519,6 +552,10 @@ bootstrap_pki() {
   # ---- static bearer token --------------------------------------------------
   # Convenient for clients that cannot carry a client certificate. NEVER
   # anonymous: --anonymous-auth=false is passed to the apiserver.
+  if [ "${CP_ADMIN_TOKEN_ENABLED}" != "true" ]; then
+    CP_ADMIN_TOKEN=""
+    return 0
+  fi
   # Persisted with the PKI. If CP_ADMIN_TOKEN is set in the environment it wins,
   # so changing the platform variable rotates the token on the next boot. Unset,
   # the stored token is reused (or generated on first boot) -- so removing the
@@ -541,16 +578,25 @@ bootstrap_pki() {
   CP_ADMIN_TOKEN="${tok}"
 }
 
+# cert_fresh FILE SECONDS: true when FILE exists and is valid for at least SECONDS more.
+cert_fresh() { [ -f "$1" ] && openssl x509 -checkend "$2" -noout -in "$1" >/dev/null 2>&1; }
+# cert_within_policy FILE DAYS: true when FILE exists, has at least half of DAYS
+# left, and does not outlive DAYS (so lowering the policy shortens an existing cert).
+cert_within_policy() {
+  cert_fresh "$1" $(( $2 * 86400 / 2 )) && ! cert_fresh "$1" $(( $2 * 86400 + 60 ))
+}
+
 issue_client_cert() {
   local name="$1" cn="$2" org="$3"
-  [ -f "${CP_PKI_DIR}/${name}.crt" ] && return 0
-  log "issuing client certificate ${name} (CN=${cn}, O=${org})"
+  # Reissue once less than half the validity remains, or if the cert outlives the policy.
+  cert_within_policy "${CP_PKI_DIR}/${name}.crt" "${CP_CLIENT_CERT_DAYS}" && return 0
+  log "issuing client certificate ${name} (CN=${cn}, O=${org}, ${CP_CLIENT_CERT_DAYS} days)"
   openssl genrsa -out "${CP_PKI_DIR}/${name}.key" 2048 2>/dev/null
   openssl req -new -key "${CP_PKI_DIR}/${name}.key" \
     -subj "/O=${org}/CN=${cn}" -out "${CP_PKI_DIR}/${name}.csr" 2>/dev/null
   openssl x509 -req -in "${CP_PKI_DIR}/${name}.csr" \
     -CA "${CP_PKI_DIR}/ca.crt" -CAkey "${CP_PKI_DIR}/ca.key" -CAcreateserial \
-    -out "${CP_PKI_DIR}/${name}.crt" -days 3650 -sha256 \
+    -out "${CP_PKI_DIR}/${name}.crt" -days "${CP_CLIENT_CERT_DAYS}" -sha256 \
     -extfile <(printf 'extendedKeyUsage=clientAuth\n') 2>/dev/null
   rm -f "${CP_PKI_DIR}/${name}.csr"
 }
@@ -646,7 +692,109 @@ start_etcd() {
 #     mounts a token into a Pod.
 #   * No --enable-aggregator-routing: there is no kube-proxy to route to.
 # ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# B3: secrets at rest and audit policy (files under CP_RUN_DIR, written each boot)
+# ------------------------------------------------------------------------------
+key_fp() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+key_ok() { [ "$(printf '%s' "$1" | base64 -d 2>/dev/null | wc -c | tr -d ' ')" = "32" ]; }
+
+ENCRYPTION_CONFIG="${CP_RUN_DIR}/encryption-config.yaml"
+ENCRYPTION_STAMP="${CP_STATE_DIR}/ENCRYPTION"
+ENCRYPTION_REWRAP=false
+ENCRYPTION_FP=""
+
+prepare_encryption() {
+  local key="${CP_ENCRYPTION_KEY}" prev="${CP_ENCRYPTION_KEY_PREVIOUS}" keyfile="${CP_PKI_DIR}/encryption.key"
+  if [ -z "${key}" ]; then
+    if [ "${CP_REQUIRE_EXTERNAL_KEY}" = "true" ]; then
+      fail "CP_ENCRYPTION_KEY is unset. Generate one with 'openssl rand -base64 32', store it in the platform's secret store (never on the volume), and pass it as CP_ENCRYPTION_KEY"
+    fi
+    if [ -f "${keyfile}" ]; then
+      key="$(cat "${keyfile}")"
+    else
+      key="$(openssl rand -base64 32)"
+      printf '%s' "${key}" > "${keyfile}"; chmod 600 "${keyfile}"
+      log "generated a secrets encryption key at ${keyfile}"
+    fi
+    log "WARNING: the secrets encryption key lives at ${keyfile}, on the same volume as the data it protects; pass CP_ENCRYPTION_KEY from a secret store for a real deployment"
+  fi
+  key_ok "${key}" || fail "CP_ENCRYPTION_KEY must be 32 random bytes, base64-encoded (openssl rand -base64 32)"
+  [ -z "${prev}" ] || key_ok "${prev}" || fail "CP_ENCRYPTION_KEY_PREVIOUS must be 32 random bytes, base64-encoded"
+
+  ENCRYPTION_FP="$(key_fp "${key}")"
+  local stored=""; [ -f "${ENCRYPTION_STAMP}" ] && stored="$(cat "${ENCRYPTION_STAMP}")"
+  if [ -z "${stored}" ]; then
+    ENCRYPTION_REWRAP=true   # first boot with encryption: rewrite any plaintext Secrets
+  elif [ "${stored}" != "${ENCRYPTION_FP}" ]; then
+    if [ -n "${prev}" ] && [ "$(key_fp "${prev}")" = "${stored}" ]; then
+      log "rotating the secrets encryption key (${stored} -> ${ENCRYPTION_FP}); Secrets are re-encrypted once the API server is up"
+      ENCRYPTION_REWRAP=true
+    else
+      fail "Secrets in etcd were encrypted with key ${stored}, but CP_ENCRYPTION_KEY has fingerprint ${ENCRYPTION_FP}. Restore the right key, or pass the old one as CP_ENCRYPTION_KEY_PREVIOUS to rotate"
+    fi
+  fi
+
+  {
+    printf 'apiVersion: apiserver.config.k8s.io/v1\nkind: EncryptionConfiguration\nresources:\n  - resources: [secrets]\n    providers:\n      - secretbox:\n          keys:\n'
+    printf '            - name: key-%s\n              secret: %s\n' "${ENCRYPTION_FP}" "${key}"
+    [ -z "${prev}" ] || printf '            - name: key-%s\n              secret: %s\n' "$(key_fp "${prev}")" "${prev}"
+    printf '      - identity: {}\n'
+  } > "${ENCRYPTION_CONFIG}"
+  chmod 600 "${ENCRYPTION_CONFIG}"
+  log "secrets encryption at rest: secretbox, key ${ENCRYPTION_FP}$( [ -n "${prev}" ] && printf ' (+ previous %s for reading)' "$(key_fp "${prev}")" )"
+}
+
+# After the API server is ready: rewrite every Secret so it is stored under the
+# current key (covers first enablement and rotation), then move the stamp.
+finish_encryption() {
+  [ "${ENCRYPTION_REWRAP}" = "true" ] || return 0
+  local n; n="$(kc get secrets -A -o name 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n}" -gt 0 ]; then
+    log "re-encrypting ${n} Secret(s) under key ${ENCRYPTION_FP}"
+    kc get secrets -A -o json | kc replace -f - >/dev/null
+  fi
+  printf '%s' "${ENCRYPTION_FP}" > "${ENCRYPTION_STAMP}.tmp" && mv -f "${ENCRYPTION_STAMP}.tmp" "${ENCRYPTION_STAMP}"
+}
+
+AUDIT_POLICY="${CP_RUN_DIR}/audit-policy.yaml"
+write_audit_policy() {
+  cat > "${AUDIT_POLICY}" <<'EOF'
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  # Health, discovery and metrics: never.
+  - level: None
+    nonResourceURLs: ["/healthz*", "/readyz*", "/livez*", "/metrics", "/version", "/openapi*", "/api", "/api/*", "/apis", "/apis/*"]
+  # Any access to Secrets: who, what, when (never the body).
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets"]
+  # Reads of everything else: the controllers watch constantly; not logged.
+  - level: None
+    verbs: ["get", "list", "watch"]
+  # Every write: Metadata.
+  - level: Metadata
+EOF
+  chmod 600 "${AUDIT_POLICY}"
+}
+
+apiserver_audit_flags() {
+  [ "${CP_AUDIT_ENABLED}" = "true" ] || return 0
+  write_audit_policy
+  printf -- '--audit-policy-file=%s\n--audit-log-path=%s\n--audit-log-format=json\n--audit-log-maxsize=%s\n--audit-log-maxbackup=%s\n--audit-log-maxage=7\n' \
+    "${AUDIT_POLICY}" "${CP_AUDIT_LOG_PATH}" "${CP_AUDIT_LOG_MAXSIZE_MB}" "${CP_AUDIT_LOG_MAXBACKUP}"
+}
+
+apiserver_token_flags() {
+  [ "${CP_ADMIN_TOKEN_ENABLED}" = "true" ] || return 0
+  printf -- '--token-auth-file=%s\n' "${CP_PKI_DIR}/tokens.csv"
+}
+
 start_apiserver() {
+  local extra=()
+  mapfile -t extra < <(apiserver_audit_flags; apiserver_token_flags)
   start_bg kube-apiserver "${CP_BIN_DIR}/kube-apiserver" \
     --etcd-servers "http://127.0.0.1:${CP_ETCD_CLIENT_PORT}" \
     --bind-address "${CP_APISERVER_BIND_ADDRESS}" \
@@ -655,7 +803,8 @@ start_apiserver() {
     --tls-cert-file "${CP_PKI_DIR}/apiserver.crt" \
     --tls-private-key-file "${CP_PKI_DIR}/apiserver.key" \
     --client-ca-file "${CP_PKI_DIR}/ca.crt" \
-    --token-auth-file "${CP_PKI_DIR}/tokens.csv" \
+    --encryption-provider-config "${ENCRYPTION_CONFIG}" \
+    --tls-min-version "${CP_TLS_MIN_VERSION}" \
     --service-account-key-file "${CP_PKI_DIR}/sa.pub" \
     --service-account-signing-key-file "${CP_PKI_DIR}/sa.key" \
     --service-account-issuer "https://kubernetes.default.svc.cluster.local" \
@@ -673,10 +822,12 @@ start_apiserver() {
     --allow-privileged=false \
     --profiling=false \
     --enable-priority-and-fairness=true \
-    --v=1
+    --v=1 \
+    "${extra[@]}"
 
   wait_ready "kube-apiserver /readyz" "${CP_READY_TIMEOUT}" \
     kc get --raw=/readyz
+  finish_encryption
 }
 
 # ------------------------------------------------------------------------------
@@ -972,7 +1123,12 @@ main() {
 
   write_kubeconfig "${KUBECONFIG_INTERNAL}" "https://127.0.0.1:${CP_APISERVER_PORT}" admin
   write_kubeconfig "${KUBECONFIG_EXTERNAL}" "${external}" admin
-  write_kubeconfig_token "${KUBECONFIG_EXTERNAL_TOKEN}" "${external}"
+  if [ "${CP_ADMIN_TOKEN_ENABLED}" = "true" ]; then
+    write_kubeconfig_token "${KUBECONFIG_EXTERNAL_TOKEN}" "${external}"
+  else
+    rm -f "${KUBECONFIG_EXTERNAL_TOKEN}"
+  fi
+  prepare_encryption
 
   start_etcd
   start_apiserver
@@ -986,14 +1142,21 @@ main() {
   log "control plane UP"
   log "  api server (external): ${external}"
   log "  kubeconfig (external): ${KUBECONFIG_EXTERNAL}      (client cert)"
-  log "  kubeconfig (external): ${KUBECONFIG_EXTERNAL_TOKEN} (bearer token)"
+  if [ "${CP_ADMIN_TOKEN_ENABLED}" = "true" ]; then
+    log "  kubeconfig (external): ${KUBECONFIG_EXTERNAL_TOKEN} (bearer token)"
+  else
+    log "  bearer token:          disabled (CP_ADMIN_TOKEN_ENABLED=false)"
+  fi
+  log "  client cert validity:  ${CP_CLIENT_CERT_DAYS} days (renewed on restart past the midpoint)"
   # The token is a cluster-admin credential and this log stream is usually the
   # platform's deploy log, so print it only when explicitly asked. It is always
   # in the token kubeconfig above and in ${CP_PKI_DIR}/tokens.csv.
-  if [ "${CP_LOG_ADMIN_TOKEN:-false}" = "true" ]; then
-    log "  bearer token:          ${CP_ADMIN_TOKEN}"
-  else
-    log "  bearer token:          <hidden; set CP_LOG_ADMIN_TOKEN=true to print>"
+  if [ "${CP_ADMIN_TOKEN_ENABLED}" = "true" ]; then
+    if [ "${CP_LOG_ADMIN_TOKEN:-false}" = "true" ]; then
+      log "  bearer token:          ${CP_ADMIN_TOKEN}"
+    else
+      log "  bearer token:          <hidden; set CP_LOG_ADMIN_TOKEN=true to print>"
+    fi
   fi
   log "  logs:                  ${CP_LOG_DIR}"
   log "=============================================================="
