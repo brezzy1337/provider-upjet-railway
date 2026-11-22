@@ -24,8 +24,8 @@ deploy itself has not happened yet and is the next step.
 | B5, etcd quota and memory | #9, `d282731` | `CP_ETCD_QUOTA_BYTES` (`auto`: half the volume, at most 2 GiB) checked against the volume at boot; a background maintenance pass (defrag when fragmented, snapshot to `state/snapshots`, prune) at boot, every 6 h and on `SIGUSR1`; a 60 s alarm poll that compacts, defragments and disarms a NOSPACE alarm; `GOMEMLIMIT` per Go component as a share of the cgroup limit; `etcdutl` in the image | 41 |
 | B3 leftover, etcd client authentication | #10, `00d5605` | A dedicated etcd CA; TLS with a client certificate required on both etcd listeners, client and peer; per-boot client identities for the API server and the supervisor; one atomic signing path for every certificate the supervisor issues | 49 |
 
-Across the six PRs the supervisor grew from about 900 to 1 660 lines and the harness's `verify`
-from 17 to 49 checks. Twenty-one `CP_*` variables were added; each is documented where it is set
+Across the six PRs the supervisor grew from about 800 to 1 660 lines and the harness's `verify`
+from 17 to 49 checks. Twenty-five `CP_*` variables were added; each is documented where it is set
 and in the Architecture page section that owns it.
 
 ## Verification
@@ -36,8 +36,8 @@ matter most, with their results on the final code of each PR:
 
 | Scenario | Result |
 |----------|--------|
-| Cold boot on an empty state root | 17 to 29 s to provider ready, depending on the day's load; every check passing |
-| Restart on persisted state | 10 to 16 s; cluster CA and admin token unchanged, asserted by `verify` |
+| Cold boot on an empty state root | 17 to 38 s to provider ready, depending on the day's load; every check passing |
+| Restart on persisted state | 10 to 17 s; cluster CA and admin token unchanged, asserted by `verify` |
 | Image older than the `VERSION` stamp | refused; `CP_ALLOW_DOWNGRADE=true` boots with a warning and keeps the mark |
 | Started as root on a root-owned state root | ownership taken, every process including the supervisor at uid 1000 afterwards; `CP_RUN_UID=0`, `CP_STATE_DIR=/` and the like refused before any filesystem change |
 | Encryption key rotation `KA` to `KB` | every Secret re-encrypted after the API server is up; a boot with the wrong key refused by fingerprint; a key that is not the base64 of 32 bytes refused |
@@ -45,7 +45,7 @@ matter most, with their results on the final code of each PR:
 | etcd filled past a 100 MiB quota | NOSPACE raised at 105 MB; after deleting the objects the alarm cleared on the next pass, at boot or on signal, database 100 to 1 MiB |
 | Live data over 90% of the quota, restart | refused with the two ways out; a restart with a larger quota cleared the alarm at boot in 18 s |
 | etcd without a certificate, with a cluster-CA certificate, or in plaintext | each refused with a TLS alert or a dropped connection, on both ports; the etcd CA rotated by removing its files and rebooting |
-| Shutdown | all components gone in under 10 s every time, no kill escalation observed |
+| Shutdown | all components gone within about 10 s every time, no kill escalation observed |
 
 Two defects were found by running rather than by reading, both in B5: under a NOSPACE alarm the
 API server cannot compact (its compactor writes a bookkeeping key first, and that write is refused),
@@ -60,8 +60,8 @@ round trip.
 ## How the reviews changed the design
 
 Every PR went through the read-only review panel before merge (factual, architecture, security,
-consistency, redundancy from B2 onward), and every PR took a follow-up commit. The findings that
-changed the design rather than the wording:
+consistency and redundancy for anything touching `cluster/` or `hack/`), and the panel's findings
+were fixed before merging. The findings that changed the design rather than the wording:
 
 - **B1.** The version stamp was rewritten unconditionally, so a boot with a missing binary would have
   lowered it and disarmed the guard; a Makefile comment on the `STATE_DIR` line would have mounted
@@ -121,7 +121,7 @@ Nothing from the Phase 1 review blocks the deploy. In order:
 3. **The uid split** for the provider and terraform: per-component ownership of key files and the
    etcd data directory, a PKI directory the provider cannot traverse, and a reduced RBAC identity in
    place of `system:masters` (D3 of the Phase 1 review).
-4. **Design debt D1, D2, D4, D5 and D6** of the Phase 1 review is unchanged: all-or-nothing
+4. **Design debt D1, D2, D4, D5 and D6** of the Phase 1 review are unchanged: all-or-nothing
    supervision, no component abstraction, the package manager bypassed, two build paths, no
    Railway-facing health check. The maintenance pass and the alarm poll were added to the existing
    supervise loop rather than to a new structure, so D1 and D2 grew slightly.
