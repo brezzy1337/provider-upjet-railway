@@ -7,6 +7,7 @@
 
 * [Authentication](getting-started/authentication.md)
 * [Development](getting-started/development.md)
+* [Deploy the control plane to Railway](getting-started/deploy-to-railway.md)
 
 ## Concepts
 
@@ -31,5 +32,6 @@
 ## Development reports
 
 * [Development reports](reports/README.md)
+  * [2026-11-24](reports/2026-11-24.md)
   * [2026-11-22](reports/2026-11-22.md)
   * [2026-11-21](reports/2026-11-21.md)

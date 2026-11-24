@@ -39,7 +39,10 @@ straight into cloud APIs. That is also why providers run as processes rather tha
 The package manager would create Deployments that could never schedule.
 
 **Exposure.** Railway HTTP domains terminate TLS at the edge, so the API server sits behind a Railway
-TCP proxy on 6443 with the proxy hostname in its serving certificate. Authentication is a static
+TCP proxy on 6443 with the proxy hostname in its serving certificate; the supervisor reads the
+hostname and the proxy port from Railway's own variables at boot, for the certificate and for the
+exported kubeconfig (see [Deploy the control plane to
+Railway](../getting-started/deploy-to-railway.md)). Authentication is a static
 bearer token or client certificates. Anonymous access is off.
 
 **Secrets.** Cloud credentials arrive as Railway environment variables and are written into
