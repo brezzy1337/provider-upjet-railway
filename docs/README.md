@@ -39,6 +39,8 @@ Railway itself, including, eventually, its own hosting.
 
 * [Authentication](getting-started/authentication.md): which Railway token works and how to wire it.
 * [Development](getting-started/development.md): toolchain, scripts and the generate loop.
+* [Deploy the control plane to Railway](getting-started/deploy-to-railway.md): the service, volume,
+  TCP proxy and two secrets; the smoke test; publishing it as a template.
 * [Resources](resources/overview.md): every kind, its references and what has been tested live.
 * [Roadmap](roadmap.md): current status and the phased plan.
 * [Development reports](reports/README.md): dated records of what each working session shipped,
