@@ -11,3 +11,12 @@ cover.out
 .vscode/
 .idea/
 .DS_Store
+
+# Never ship credentials or local config to a builder
+kubeconfig-external*
+*.kubeconfig
+*.key
+*.pem
+.env
+.env.*
+.claude/

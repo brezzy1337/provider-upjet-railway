@@ -60,8 +60,11 @@ the Railway token out of every component's environment, B4, done 2026-11-22 in P
 snapshots and GOMEMLIMIT, B5, done 2026-11-22 in PR #9; etcd client authentication, the B3 leftover,
 done 2026-11-22 in PR #10), TCP proxy on 6443, env vars for the Railway token, `CP_ENCRYPTION_KEY`
 and API-server credential material. Nothing from the Phase 1 review blocks the first deploy any
-more. First spike after it: a composition function as a supervised process, since every XRD depends
-on it. Done when the `Project` smoke test passes over the internet.
+more; the procedure is [Deploy the control plane to Railway](getting-started/deploy-to-railway.md),
+and since PR #12 the service configures its own endpoint from Railway's variables. First spike after
+it: a composition function as a supervised process, since every XRD depends on it. Done when the
+`Project` smoke test passes over the internet. Revisit Railway's Infrastructure as Code for the
+service definition once its reference covers the TCP proxy and the Dockerfile path.
 Consider provisioning the service with this provider once it exists.
 
 ### Phase 3: first cloud, DigitalOcean

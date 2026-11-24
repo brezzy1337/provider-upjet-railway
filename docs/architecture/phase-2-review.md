@@ -111,11 +111,11 @@ were fixed before merging. The findings that changed the design rather than the 
 
 Nothing from the Phase 1 review blocks the deploy. In order:
 
-1. **The deploy itself**: service from the image, one volume at `CP_STATE_DIR`, a TCP proxy on 6443,
-   `RAILWAY_TOKEN` and `CP_ENCRYPTION_KEY` from the platform's secret store, the proxy hostname in
-   `CP_APISERVER_CERT_SANS`. Done when the `Project` smoke test passes over the internet. The first
-   deploy should also exercise `etcdutl snapshot restore` once and check the `GOMEMLIMIT` shares
-   against observed usage under the real limit.
+1. **The deploy itself**, by the runbook
+   [Deploy the control plane to Railway](../getting-started/deploy-to-railway.md). Done when the
+   `Project` smoke test passes over the internet. The first deploy should also exercise
+   `etcdutl snapshot restore` once and check the `GOMEMLIMIT` shares against observed usage under the
+   real limit.
 2. **The composition-function spike**, unchanged from Phase 1: a function as a supervised process
    with its endpoint written by hand. Every XRD depends on it.
 3. **The uid split** for the provider and terraform: per-component ownership of key files and the

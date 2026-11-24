@@ -34,8 +34,10 @@
 # empty (CP_MEMORY_LIMIT_BYTES=) to test cgroup detection itself.
 #
 # Railway: set RAILWAY_SERVICE_ID=x RAILWAY_TCP_PROXY_DOMAIN=<host>
-# RAILWAY_TCP_PROXY_PORT=<port> for `up` and the same for `verify` to exercise
-# the platform defaults (proxy hostname in the serving cert, kubeconfig URL).
+# RAILWAY_TCP_PROXY_PORT=<port>, all three, for `up` and again for `verify`, to
+# exercise the platform defaults (proxy hostname in the serving cert, kubeconfig
+# URL). verify then skips the two kubeconfig round trips, since the host does
+# not resolve here.
 #
 # State lives in .work/native (gitignored). Set NATIVE_WORK to relocate.
 # ==============================================================================
@@ -328,15 +330,17 @@ verify() {
   check "provider metrics" curl -fsS "http://127.0.0.1:${CP_PROVIDER_METRICS_PORT}/metrics"
   check "provider controllers running" bash -c \
     "curl -fsS http://127.0.0.1:${CP_PROVIDER_METRICS_PORT}/metrics | grep -q 'controller_runtime_active_workers.*project'"
-  if [ -n "${RAILWAY_TCP_PROXY_DOMAIN:-}" ]; then
-    # The exported kubeconfigs point at the simulated proxy, which does not
-    # resolve here; the Railway check further down asserts their contents.
-    printf 'SKIP  external and bearer-token kubeconfig round trips (they point at the simulated Railway proxy)\n'
-  else
+  local railway_sim=""
+  [ -n "${RAILWAY_SERVICE_ID:-}" ] && [ -n "${RAILWAY_TCP_PROXY_DOMAIN:-}" ] && [ -n "${RAILWAY_TCP_PROXY_PORT:-}" ] && railway_sim=1
+  if [ -z "${railway_sim}" ]; then
     check "external kubeconfig works from a clean environment" bash -c \
       "env -i PATH=/usr/bin:/bin '$BIN/kubectl' --kubeconfig '${HOME_DIR}/kubeconfig-external' get --raw=/version"
     check "bearer-token kubeconfig works" bash -c \
       "env -i PATH=/usr/bin:/bin '$BIN/kubectl' --kubeconfig '${HOME_DIR}/kubeconfig-external-token' get --raw=/version"
+  else
+    # The exported kubeconfigs point at the simulated proxy, which does not
+    # resolve here; the Railway check further down asserts their contents.
+    printf 'SKIP  external and bearer-token kubeconfig round trips (they point at the simulated Railway proxy)\n'
   fi
 
   # The mirror must hold the PATCHED build, not the v0.6.2 release. Two
@@ -518,10 +522,10 @@ verify() {
   # Railway platform defaults: with the proxy variables set for both up and
   # verify, the proxy hostname must be a SAN of the serving certificate and the
   # exported kubeconfig must point at https://domain:port.
-  if [ -n "${RAILWAY_TCP_PROXY_DOMAIN:-}" ]; then
+  if [ -n "${railway_sim}" ]; then
     check "serving certificate carries the Railway TCP proxy hostname and the exported kubeconfig points at it" bash -c '
-      openssl x509 -noout -ext subjectAltName -in "$1/pki/apiserver.crt" | grep -q "DNS:$2" \
-        && grep -q "server: https://$2:$3$" "$4/kubeconfig-external"' _ "${CP_STATE_DIR}" "${RAILWAY_TCP_PROXY_DOMAIN}" "${RAILWAY_TCP_PROXY_PORT:-}" "${HOME_DIR}"
+      openssl x509 -noout -ext subjectAltName -in "$1/pki/apiserver.crt" | tr "," "\n" | grep -qxF " DNS:$2" \
+        && grep -qxF "    server: https://$2:$3" "$4/kubeconfig-external"' _ "${CP_STATE_DIR}" "${RAILWAY_TCP_PROXY_DOMAIN}" "${RAILWAY_TCP_PROXY_PORT:-}" "${HOME_DIR}"
   fi
 
   # Owner-reference cascading deletion is the garbage collector's job, and the

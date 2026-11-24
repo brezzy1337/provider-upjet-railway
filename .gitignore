@@ -9,3 +9,11 @@ cover.out
 # ignore IDE folders
 .vscode/
 .idea/
+
+# Credentials that the Railway runbook or local runs may leave in the tree
+kubeconfig-external*
+*.kubeconfig
+*.key
+*.pem
+.env
+.env.*

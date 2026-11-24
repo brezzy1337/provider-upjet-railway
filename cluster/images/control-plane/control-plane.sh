@@ -100,8 +100,9 @@ CP_APISERVER_BIND_ADDRESS="${CP_APISERVER_BIND_ADDRESS:-0.0.0.0}"
 CP_APISERVER_PORT="${CP_APISERVER_PORT:-6443}"
 CP_APISERVER_ADVERTISE_ADDRESS="${CP_APISERVER_ADVERTISE_ADDRESS:-}"
 CP_SERVICE_CLUSTER_IP_RANGE="${CP_SERVICE_CLUSTER_IP_RANGE:-10.96.0.0/24}"
-# Comma-separated extra SANs for the serving cert. Put the future public
-# hostname (Railway TCP proxy) here, e.g. "monorail.proxy.rlwy.net".
+# Comma-separated extra SANs for the serving cert. On Railway the TCP proxy
+# hostname is added automatically (apply_railway_defaults); this is for any
+# other name clients will use, e.g. a custom domain in front of the proxy.
 CP_APISERVER_CERT_SANS="${CP_APISERVER_CERT_SANS:-}"
 # Public URL clients outside the container should use. Defaults to the first
 # extra SAN if one was given, otherwise to the advertise address. On Railway
@@ -350,39 +351,54 @@ drop_privileges_if_root() {
 }
 
 # ------------------------------------------------------------------------------
-# Railway: what the platform tells the service about itself. The TCP proxy in
+# Step -1a: Railway platform defaults (before the state root is checked)
+#
+# What the platform tells the service about itself. The TCP proxy in
 # front of the API server is known through RAILWAY_TCP_PROXY_DOMAIN and
-# RAILWAY_TCP_PROXY_PORT, so unless set explicitly the proxy hostname joins the
-# serving certificate's SANs and the exported kubeconfig points at domain:port;
-# a template deploy then needs no networking variables at all. The rest are
-# checks against the two mistakes a deploy can make: the volume at a path
-# other than CP_STATE_DIR, and a drain window shorter than the shutdown.
+# RAILWAY_TCP_PROXY_PORT: the proxy hostname is a platform fact, so it always
+# joins the serving certificate's SANs, and unless CP_EXTERNAL_URL is set the
+# exported kubeconfig points at domain:port. A template deploy then needs no
+# networking variables at all. The rest are checks against the mistakes a
+# deploy can make: the volume somewhere other than the state root (reported
+# here with the fix, before prepare_state_dir fails on it), and a drain window
+# shorter than the shutdown. Railway-specific on purpose and kept small.
 # ------------------------------------------------------------------------------
 apply_railway_defaults() {
   [ -n "${RAILWAY_SERVICE_ID:-}" ] || return 0     # not on Railway
   local dom="${RAILWAY_TCP_PROXY_DOMAIN:-}" port="${RAILWAY_TCP_PROXY_PORT:-}"
+  # The hostname goes into the certificate's SAN list and the kubeconfig; a
+  # value that is not a plain hostname is refused rather than interpolated.
+  if [ -n "${dom}" ] && ! [[ "${dom}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
+    fail "RAILWAY_TCP_PROXY_DOMAIN is not a hostname: '${dom}'"
+  fi
   if [ -n "${dom}" ]; then
-    if [ -z "${CP_APISERVER_CERT_SANS}" ]; then
-      CP_APISERVER_CERT_SANS="${dom}"
+    if ! printf ',%s,' "${CP_APISERVER_CERT_SANS//[[:space:]]/}" | grep -qF ",${dom},"; then
+      CP_APISERVER_CERT_SANS="${CP_APISERVER_CERT_SANS:+${CP_APISERVER_CERT_SANS},}${dom}"
       log "Railway TCP proxy ${dom} added to the serving certificate SANs"
-    elif ! printf ',%s,' "${CP_APISERVER_CERT_SANS//[[:space:]]/}" | grep -qF ",${dom},"; then
-      log "WARNING: CP_APISERVER_CERT_SANS does not include the Railway TCP proxy ${dom}; clients through the proxy will fail certificate verification"
     fi
-    if [ -z "${CP_EXTERNAL_URL}" ] && [[ "${port}" =~ ^[0-9]+$ ]]; then
+    if [ -n "${CP_EXTERNAL_URL}" ]; then
+      :   # an explicit URL wins
+    elif [[ "${port}" =~ ^[0-9]+$ ]] && [ "${port}" -ge 1 ] && [ "${port}" -le 65535 ]; then
       CP_EXTERNAL_URL="https://${dom}:${port}"
       log "external URL defaults to ${CP_EXTERNAL_URL} (Railway TCP proxy)"
+    else
+      log "WARNING: RAILWAY_TCP_PROXY_PORT is '${port}', not a port; the exported kubeconfig will carry the API server's own port, which is wrong behind the proxy. Set CP_EXTERNAL_URL"
     fi
   else
-    log "WARNING: this Railway service has no TCP proxy (RAILWAY_TCP_PROXY_DOMAIN unset); the API server is unreachable from outside until one exists on port ${CP_APISERVER_PORT}"
+    log "WARNING: this Railway service has no TCP proxy (RAILWAY_TCP_PROXY_DOMAIN unset); the API server is unreachable from outside until one exists on port ${CP_APISERVER_PORT}, and the serving certificate is reissued with its hostname on the boot after that"
   fi
+  # The state root must be on the volume: equal to the mount path or under it.
   local mp="${RAILWAY_VOLUME_MOUNT_PATH:-}"
-  if [ -n "${mp}" ] && [ "${mp%/}" != "${CP_STATE_DIR%/}" ]; then
-    log "WARNING: the Railway volume is mounted at ${mp} but CP_STATE_DIR is ${CP_STATE_DIR}; the state root is not on the volume"
+  if [ -n "${mp}" ]; then
+    case "${CP_STATE_DIR%/}/" in
+      "${mp%/}/"*) ;;
+      *) log "WARNING: the Railway volume is mounted at ${mp} but CP_STATE_DIR is ${CP_STATE_DIR}; mount the volume at ${CP_STATE_DIR} (or set CP_STATE_DIR=${mp}). The persistence check below will fail" ;;
+    esac
   fi
   local drain="${RAILWAY_DEPLOYMENT_DRAINING_SECONDS:-0}" need=$(( CP_SHUTDOWN_TIMEOUT * 5 ))
   [[ "${drain}" =~ ^[0-9]+$ ]] || drain=0
   [ "${drain}" -ge "${need}" ] \
-    || log "WARNING: RAILWAY_DEPLOYMENT_DRAINING_SECONDS is ${drain} (Railway's default is 0); set it to at least ${need} so a redeploy lets every component stop before SIGKILL"
+    || log "WARNING: RAILWAY_DEPLOYMENT_DRAINING_SECONDS is ${drain} (Railway's default is 0); ${need} is recommended so a redeploy lets every component stop before SIGKILL (a clean stop takes about 10 s, the worst case 5 x CP_SHUTDOWN_TIMEOUT)"
 }
 
 # ------------------------------------------------------------------------------
@@ -1595,10 +1611,10 @@ main() {
   trap shutdown EXIT
   trap 'MAINTENANCE_NOW=1' USR1
 
+  apply_railway_defaults
   prepare_state_dir
   check_capacity
   detect_memory_limit
-  apply_railway_defaults
   bootstrap_pki
 
   local external="${CP_EXTERNAL_URL}"
