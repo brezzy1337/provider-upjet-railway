@@ -11,6 +11,10 @@
 #
 # Build from the REPOSITORY ROOT:
 #   docker build -f cluster/images/control-plane/Dockerfile -t provider-upjet-railway-control-plane:dev .
+#
+# No BuildKit cache mounts and no VOLUME instruction: Railway's Dockerfile
+# validator rejects both. Why, and what it costs, is in
+# docs/architecture/control-plane-image.md.
 # ==============================================================================
 
 ARG GO_VERSION=1.26.7
@@ -58,12 +62,11 @@ ARG TARGETOS
 ARG TARGETARCH
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 WORKDIR /src
-# Warm the module cache on the manifests alone so source edits do not refetch.
+# Download modules from the manifests alone, so a source edit reuses that layer.
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN go mod download
 COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/provider ./cmd/provider
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/provider ./cmd/provider
 
 # ==============================================================================
 # Stage: crossplane-build -- Crossplane core from source
@@ -81,8 +84,7 @@ RUN apk add --no-cache git
 RUN git clone --quiet --depth 1 --branch "v${CROSSPLANE_VERSION}" \
       https://github.com/crossplane/crossplane.git /src
 WORKDIR /src
-RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/crossplane ./cmd/crossplane
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/crossplane ./cmd/crossplane
 RUN mkdir -p /out/crds /out/webhookconfigurations \
     && cp -r /src/cluster/crds/. /out/crds/ \
     && cp -r /src/cluster/webhookconfigurations/. /out/webhookconfigurations/
@@ -110,8 +112,7 @@ COPY hack/upstream/*.patch /patches/
 RUN git -c user.email=build@local -c user.name=build am /patches/*.patch \
     && git --no-pager log --oneline -1 \
     && test -f internal/provider/not_found.go   # fails loudly if the patch stopped applying
-RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -o "/out/${TERRAFORM_NATIVE_PROVIDER_BINARY}" .
 # Assert we shipped the patched build, not the v0.6.2 release: gqlparser is a
 # dependency only the patch introduces, and the module version is past the tag.
@@ -178,8 +179,6 @@ RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/cache ${CP_HOME}/tf ${CP_S
     && chmod +x /usr/local/bin/control-plane.sh \
     && chmod 700 ${CP_STATE_DIR} \
     && chown -R ${USER_ID}:${USER_ID} ${CP_HOME} /terraform
-
-VOLUME ${CP_STATE_DIR}
 
 # Deliberately no USER: control-plane.sh (Step -2) drops to CP_RUN_UID itself
 # after taking ownership of the volume.
