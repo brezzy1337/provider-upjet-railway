@@ -11,7 +11,8 @@ Phase 1 produced an image that boots a complete nodeless control plane. Its revi
 things that had to change before that image could be deployed to Railway (B1 to B5) and left one
 item of B3 open. Phase 2 was defined as fixing those, deploying, and passing the `Project` smoke test
 over the internet. This page covers the first part: every finding is fixed, merged and reviewed. The
-deploy itself has not happened yet and is the next step.
+deploy happened on 2026-11-25 and the smoke test passed; the [2026-11-25 report](../reports/2026-11-25.md)
+records it, including the two fixes the day needed (PRs #13 and #14).
 
 ## What Phase 2 delivered
 
@@ -111,11 +112,11 @@ were fixed before merging. The findings that changed the design rather than the 
 
 Nothing from the Phase 1 review blocks the deploy. In order:
 
-1. **The deploy itself**, by the runbook
-   [Deploy the control plane to Railway](../getting-started/deploy-to-railway.md). Done when the
-   `Project` smoke test passes over the internet. The first deploy should also exercise
-   `etcdutl snapshot restore` once and check the `GOMEMLIMIT` shares against observed usage under the
-   real limit.
+1. **The deploy itself.** Done 2026-11-25 by the runbook
+   [Deploy the control plane to Railway](../getting-started/deploy-to-railway.md); the `Project` smoke
+   test passed over the internet. `etcdutl snapshot restore` was exercised offline into a scratch
+   directory; a live restore with the service stopped has not been. The cgroup limit was read
+   (22888 MiB) and the shares applied; usage under it was not profiled beyond the idle figure.
 2. **The composition-function spike**, unchanged from Phase 1: a function as a supervised process
    with its endpoint written by hand. Every XRD depends on it.
 3. **The uid split** for the provider and terraform: per-component ownership of key files and the
