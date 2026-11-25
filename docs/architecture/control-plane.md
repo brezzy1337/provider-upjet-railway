@@ -171,7 +171,7 @@ API server, no token kubeconfig is written, and a token file left by an earlier 
 native harness keeps it on. When on, `CP_ADMIN_TOKEN` rotates it as described above.
 
 **The Railway token.** `RAILWAY_TOKEN` is read once before any component starts, right after the
-privilege drop: leading and trailing whitespace is dropped, anything else outside `[A-Za-z0-9-]`
+privilege drop: leading and trailing whitespace is dropped, anything else outside `[A-Za-z0-9._-]`
 (interior whitespace included) is refused with a fatal error that does not echo the value, and the
 variable is removed from the environment, so etcd, the API server, the controller manager,
 Crossplane, the provider and the terraform processes it forks never inherit it (B4). Refusal is
@@ -180,7 +180,9 @@ variable is fixed, the same trade as `CP_ENCRYPTION_KEY`. The `railway-creds` Se
 the value by a builtin `printf` piped into `kubectl create secret --from-file=credentials=/dev/stdin`
 and written with server-side apply, so the token is on no command line, in no file, and not
 duplicated into a last-applied-configuration annotation; the character check is what makes the
-hand-built JSON safe (the image has no `jq`). kubectl's diagnostics on a failed write are logged
+hand-built JSON safe (the image has no `jq`); the set is deliberately wider than any one token
+format, since Railway replaced its UUID tokens with longer ones containing underscores after its
+2026-10-21 incident, and the first deploy was refused on exactly that. kubectl's diagnostics on a failed write are logged
 with the token and its base64 form masked. A boot without a token warns and leaves any Secret from
 an earlier boot in place.
 

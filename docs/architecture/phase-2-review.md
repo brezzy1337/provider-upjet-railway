@@ -135,7 +135,7 @@ Nothing from the Phase 1 review blocks the deploy. In order:
 ```bash
 hack/native-cluster.sh build        # several minutes the first time
 export CP_ENCRYPTION_KEY="$(openssl rand -base64 32)"
-export RAILWAY_TOKEN=fake-token-for-test   # any [A-Za-z0-9-] value; reconciles just fail
+export RAILWAY_TOKEN=fake_token-for-test   # any [A-Za-z0-9._-] value; reconciles just fail
 hack/native-cluster.sh up           # foreground; Ctrl-C to stop
 hack/native-cluster.sh verify       # in another shell: 49 checks with the token
 hack/native-cluster.sh down

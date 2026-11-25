@@ -25,7 +25,8 @@
 # asserts that no component runs as uid 0.
 #
 # RAILWAY_TOKEN: pass it to `up` as the image would receive it; a fake value
-# (RAILWAY_TOKEN=fake-token-for-b4-test) exercises the handling, the provider
+# (RAILWAY_TOKEN=fake_token-for-b4-test, with the underscore of a post-2026-10 Railway
+# token) exercises the handling, the provider
 # just fails its reconciles. Pass the same value to `verify` to turn on the
 # checks that need it (Secret contents, no trace in ps or logs).
 #

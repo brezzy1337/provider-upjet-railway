@@ -16,6 +16,12 @@ Railway issues three kinds of token. Only two of them work here.
 Create one under Railway → Account Settings → Tokens, and pick the workspace when offered. Treat it
 like a cloud root credential: it can create and delete anything in that workspace.
 
+Tokens created before Railway's security incident of 2026-10-21 were all invalidated and stay so;
+create a new one. Tokens issued since are no longer UUIDs: they are longer and contain underscores.
+The control-plane image checks the value against `[A-Za-z0-9._-]` before it starts anything (see
+[Architecture](../architecture/control-plane.md#secrets-audit-and-credential-lifetimes)); a token
+outside that set stops the boot with a message that does not echo the value.
+
 ## Secret format
 
 The Secret's `credentials` key holds JSON with one field. `internal/clients/railway.go` unmarshals it
