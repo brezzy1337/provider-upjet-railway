@@ -16,6 +16,10 @@ Railway issues three kinds of token. Only two of them work here.
 Create one under Railway → Account Settings → Tokens, and pick the workspace when offered. Treat it
 like a cloud root credential: it can create and delete anything in that workspace.
 
+Tokens created before Railway's security incident of 2026-10-21 were all invalidated and stay so;
+create a new one. Do not assume a format: the token the control plane was first deployed with, on
+2026-11-25, was not a UUID but a longer value containing underscores.
+
 ## Secret format
 
 The Secret's `credentials` key holds JSON with one field. `internal/clients/railway.go` unmarshals it
@@ -78,6 +82,11 @@ Several configs with different tokens let one control plane manage several works
 ## Troubleshooting
 
 * `Not Authorized` on every resource: almost always a project token. Replace it with a workspace token.
+* `RAILWAY_TOKEN contains characters outside [A-Za-z0-9._-]` at boot of the control-plane image: the
+  image checks the character set, and nothing more, before it starts anything, and does not echo the
+  value (see [Architecture](../architecture/control-plane.md#secrets-audit-and-credential-lifetimes)).
+  Paste the token alone, no quotes or `Bearer` prefix; an earlier check written for UUID-shaped tokens
+  refused the post-incident format and was widened on 2026-11-25.
 * `cannot extract credentials` / `must contain a non-empty "token" key`: the Secret key is not named
   `credentials`, or the JSON is malformed. Check `kubectl get secret railway-creds -o jsonpath='{.data.credentials}' | base64 -d`.
 * Resources stuck with `Synced: False` and a Terraform "not found" error: that is the upstream bug,

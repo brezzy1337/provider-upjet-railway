@@ -1486,8 +1486,13 @@ start_crossplane() {
 #
 # B4: the token is taken out of the environment before any component starts
 # (take_railway_token, called from main()), so no component inherits it. Only
-# [A-Za-z0-9-] is accepted, which is what keeps the hand-built JSON below safe
-# (the image has no jq). Two copies remain and are accepted: the short-lived
+# [A-Za-z0-9._-] is accepted. Two separate reasons, kept apart on purpose:
+# the invariant is that the set never admits a quote, a backslash, whitespace
+# or a control character, which is what keeps the hand-built JSON below safe
+# (the image has no jq); the width within that invariant is a matter of what
+# Railway issues, and it is a character-set check, not a format check, so do
+# not narrow it to one token shape (docs/getting-started/authentication.md).
+# Two copies remain and are accepted: the short-lived
 # root-phase helpers (find, chown, su-exec) run before the drop with it, and
 # bash's unset cannot scrub this process's own exec-time environment block, so
 # /proc/<supervisor pid>/environ keeps it. Why that is acceptable, and the
@@ -1505,8 +1510,8 @@ take_railway_token() {
   _tok="${_tok#"${_tok%%[![:space:]]*}"}"
   _tok="${_tok%"${_tok##*[![:space:]]}"}"
   # The value itself is never logged, not even when it is refused.
-  [ -z "${_tok}" ] || [[ "${_tok}" =~ ^[A-Za-z0-9-]+$ ]] \
-    || fail "RAILWAY_TOKEN contains characters outside [A-Za-z0-9-]; expected a Railway workspace or account token"
+  [ -z "${_tok}" ] || [[ "${_tok}" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || fail "RAILWAY_TOKEN contains characters outside [A-Za-z0-9._-]; expected a Railway workspace or account token"
   printf -v "$1" '%s' "${_tok}"
 }
 
