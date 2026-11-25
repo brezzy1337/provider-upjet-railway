@@ -13,7 +13,7 @@ only secrets a person supplies are two, plus three ordinary settings.
 
 | Item | Value | Notes |
 |------|-------|-------|
-| Source | this repository, `main`, `RAILWAY_DOCKERFILE_PATH=cluster/images/control-plane/Dockerfile` | the build needs the repository root as its context, so the root directory stays `/` |
+| Source | this repository, `main`, `RAILWAY_DOCKERFILE_PATH=cluster/images/control-plane/Dockerfile` | the build needs the repository root as its context, so the root directory stays `/`; the Dockerfile is written for Railway's validator, see [The control-plane image on Railway's builder](../architecture/control-plane-image.md) |
 | Volume | mounted at `/var/lib/control-plane/state`; a few GB is plenty | the [state root](../architecture/control-plane.md#the-state-root); root-owned mounts are handled by the image; the etcd quota sizes itself to half the volume ([Capacity](../architecture/control-plane.md#capacity-etcd-quota-snapshots-and-memory)); snapshots live on the same volume and are not a backup |
 | TCP proxy | application port `6443`, created **before the first deploy** | the API server serves its own TLS; Railway assigns the public `domain:port` |
 | `RAILWAY_TOKEN` | a Railway workspace (team) or account token, **sealed** | see [Authentication](authentication.md); project tokens are rejected |

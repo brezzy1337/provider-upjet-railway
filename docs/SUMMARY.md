@@ -26,6 +26,7 @@
 ## Architecture
 
 * [Railway-hosted control plane](architecture/control-plane.md)
+* [The control-plane image on Railway's builder](architecture/control-plane-image.md)
 * [Phase 1 review](architecture/phase-1-review.md)
 * [Phase 2 review](architecture/phase-2-review.md)
 
