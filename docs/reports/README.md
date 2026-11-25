@@ -30,7 +30,7 @@ each phase review lists its reports.
 | Review | Covers | Reports |
 |--------|--------|---------|
 | [Phase 2 review](phase-2-review.md) | B1 to B5 and etcd client authentication (PRs #5 to #10), the first Railway deploy (PRs #13 to #15) | [2026-11-21](2026-11-21.md) (B1), [2026-11-22](2026-11-22.md), [2026-11-24](2026-11-24.md), [2026-11-25](2026-11-25.md) |
-| [Phase 1 review](phase-1-review.md) | the control-plane image proven natively (2026-08), merged 2026-11-21 (PR #3) | [2026-11-21](2026-11-21.md) | [1](phase-1-review.md), [2](phase-2-review.md) |
+| [Phase 1 review](phase-1-review.md) | the control-plane image proven natively (2026-08), merged 2026-11-21 (PR #3) | [2026-11-21](2026-11-21.md) |
 
 ## Reports
 
@@ -39,4 +39,4 @@ each phase review lists its reports.
 | [2026-11-25](2026-11-25.md) | [2](phase-2-review.md) | First deploy to Railway: the Phase 1 project reused, two deploy-day fixes (Dockerfile validator, token character set), the control plane up and the `Project` smoke test passed over the internet; Phase 2 done |
 | [2026-11-24](2026-11-24.md) | [2](phase-2-review.md) | Preparing the first Railway deploy: the supervisor configures its public endpoint from Railway's own variables; the deploy and template runbook |
 | [2026-11-22](2026-11-22.md) | [2](phase-2-review.md) | Phase 2 B2: start as root to own the volume, then drop privileges via `su-exec`; session 2: B3, secrets at rest, audit, 90-day exported credentials; session 3: B4, the Railway token out of every component's environment; session 4: B5, etcd quota, snapshots on the volume, GOMEMLIMIT per process; session 5: etcd client authentication, the last Phase 1 finding; session 6: the Phase 2 review page |
-| [2026-11-21](2026-11-21.md) | Toolchain restored, GitBook docs live, `/ship` pipeline in use, Phase 1 control plane merged and reviewed; session 2: Phase 2 B1, one persistent state root |
+| [2026-11-21](2026-11-21.md) | [1](phase-1-review.md), [2](phase-2-review.md) | Toolchain restored, GitBook docs live, `/ship` pipeline in use, Phase 1 control plane merged and reviewed; session 2: Phase 2 B1, one persistent state root |
