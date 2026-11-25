@@ -56,7 +56,8 @@ the volume, volume ownership, secrets encryption and audit, token handling, etcd
 Service from the image, one volume mounted at `CP_STATE_DIR` (etcd data, PKI and `VERSION` stamp;
 B1, done 2026-11-21 in PR #5; ownership of that volume handled by the image itself, B2, done
 2026-11-22 in PR #6; Secrets at rest, audit and credential lifetimes, B3, done 2026-11-22 in PR #7;
-the Railway token out of every component's environment, B4, done 2026-11-22 in PR #8; etcd quota,
+the Railway token out of every component's environment, B4, done 2026-11-22 in PR #8, its character
+set widened 2026-11-25 after the first deploy refused a post-incident token; etcd quota,
 snapshots and GOMEMLIMIT, B5, done 2026-11-22 in PR #9; etcd client authentication, the B3 leftover,
 done 2026-11-22 in PR #10), TCP proxy on 6443, env vars for the Railway token, `CP_ENCRYPTION_KEY`
 and API-server credential material. Nothing from the Phase 1 review blocks the first deploy any

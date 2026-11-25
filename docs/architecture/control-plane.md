@@ -181,8 +181,8 @@ the value by a builtin `printf` piped into `kubectl create secret --from-file=cr
 and written with server-side apply, so the token is on no command line, in no file, and not
 duplicated into a last-applied-configuration annotation; the character check is what makes the
 hand-built JSON safe (the image has no `jq`); the set is deliberately wider than any one token
-format, since Railway replaced its UUID tokens with longer ones containing underscores after its
-2026-10-21 incident, and the first deploy was refused on exactly that. kubectl's diagnostics on a failed write are logged
+format (see [Authentication](../getting-started/authentication.md)). kubectl's diagnostics on a
+failed write are logged
 with the token and its base64 form masked. A boot without a token warns and leaves any Secret from
 an earlier boot in place.
 

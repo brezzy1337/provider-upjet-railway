@@ -1486,10 +1486,13 @@ start_crossplane() {
 #
 # B4: the token is taken out of the environment before any component starts
 # (take_railway_token, called from main()), so no component inherits it. Only
-# [A-Za-z0-9._-] is accepted, which is what keeps the hand-built JSON below safe
-# (the image has no jq); it is a character-set check, not a format check, and
-# covers the UUID tokens Railway issued before 2026-10-21 and the longer tokens
-# with underscores it has issued since (the first deploy was refused on one). Two copies remain and are accepted: the short-lived
+# [A-Za-z0-9._-] is accepted. Two separate reasons, kept apart on purpose:
+# the invariant is that the set never admits a quote, a backslash, whitespace
+# or a control character, which is what keeps the hand-built JSON below safe
+# (the image has no jq); the width within that invariant is a matter of what
+# Railway issues, and it is a character-set check, not a format check, so do
+# not narrow it to one token shape (docs/getting-started/authentication.md).
+# Two copies remain and are accepted: the short-lived
 # root-phase helpers (find, chown, su-exec) run before the drop with it, and
 # bash's unset cannot scrub this process's own exec-time environment block, so
 # /proc/<supervisor pid>/environ keeps it. Why that is acceptable, and the
