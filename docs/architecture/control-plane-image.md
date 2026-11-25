@@ -5,13 +5,11 @@ page says what runs inside the image; this page is about getting it built, and i
 what Railway's builder accepts._
 
 The control plane ships as one container image built from
-`cluster/images/control-plane/Dockerfile` with the repository root as the build context. The
-Dockerfile is self-contained: it fetches pinned release binaries (etcd, kube-apiserver,
-kube-controller-manager, kubectl, Terraform), compiles this provider from the tree, Crossplane core
-from its tag and the patched Terraform provider from `hack/upstream/`, and assembles them on Alpine.
-Railway builds it straight from the uploaded tree or from the GitHub repository, with no `make`
-step and no registry in between; the same file builds locally with `docker build` from the repository
-root (see the comment at the top of the Dockerfile).
+`cluster/images/control-plane/Dockerfile` with the repository root as the build context; what the
+image contains and why it is self-contained is in [Architecture](control-plane.md). Railway builds it
+straight from the uploaded tree or from the GitHub repository, with no `make` step and no registry to
+configure; the same file builds locally with `docker build` from the repository root (see the
+comment at the top of the Dockerfile).
 
 ## What Railway's validator rejects
 
@@ -39,28 +37,33 @@ the build cache, which speeds up repeated local builds. Railway's
 with the service id written literally; variables are not allowed in the id. A Dockerfile that is
 meant to be deployed by anyone, through a template or a fork, cannot carry one deployer's service
 id, so the mounts were removed rather than given an id. The cost is that every Railway build
-downloads the Go modules again. The first full build, with nothing cached, took under three minutes
-from upload to pushed image, so the cost is small; Railway keeps its own layer cache between builds
-of the same service (the build log ends with `exporting cache to Amazon S3`).
+downloads the Go modules again; the first build, with nothing cached, was quick enough (table below)
+for that to be acceptable. Railway's builder exported a layer cache of its own at the end of the
+build (`exporting cache to Amazon S3`); whether a later build of the same service hits it has not
+been timed. Local `docker build` runs lose the mounts too.
 
 **No `VOLUME` instruction.** The Dockerfile declared `VOLUME` on the state root as documentation of
 where the persistent mount belongs. Railway rejects the instruction outright and mounts volumes
 from the service configuration instead. The line is gone; the state root, its guards and the
-required mount path are documented at `CP_STATE_DIR` in `control-plane.sh` and in
-[The state root](control-plane.md#the-state-root), and the supervisor refuses to boot when nothing is
-mounted there (`CP_REQUIRE_PERSISTENT=true` in the image).
+required mount path are in [The state root](control-plane.md#the-state-root), and the supervisor
+refuses to boot when nothing is mounted there.
 
-Neither change alters what the image does at runtime.
+Neither change alters what the image does on Railway. One local difference: a plain `docker run`
+without `-v` used to get an anonymous Docker volume at the state root and now gets the container
+layer, which the persistence guard rejects, so pass `-v` or set `CP_REQUIRE_PERSISTENT=false` for a
+throwaway run.
 
 ## What the first build showed
 
+One build, deployment `12255d3e` on 2026-11-25; the numbers are that build's and will drift.
+
 | Observation | Value |
 |-------------|-------|
-| Upload of the working tree (`railway up`) | 317 kB snapshot; `.gitignore` is honoured, so `.work/` stays home |
+| Upload of the working tree (`railway up`) | 317 kB snapshot, so `.gitignore` is honoured and `.work/` stays home |
 | Dockerfile path | from the `RAILWAY_DOCKERFILE_PATH` service variable, context at the repository root |
-| Build, upload to pushed image | 2 min 40 s with no cache (2026-11-25, `amd64`) |
-| Builder | BuildKit with Railway's layer cache on S3; `# syntax=docker/dockerfile:1` is accepted |
-| Image start | the container starts as root and the supervisor's ownership step runs first, as designed |
+| Upload to container start | 2 min 40 s with no cache, `linux/amd64`; the image push itself took 5 s |
+| Builder | BuildKit; `# syntax=docker/dockerfile:1` accepted; a layer cache exported to S3 at the end |
+| First supervisor log line | `started as root: taking ownership for 65532:65532, then dropping privileges`, as designed |
 
 A rebuild is also what a change to the service's volume configuration triggers: moving the volume's
 mount path redeployed the service from its stored code snapshot, not from a new upload, so the

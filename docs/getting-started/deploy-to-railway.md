@@ -1,9 +1,9 @@
 # Deploy the control plane to Railway
 
-_Last updated 2026-11-24, ahead of the first deploy. The steps below are what the image was built
-for; the CLI commands were checked against Railway's CLI reference on that date but have not been
-run, and anything marked **to confirm** is a Railway behaviour not yet observed. The page is updated
-as the first deploy teaches us otherwise._
+_Last updated 2026-11-25, during the first deploy. The steps below are what the image was built
+for; the CLI commands were checked against Railway's CLI reference on 2026-11-24, and anything
+marked **to confirm** is a Railway behaviour not yet observed. The page is updated as the first
+deploy teaches us otherwise._
 
 The control plane is one Railway service built from this repository's Dockerfile, with one volume
 and one TCP proxy. Everything the service needs to know about its network, Railway tells it; the
@@ -59,10 +59,10 @@ variable created by the CLI is not sealed until sealed in the dashboard. Keep a 
 password manager. Never paste `railway logs` or `railway variable list` output into a report.
 
 Deploy the working tree from a clean, committed checkout, so the deployed code is a known commit
-(the first build compiles Crossplane, the provider and the patched Terraform provider from source
-and takes several minutes; Railway's build time and builder memory limits are **to confirm**, and if
-they bite, the fallback is to build the image in CI, push it to GHCR and point the service at the
-image instead). Then watch the boot:
+(the build compiles Crossplane, the provider and the patched Terraform provider from source; the
+first one on Railway took under three minutes with no cache, see
+[The control-plane image on Railway's builder](../architecture/control-plane-image.md), which also
+records what Railway's Dockerfile validator rejects). Then watch the boot:
 
 ```bash
 git status --short            # must be empty

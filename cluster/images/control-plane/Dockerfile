@@ -12,11 +12,9 @@
 # Build from the REPOSITORY ROOT:
 #   docker build -f cluster/images/control-plane/Dockerfile -t provider-upjet-railway-control-plane:dev .
 #
-# Written for Railway's Dockerfile validator as well as Docker: no BuildKit
-# cache mounts (Railway requires an id of the form s/<service id>-<path>, which
-# would pin the file to one deployer's service and so cannot go in a template)
-# and no VOLUME instruction (rejected; the platform volume is declared on the
-# service instead). Observed on the first deploy, 2026-11-25.
+# No BuildKit cache mounts and no VOLUME instruction: Railway's Dockerfile
+# validator rejects both. Why, and what it costs, is in
+# docs/architecture/control-plane-image.md.
 # ==============================================================================
 
 ARG GO_VERSION=1.26.7
@@ -64,7 +62,7 @@ ARG TARGETOS
 ARG TARGETARCH
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 WORKDIR /src
-# Warm the module cache on the manifests alone so source edits do not refetch.
+# Download modules from the manifests alone, so a source edit reuses that layer.
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
