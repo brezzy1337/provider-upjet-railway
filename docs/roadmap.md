@@ -19,7 +19,7 @@ the control-plane service itself and the user application. See
 | Build and unit tests | Passed 2026-11-20 on Go 1.26.11: `go build`, `go test`, `golangci-lint` with 0 issues. The patched Terraform provider builds from `hack/upstream/` and its tests pass. |
 | Live verification | `Project` create → visible in Railway → delete → gone, via kind + Crossplane 2.2.1 + the provider out-of-cluster (2026-08-25, repeated through the native control plane 2026-08-26, and over the internet from the Railway-hosted control plane 2026-11-25). No other kind has been exercised live. |
 | Upstream dependency | Blocked on [PR #93](https://github.com/terraform-community-providers/terraform-provider-railway/pull/93) (open, no activity since 2026-08-25). Upstream shipped 0.6.3 on 2026-10-19 **without** the fix. We build from a patch; see [The not-found patch](upstream/not-found-patch.md). |
-| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5), B2 (PR #6), B3 (PR #7), B4 (PR #8), B5 (PR #9) and etcd client authentication (PR #10) done and reviewed in the [Phase 2 review](architecture/phase-2-review.md). **Deployed to Railway 2026-11-25** (project `do-k8-crossplane-control-plane`, service `control-plane`, sfo): boots in 16 s, reachable over the internet through the TCP proxy, `Project` smoke test passed; two deploy-day fixes, PR #13 (Dockerfile for Railway's validator) and PR #14 (token character set). Phase 2 done; see the [2026-11-25 report](reports/2026-11-25.md). |
+| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](reports/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5), B2 (PR #6), B3 (PR #7), B4 (PR #8), B5 (PR #9) and etcd client authentication (PR #10) done and reviewed in the [Phase 2 review](reports/phase-2-review.md). **Deployed to Railway 2026-11-25** (project `do-k8-crossplane-control-plane`, service `control-plane`, sfo): boots in 16 s, reachable over the internet through the TCP proxy, `Project` smoke test passed; two deploy-day fixes, PR #13 (Dockerfile for Railway's validator) and PR #14 (token character set). Phase 2 done; see the [2026-11-25 report](reports/2026-11-25.md). |
 | Package publishing | No xpkg or image has been pushed to a registry yet. CI workflows exist from the Upjet template but have not been exercised for a release. |
 
 ## Decisions
@@ -49,7 +49,7 @@ controllers only), Crossplane core and this provider as supervised processes. Pr
 17 checks at the time (16 before the namespaced-CRD count, 21 after B1 added state-root and
 identity checks), including restart on persisted etcd data; re-verified on `main` 2026-11-21.
 `hack/native-cluster.sh` is also the way to run the full stack in an environment without Docker,
-such as the current codespace. The [Phase 1 review](architecture/phase-1-review.md) records what
+such as the current codespace. The [Phase 1 review](reports/phase-1-review.md) records what
 was verified, what the review found, and what Phase 2 must fix before deploying (B1 to B5: PKI on
 the volume, volume ownership, secrets encryption and audit, token handling, etcd quota).
 
@@ -68,9 +68,11 @@ and since PR #12 the service configures its own endpoint from Railway's variable
 2026-11-25 and the `Project` smoke test passed over the internet**, which was the exit criterion; the
 day needed two fixes, the Dockerfile for Railway's validator (PR #13) and the B4 token character set
 for Railway's post-incident tokens (PR #14). Details in the [2026-11-25 report](reports/2026-11-25.md).
-Still open from this phase: publishing the deploy as a Railway template (in progress), connecting the
-service to the GitHub repository instead of uploading the tree, and revisiting Railway's
-Infrastructure as Code once its reference covers the TCP proxy and the Dockerfile path. Consider
+Still open from this phase: connecting the service to the GitHub repository instead of uploading
+the tree, and revisiting Railway's Infrastructure as Code once its reference covers the TCP proxy
+and the Dockerfile path. Publishing the deploy as a Railway template is **deferred until Phase 3 is
+built and tested** (decided 2026-11-25): a template named for Kubernetes clusters must deliver them,
+and the series will be one template per platform, the first being the Railway-provider-only plane. Consider
 provisioning the service with this provider once it exists. First spike of Phase 3: a composition
 function as a supervised process, since every XRD depends on it.
 
