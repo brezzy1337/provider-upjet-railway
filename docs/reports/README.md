@@ -29,7 +29,7 @@ each phase review lists its reports.
 
 | Review | Covers | Reports |
 |--------|--------|---------|
-| [Phase 2 review](phase-2-review.md) | B1 to B5 and etcd client authentication (PRs #5 to #10), the first Railway deploy (PRs #13 to #15) | [2026-11-21](2026-11-21.md) (B1), [2026-11-22](2026-11-22.md), [2026-11-24](2026-11-24.md), [2026-11-25](2026-11-25.md) |
+| [Phase 2 review](phase-2-review.md) | B1 to B5 and etcd client authentication (PRs #5 to #10); the deploy that closed the phase (PRs #13 to #15) is recorded in the 2026-11-25 report | [2026-11-21](2026-11-21.md) (B1), [2026-11-22](2026-11-22.md), [2026-11-24](2026-11-24.md), [2026-11-25](2026-11-25.md) |
 | [Phase 1 review](phase-1-review.md) | the control-plane image proven natively (2026-08), merged 2026-11-21 (PR #3) | [2026-11-21](2026-11-21.md) |
 
 ## Reports

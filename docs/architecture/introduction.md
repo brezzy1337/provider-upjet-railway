@@ -18,25 +18,25 @@ flowchart LR
     subgraph railway["Railway"]
         app["Your application<br/>(a Railway service)<br/>holds a kubeconfig"]
         subgraph cp["Control plane (one Railway service, one volume, one TCP proxy)"]
-            direction TB
             api["kube-apiserver + etcd"]
             xp["Crossplane core<br/>XRDs, Compositions"]
             prw["provider-upjet-railway"]
             pdo["provider-digitalocean<br/>(Phase 3)"]
-            pk8s["provider-kubernetes / helm<br/>(after Phase 3)"]
+            pk8s["provider-kubernetes / helm<br/>(Phase 3, after the cluster XRD)"]
             api --- xp
             xp --- prw
             xp --- pdo
             xp --- pk8s
         end
     end
+    rwapi["Railway GraphQL API"]
     subgraph do["DigitalOcean (Phase 3)"]
         doks["DOKS cluster"]
         hermes["Hermes agent<br/>Deployment, PVC, Service"]
         doks --- hermes
     end
     app -- "1. kubectl / client-go over the TCP proxy" --> api
-    prw -- "Railway GraphQL API" --> railway
+    prw -- "manages Railway objects" --> rwapi
     pdo -- "2. create cluster" --> doks
     pk8s -- "3. apply workload with the cluster's kubeconfig" --> hermes
     app -. "4. calls the agent on the cluster's ingress" .-> hermes
@@ -46,12 +46,13 @@ flowchart LR
    as a sealed variable, and speaks to the API server over HTTPS through the Railway TCP proxy. It
    uses `kubectl`, `client-go` or any Kubernetes client. Railway's own API plays no part in this
    step; Railway hosts both ends.
-2. **A `KubernetesCluster` claim** (Phase 3) names a provider, a region and a node size. Crossplane
-   matches it to a Composition, the Composition drives the DigitalOcean provider, and the new
-   cluster's kubeconfig comes back as a Crossplane connection Secret inside the control plane.
-3. **A `HermesAgent` claim** (after Phase 3) names that cluster. Its Composition uses
-   provider-kubernetes or provider-helm with the connection Secret to apply a Deployment, a
-   PersistentVolumeClaim and a Service inside the cluster. Nothing in this step goes through Railway.
+2. **A `KubernetesCluster` claim** (Phase 3, planned) names a provider, a region and a node size.
+   Crossplane matches it to a Composition, the Composition drives the DigitalOcean provider, and the
+   new cluster's kubeconfig comes back as a Crossplane connection Secret inside the control plane.
+3. **A `HermesAgent` claim** (Phase 3, after the cluster XRD, planned) names that cluster. Its
+   Composition uses provider-kubernetes or provider-helm with the connection Secret to apply a
+   Deployment, a PersistentVolumeClaim and a Service inside the cluster. Nothing in this step goes
+   through Railway.
 4. **The agent answers on the cluster's ingress**, and the application calls it there.
 
 The Railway provider closes the loop and manages the hosting: it can write the agent's endpoint as a
@@ -65,10 +66,10 @@ Railway resource under the same declarative control as the clusters.
 |------|---------------------|
 | Control plane on Railway, reachable from a Railway service | done ([2026-11-25 report](../reports/2026-11-25.md)) |
 | Manage Railway objects from `kubectl` | done; `Project` proven live, the other eight kinds generated the same way and unproven |
-| Composition function as a supervised process | the first spike after Phase 2; every Composition needs one |
+| Composition function as a supervised process | the first spike of Phase 3; every Composition needs one |
 | DigitalOcean provider as a supervised process | Phase 3 |
 | `KubernetesCluster` XRD and a DOKS Composition | Phase 3 |
-| `HermesAgent` XRD with provider-kubernetes or provider-helm | after the cluster XRD |
+| `HermesAgent` XRD with provider-kubernetes or provider-helm | Phase 3, after the cluster XRD |
 | Endpoint written back to the application as a Railway `Variable` | after that |
 
 Publishing the control plane as a Railway template waits until Phase 3 is built and tested, so that
