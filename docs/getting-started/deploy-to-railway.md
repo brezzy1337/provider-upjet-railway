@@ -2,7 +2,9 @@
 
 _Last updated 2026-11-25, after the first deploy. The deploy and the `Project` smoke test over the
 internet passed that day (the [2026-11-25 report](../reports/2026-11-25.md) has every number);
-what the page states about Railway's behaviour was observed on it unless marked **to confirm**._
+what the page states about Railway's behaviour was observed on it, read from the service's own
+configuration, or carries the date it was checked in Railway's documentation, unless marked
+**to confirm**._
 
 The control plane is one Railway service built from this repository's Dockerfile, with one volume
 and one TCP proxy. Everything the service needs to know about its network, Railway tells it; the
@@ -27,7 +29,8 @@ shorter than the shutdown, and if the service has no TCP proxy yet. No Railway h
 configured, deliberately: Railway's check is HTTP against the service port, and the API server's
 `/readyz` needs a client certificate (D6 of the Phase 1 review). One replica only: the plane has one
 etcd, and a volume pins a service to one instance (**to confirm**; the service ran with one replica
-throughout). The restart policy can stay at Railway's default (`ON_FAILURE`, 10 retries); the
+throughout). The restart policy can stay at Railway's default (`ON_FAILURE` with 10 retries, as the
+service's manifest showed); the
 supervisor exits when a component dies and relies on being restarted. A boot that fails its
 configuration checks therefore restarts about every two seconds until the retry cap, and the
 deployment's status stays `SUCCESS` the whole time, because that status means the container
@@ -155,8 +158,8 @@ with three differences:
 ${{secret(42, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/")}}${{secret(1, "AEIMQUYcgkosw048")}}=
 ```
 
-- `CP_MEMORY_LIMIT_BYTES` cannot be known by the template; it is a variable the deployer sets, or is
-  left unset at the cost of `GOMEMLIMIT`.
+- `CP_MEMORY_LIMIT_BYTES` is not needed: the cgroup supplies the limit (a deployer may still override
+  it).
 
 **To confirm** on the composer: that a template can carry the TCP proxy (if not, creating it is the
 deployer's one post-deploy step and the next boot picks it up), and that `RAILWAY_DOCKERFILE_PATH`

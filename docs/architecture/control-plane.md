@@ -287,7 +287,7 @@ the container's limit: kube-apiserver 35%, etcd 15%, the provider 15%, kube-cont
 Crossplane 10%, leaving 15% for bash and the page cache; `CP_GOMEMLIMIT_PCT_<NAME>` overrides one
 share, and the total must stay at or under 100. The limit comes from `CP_MEMORY_LIMIT_BYTES` or, when
 that is unset, from the cgroup (`memory.max`, then the v1 file), which works where the container
-sees its own cgroup; where it does not, the boot warns and sets nothing, and `CP_MEMORY_LIMIT_BYTES`
+sees its own cgroup (Railway exposes it, cgroup v2, seen on the first deploy); where it does not, the boot warns and sets nothing, and `CP_MEMORY_LIMIT_BYTES`
 is the supported override. `CP_GOMEMLIMIT_ENABLED=false` turns it off. Three limits to be plain
 about. GOMEMLIMIT is a GC hint, not a cap: a component whose live heap exceeds its share collects
 harder (the runtime caps that work at half its CPU) and can still grow, so real OOM protection is the
