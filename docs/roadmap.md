@@ -1,6 +1,6 @@
 # Roadmap and status
 
-_Last updated 2026-11-22._
+_Last updated 2026-11-25._
 
 ## End goal
 
@@ -17,9 +17,9 @@ the control-plane service itself and the user application. See
 |------|--------|
 | Code generation | Done. Nine resources generated from `terraform-community-providers/railway` 0.6.2 with Upjet v2.4.1 (pre-release build). `make generate` re-run 2026-11-20 reproduces the committed tree exactly. |
 | Build and unit tests | Passed 2026-11-20 on Go 1.26.11: `go build`, `go test`, `golangci-lint` with 0 issues. The patched Terraform provider builds from `hack/upstream/` and its tests pass. |
-| Live verification | `Project` create → visible in Railway → delete → gone, via kind + Crossplane 2.2.1 + the provider out-of-cluster (2026-08-25, repeated through the native control plane 2026-08-26). No other kind has been exercised live. |
+| Live verification | `Project` create → visible in Railway → delete → gone, via kind + Crossplane 2.2.1 + the provider out-of-cluster (2026-08-25, repeated through the native control plane 2026-08-26, and over the internet from the Railway-hosted control plane 2026-11-25). No other kind has been exercised live. |
 | Upstream dependency | Blocked on [PR #93](https://github.com/terraform-community-providers/terraform-provider-railway/pull/93) (open, no activity since 2026-08-25). Upstream shipped 0.6.3 on 2026-10-19 **without** the fix. We build from a patch; see [The not-found patch](upstream/not-found-patch.md). |
-| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5), B2 (PR #6), B3 (PR #7), B4 (PR #8), B5 (PR #9) and etcd client authentication (PR #10) done and reviewed in the [Phase 2 review](architecture/phase-2-review.md); the first deploy is next, see Phase 2 below. |
+| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](architecture/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5), B2 (PR #6), B3 (PR #7), B4 (PR #8), B5 (PR #9) and etcd client authentication (PR #10) done and reviewed in the [Phase 2 review](architecture/phase-2-review.md). **Deployed to Railway 2026-11-25** (project `do-k8-crossplane-control-plane`, service `control-plane`, sfo): boots in 16 s, reachable over the internet through the TCP proxy, `Project` smoke test passed; two deploy-day fixes, PR #13 (Dockerfile for Railway's validator) and PR #14 (token character set). Phase 2 done; see the [2026-11-25 report](reports/2026-11-25.md). |
 | Package publishing | No xpkg or image has been pushed to a registry yet. CI workflows exist from the Upjet template but have not been exercised for a release. |
 
 ## Decisions
@@ -30,8 +30,10 @@ the control-plane service itself and the user application. See
    needed to host the control plane (image, volume, TCP proxy, env vars). Revisit when a Railway
    service needs those fields or when upstream merges the not-found fix. Moving means rebasing
    `hack/upstream/0001-*.patch`, regenerating, and re-reviewing the `Service` schema.
-2. Railway plan and sizing for the control-plane service (2–4 GB RAM plus a volume) and which
-   workspace hosts it.
+2. **Railway plan and sizing.** Resolved by use (2026-11-25): the service runs in the user's Pro
+   workspace, project `do-k8-crossplane-control-plane` (created 2026-08-27 for Phase 1 and reused),
+   with the plan's 24 GB / 24 vCPU limit and a 50 GB volume; idle usage is about 0.9 GB. A smaller
+   explicit limit is a later tuning question.
 3. Registry for the xpkg and control-plane image (ghcr.io assumed).
 4. **Where the control plane lives.** Resolved 2026-11-21: in this repository
    (`cluster/images/control-plane/`), merged from the `phase-1/control-plane-image` branch. A
@@ -51,7 +53,7 @@ such as the current codespace. The [Phase 1 review](architecture/phase-1-review.
 was verified, what the review found, and what Phase 2 must fix before deploying (B1 to B5: PKI on
 the volume, volume ownership, secrets encryption and audit, token handling, etcd quota).
 
-### Phase 2: deploy to Railway. Next
+### Phase 2: deploy to Railway. Done
 
 Service from the image, one volume mounted at `CP_STATE_DIR` (etcd data, PKI and `VERSION` stamp;
 B1, done 2026-11-21 in PR #5; ownership of that volume handled by the image itself, B2, done
@@ -62,11 +64,15 @@ snapshots and GOMEMLIMIT, B5, done 2026-11-22 in PR #9; etcd client authenticati
 done 2026-11-22 in PR #10), TCP proxy on 6443, env vars for the Railway token, `CP_ENCRYPTION_KEY`
 and API-server credential material. Nothing from the Phase 1 review blocks the first deploy any
 more; the procedure is [Deploy the control plane to Railway](getting-started/deploy-to-railway.md),
-and since PR #12 the service configures its own endpoint from Railway's variables. First spike after
-it: a composition function as a supervised process, since every XRD depends on it. Done when the
-`Project` smoke test passes over the internet. Revisit Railway's Infrastructure as Code for the
-service definition once its reference covers the TCP proxy and the Dockerfile path.
-Consider provisioning the service with this provider once it exists.
+and since PR #12 the service configures its own endpoint from Railway's variables. **Deployed
+2026-11-25 and the `Project` smoke test passed over the internet**, which was the exit criterion; the
+day needed two fixes, the Dockerfile for Railway's validator (PR #13) and the B4 token character set
+for Railway's post-incident tokens (PR #14). Details in the [2026-11-25 report](reports/2026-11-25.md).
+Still open from this phase: publishing the deploy as a Railway template (in progress), connecting the
+service to the GitHub repository instead of uploading the tree, and revisiting Railway's
+Infrastructure as Code once its reference covers the TCP proxy and the Dockerfile path. Consider
+provisioning the service with this provider once it exists. First spike of Phase 3: a composition
+function as a supervised process, since every XRD depends on it.
 
 ### Phase 3: first cloud, DigitalOcean
 
