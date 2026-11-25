@@ -2,8 +2,9 @@
 
 _Last updated 2026-11-22. Covers PRs #5 to #10, merged to `main` between 2026-11-21 and 2026-11-22
 (`db2c0d3` through `00d5605`). The [Phase 1 review](phase-1-review.md) is the document this one
-answers; the mechanics it refers to live in [Architecture](control-plane.md); the per-session record,
-including every number below, is in the [development reports](../reports/README.md)._
+answers; the mechanics it refers to live in [Architecture](../architecture/control-plane.md); the per-session records,
+including every number below, are the reports of [2026-11-21](2026-11-21.md) (B1),
+[2026-11-22](2026-11-22.md), [2026-11-24](2026-11-24.md) and [2026-11-25](2026-11-25.md)._
 
 ## What Phase 2 set out to do
 
@@ -11,7 +12,7 @@ Phase 1 produced an image that boots a complete nodeless control plane. Its revi
 things that had to change before that image could be deployed to Railway (B1 to B5) and left one
 item of B3 open. Phase 2 was defined as fixing those, deploying, and passing the `Project` smoke test
 over the internet. This page covers the first part: every finding is fixed, merged and reviewed. The
-deploy happened on 2026-11-25 and the smoke test passed; the [2026-11-25 report](../reports/2026-11-25.md)
+deploy happened on 2026-11-25 and the smoke test passed; the [2026-11-25 report](2026-11-25.md)
 records it, including the two fixes the day needed (PRs #13 and #14).
 
 ## What Phase 2 delivered

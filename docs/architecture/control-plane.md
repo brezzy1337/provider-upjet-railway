@@ -18,7 +18,7 @@ is not needed for Phase 2 and was dropped on 2026-11-21 (see the [roadmap](../ro
 image is self-contained: it builds the provider from this tree, Crossplane core from its tag, and
 the patched Terraform provider from `hack/upstream/`, so `package/crds/`, the patch and
 `cluster/images/provider-upjet-railway/terraformrc.hcl` are inputs to the image build and should be
-treated as a contract. The [Phase 1 review](phase-1-review.md) records the verification results and
+treated as a contract. The [Phase 1 review](../reports/phase-1-review.md) records the verification results and
 the open findings.
 
 ## Design
@@ -76,8 +76,8 @@ Lessons that changed the design, in brief (the full list is in
 
 ## Phases
 
-See the [roadmap](../roadmap.md). Phase 1 is done ([Phase 1 review](phase-1-review.md)); Phase 2's
-hardening, every finding of that review, is done ([Phase 2 review](phase-2-review.md)) and the plane
+See the [roadmap](../roadmap.md). Phase 1 is done ([Phase 1 review](../reports/phase-1-review.md)); Phase 2's
+hardening, every finding of that review, is done ([Phase 2 review](../reports/phase-2-review.md)) and the plane
 has run on Railway since 2026-11-25 with the smoke test passed over the internet
 ([runbook](../getting-started/deploy-to-railway.md)); Phase 3 adds DigitalOcean, then EKS and GKE.
 
@@ -88,7 +88,7 @@ Everything that must survive a redeploy lives under one directory, `CP_STATE_DIR
 CA, service-account signing key, front-proxy CA, client certs and, when enabled, the bearer token) and
 `VERSION`.
 Keeping only etcd persistent, as Phase 1 did, meant every redeploy minted a new CA against old data
-and invalidated every kubeconfig ever issued (finding B1 of the [Phase 1 review](phase-1-review.md)).
+and invalidated every kubeconfig ever issued (finding B1 of the [Phase 1 review](../reports/phase-1-review.md)).
 
 Ownership first: Railway mounts volumes root-owned, so the image starts as root (no `USER`), and
 the supervisor's very first step takes ownership of the state root and the ephemeral directories for
@@ -223,7 +223,7 @@ identity for the provider in place of `system:masters`.
 
 **etcd quota.** `--quota-backend-bytes` is `CP_ETCD_QUOTA_BYTES`. The default, `auto`, is half the
 filesystem under the state root, at most 2 GiB (Phase 1 shipped etcd's 8 GiB maximum, larger than a
-small Railway volume; finding B5 of the [Phase 1 review](phase-1-review.md)); the other half is for
+small Railway volume; finding B5 of the [Phase 1 review](../reports/phase-1-review.md)); the other half is for
 the write-ahead log, a defrag copy and the snapshots. The quota is what makes etcd refuse writes,
 with a NOSPACE alarm, before the volume fills; a database that hits disk-full instead is how etcd
 gets corrupted. An explicit value must lie between 100 MiB and 8 GiB and fit the filesystem, or the

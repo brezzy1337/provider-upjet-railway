@@ -29,8 +29,9 @@ All kinds live in `railway.crossplane.io/v1alpha1` (cluster-scoped) and `railway
 ## Why it exists
 
 The provider is the first building block of a
-[Crossplane control plane hosted on Railway](architecture/control-plane.md) (and its
-[Phase 1 review](architecture/phase-1-review.md), [Phase 2 review](architecture/phase-2-review.md) and
+[Crossplane control plane hosted on Railway](architecture/control-plane.md) (start with the
+[Introduction](architecture/introduction.md); then its
+[Phase 1 review](reports/phase-1-review.md), [Phase 2 review](reports/phase-2-review.md) and
 [image build notes](architecture/control-plane-image.md)): a nodeless Kubernetes
 API server plus Crossplane running inside a single Railway service, provisioning Kubernetes clusters
 on DigitalOcean, AWS and GCP from cloud-agnostic claims. This provider lets that control plane manage
@@ -40,8 +41,10 @@ Railway itself, including, eventually, its own hosting.
 
 * [Authentication](getting-started/authentication.md): which Railway token works and how to wire it.
 * [Development](getting-started/development.md): toolchain, scripts and the generate loop.
+* [Architecture introduction](architecture/introduction.md): the flow from an application on Railway
+  to a workload on a provisioned cluster, what exists today, and how Upjet works.
 * [Deploy the control plane to Railway](getting-started/deploy-to-railway.md): the service, volume,
-  TCP proxy and two secrets; the smoke test; publishing it as a template.
+  TCP proxy and two secrets; the smoke test; publishing it as a template (deferred to Phase 3).
 * [Resources](resources/overview.md): every kind, its references and what has been tested live.
 * [Roadmap](roadmap.md): current status and the phased plan.
 * [Development reports](reports/README.md): dated records of what each working session shipped,

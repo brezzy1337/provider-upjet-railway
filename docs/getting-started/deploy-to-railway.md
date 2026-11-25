@@ -144,6 +144,12 @@ existing kubeconfig only needs its server URL updated.
 
 ## Publishing it as a template
 
+Deferred until Phase 3 is built and tested (decided 2026-11-25; the
+[Introduction](../architecture/introduction.md) says why). The mechanics below stay for that day.
+The Railway CLI can also do the dashboard's part: `railway templates create --project` clones a
+project into an unpublished draft, `railway templates publish` sets the category, description,
+overview and image.
+
 A Railway template is composed in the dashboard (Workspace settings, Templates, New Template, or
 "Generate Template from Project" on a working project) and has the same shape as the table above,
 with three differences:

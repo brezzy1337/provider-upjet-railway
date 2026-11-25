@@ -3,7 +3,7 @@
 > **Correction (2026-11-21):** the extraction to a separate control-plane repository described below
 > never happened. The Phase 1 code (`cluster/images/control-plane/`, `hack/native-cluster.sh`) is on
 > `main` of this repo (merged 2026-11-21 via PR #3), not "historical". Current status is in
-> `docs/roadmap.md` and the findings in `docs/architecture/phase-1-review.md`; the rest of this
+> `docs/roadmap.md` and the findings in `docs/reports/phase-1-review.md`; the rest of this
 > file is kept as the 2026-08 record.
 
 **Written:** 2026-08-25, for a fresh Claude Code session working in this repo
