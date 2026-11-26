@@ -1,6 +1,6 @@
 # Roadmap and status
 
-_Last updated 2026-11-25._
+_Last updated 2026-11-26._
 
 ## End goal
 
@@ -76,14 +76,46 @@ and the series will be one template per platform, the first being the Railway-pr
 provisioning the service with this provider once it exists. First spike of Phase 3: a composition
 function as a supervised process, since every XRD depends on it.
 
-### Phase 3: first cloud, DigitalOcean
+### Phase 3: first cloud and the workload catalogue. Next
 
-Add the DigitalOcean provider as another supervised process, write a `KubernetesCluster` XRD with a
-DOKS Composition, provision a real cluster, read its kubeconfig back as a connection secret. Then
-EKS and GKE as additional Composition variants using the family providers. Then a `HermesAgent` XRD
-that composes a Hermes instance onto a provisioned cluster via provider-kubernetes or provider-helm.
-Open problem: Compositions need a Function, which is a gRPC server that must serve a certificate
-signed by Crossplane's root CA.
+Decided 2026-11-26. In order:
+
+1. **Composition functions as supervised processes.** Every Composition needs one, and a function is
+   a gRPC server that must serve a certificate signed by Crossplane's root CA, in a plane with no
+   pods to run it in. The spike runs one function as a supervised process with its endpoint written
+   by hand and proves a Composition through it. Candidates: `function-go-templating` or
+   `function-kcl` for rendering and branching, `function-auto-ready` for readiness; keep the count
+   low, each is a process.
+2. **DigitalOcean.** The DigitalOcean provider as another supervised process, a `KubernetesCluster`
+   XRD with a DOKS Composition, a real cluster provisioned, its kubeconfig read back as a connection
+   Secret, and from that Secret a per-cluster `ProviderConfig` for provider-kubernetes and
+   provider-helm, which also join the plane as supervised processes. Check the DigitalOcean
+   provider's maintenance status first; it is a hand-written native provider, not an Upjet one.
+3. **The `Workload` XRD with presets.** One claim-able, namespaced kind instead of a `HermesAgent`
+   XRD: `spec.clusterRef` names the `KubernetesCluster`, `spec.preset` picks a Composition
+   (selected by label, or by a function branching on the field), and the schema enforces one block
+   per preset with CEL rules. Every preset renders to the same two kinds, provider-helm's `Release`
+   and provider-kubernetes's `Object`, so a new preset is a new Composition, not an API change.
+   - `hermes`, first: model-provider key, channel tokens, volume size, replicas; renders a
+     Deployment, a PersistentVolumeClaim at `/opt/data`, a Service on 8642 and an Ingress.
+   - `helm`, custom: chart repository, name, version, values; one `Release`.
+   - `manifests`, custom: a list of Kubernetes objects inline or by Git or OCI reference; one
+     `Object` per manifest.
+   - Guardrails for the custom presets from day one, since they apply arbitrary manifests with the
+     target cluster's admin credentials: the namespace is written by the Composition, not taken from
+     the manifest; a CEL deny list (no `hostPath`, no privileged containers, no cluster-scoped kinds
+     without an explicit flag); a reduced-RBAC kubeconfig per workload when tenants differ from the
+     operator.
+   - Optional later: a thin `HermesAgent` XRD that composes a `Workload` with `preset: hermes`, so
+     both front doors exist on one implementation.
+4. **The endpoint written back** to the application's Railway service as a `Variable` through this
+   provider, closing the loop described in the [Introduction](architecture/introduction.md).
+5. **EKS and GKE** as additional `KubernetesCluster` Composition variants using the Upjet family
+   providers, once DigitalOcean works end to end.
+
+Done when a `Workload` with `preset: hermes` on a provisioned DOKS cluster answers on the cluster's
+ingress, and a `helm` or `manifests` workload lands beside it. The per-platform Railway templates
+follow this phase (see Phase 2).
 
 ## Provider backlog
 

@@ -34,6 +34,7 @@
 * [Development reports](reports/README.md)
   * [Phase 2 review](reports/phase-2-review.md)
   * [Phase 1 review](reports/phase-1-review.md)
+  * [2026-11-26](reports/2026-11-26.md)
   * [2026-11-25](reports/2026-11-25.md)
   * [2026-11-24](reports/2026-11-24.md)
   * [2026-11-22](reports/2026-11-22.md)

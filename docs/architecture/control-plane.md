@@ -7,8 +7,9 @@ new cluster's kubeconfig comes back as a Crossplane connection secret. The workl
 exist for are [Hermes](https://hermes-agent.nousresearch.com) AI agent instances (one long-running
 gateway process per agent, persistent volume, a model-provider key and channel tokens as Secrets,
 expected to need roughly 4 GB and 2 CPUs each per the Hermes Docker guidance), reached from the user's Railway-hosted application. A later
-`HermesAgent` XRD will compose them onto a provisioned cluster through provider-kubernetes or
-provider-helm; it depends on the same composition-function work as the cluster XRD.
+`Workload` XRD, with a `hermes` preset first and custom chart and manifest presets beside it, will
+compose them onto a provisioned cluster through provider-kubernetes or provider-helm; it depends on
+the same composition-function work as the cluster XRD (see the [roadmap](../roadmap.md), Phase 3).
 
 The control plane lives in this repository, under `cluster/images/control-plane/` (Dockerfile,
 Makefile, the `control-plane.sh` supervisor) with `hack/native-cluster.sh` as its Docker-less test
