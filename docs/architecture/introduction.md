@@ -74,6 +74,7 @@ Railway resource under the same declarative control as the clusters.
 | `KubernetesCluster` XRD and a DOKS Composition | Phase 3 |
 | `Workload` XRD with presets (`hermes` first, `helm` and `manifests` as the custom escape hatch) over provider-kubernetes and provider-helm | Phase 3, after the cluster XRD |
 | Endpoint written back to the application as a Railway `Variable` | after that |
+| EKS and GKE as further `KubernetesCluster` variants | Phase 4 |
 
 Publishing the control plane as a Railway template waits until Phase 3 is built and tested, so that
 a deployer gets what the template's name says.
