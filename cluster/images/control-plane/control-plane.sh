@@ -10,10 +10,10 @@
 #   3. kube-controller-manager (optional; garbage collector + namespace only)
 #   4. CRDs                    (Crossplane core via `crossplane core init`,
 #                               plus this provider's package/crds)
-#   5. composition functions   (one process per CP_FUNCTIONS entry on loopback,
+#   5. crossplane core start   (out-of-cluster, package manager set to External)
+#   6. composition functions   (one process per CP_FUNCTIONS entry on loopback,
 #                               mTLS from Crossplane's root CA, then a paused
 #                               Function + FunctionRevision pointing at it)
-#   6. crossplane core start   (out-of-cluster, package manager set to External)
 #   7. provider-upjet-railway  (out-of-cluster, patched Terraform mirror)
 #
 # There is no kubelet and no scheduler: nothing in this control plane runs Pods.
@@ -136,7 +136,7 @@ CP_PROVIDER_METRICS_PORT="${CP_PROVIDER_METRICS_PORT:-8090}"
 CP_PROVIDER_ARGS="${CP_PROVIDER_ARGS:-}"
 
 # Composition functions, space separated: each is a binary of that name under
-# CP_BIN_DIR, started as its own supervised process (step 5) and registered as
+# CP_BIN_DIR, started as its own supervised process (step 6) and registered as
 # Function/<name> with FunctionRevision/<name>-local, so a Composition's
 # pipeline refers to it by this name (functionRef.name). The package manager
 # cannot run functions here (no Pods), hence processes, like the provider.
@@ -1466,7 +1466,7 @@ apply_crds() {
 }
 
 # ------------------------------------------------------------------------------
-# Step 5: composition functions
+# Step 6: composition functions
 #
 # Crossplane core dials each function with the mTLS client identity `core
 # init` wrote to Secret crossplane-tls-client, verifying the function's serving
@@ -1487,6 +1487,17 @@ apply_crds() {
 # "true" so the package manager's reconcilers never try to pull the image
 # behind the placeholder spec.package/spec.image and never recompute the status
 # we set; paused, they only add a ReconcilePaused condition.
+#
+# Order: AFTER crossplane core start, deliberately. function-sdk-go (v0.7.1)
+# starts a Prometheus metrics server on ":8080", all interfaces, with no flag
+# or variable to move or disable it, and ignores the bind error. Crossplane
+# core's own metrics port is 8080 by default, and Crossplane refuses to start
+# when it is taken (seen on the first Railway deploy of this step: "listen tcp
+# :8080: bind: address already in use", a crash loop). Starting Crossplane
+# first makes it the owner of 8080 and turns every function's metrics server
+# into a silent no-op; a dial Crossplane attempts before a function is up is
+# an ordinary reconcile error it retries. The functions therefore listen on
+# loopback only, which the harness asserts.
 # ------------------------------------------------------------------------------
 # unpack_tls_secret SECRET DIR [KEY...]: write the named keys of a TLS Secret
 # in the Crossplane namespace to DIR, mode 0600 (default keys: tls.crt tls.key
@@ -1511,8 +1522,8 @@ unpack_tls_secret() {
 }
 
 # The client identity Crossplane presents to functions, unpacked to
-# CP_RUN_DIR/tls/client. Needed by the functions' readiness probe (step 5)
-# before `crossplane core start` loads it (step 6); idempotent.
+# CP_RUN_DIR/tls/client. Loaded by `crossplane core start` (step 5) and used
+# again by the functions' readiness probe (step 6); idempotent.
 unpack_crossplane_client_tls() {
   wait_ready "crossplane TLS client secret" 60 \
     kc -n "${CP_CROSSPLANE_NAMESPACE}" get secret crossplane-tls-client
@@ -1616,7 +1627,7 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Step 6: crossplane core
+# Step 5: crossplane core
 #
 # `crossplane core start` unconditionally loads an mTLS client certificate --
 # it is the identity it presents to composition Functions over gRPC -- and
@@ -1847,11 +1858,13 @@ main() {
   start_apiserver
   start_controller_manager
   apply_crds
-  # Functions before Crossplane core, so the endpoints are up and registered
-  # before the function runner first dials them.
+  start_crossplane
+  # Functions after Crossplane core: see the step 6 comment (Crossplane must
+  # own port 8080 before the functions' SDK tries to squat it). The reverse
+  # shutdown order then stops the functions before Crossplane, which only
+  # costs Crossplane a few failed dials while it is itself being stopped.
   start_functions
   register_functions
-  start_crossplane
   write_railway_credentials "${railway_token}"
   start_provider
 
