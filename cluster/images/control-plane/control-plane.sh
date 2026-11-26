@@ -145,19 +145,41 @@ CP_PROVIDER_ARGS="${CP_PROVIDER_ARGS:-}"
 # none). A name is a DNS label: it becomes an object name and the certificate CN.
 CP_FUNCTIONS="${CP_FUNCTIONS-function-go-templating function-auto-ready}"
 # The first listed function listens on 127.0.0.1:CP_FUNCTION_PORT_BASE, the
-# next on the port after, in list order. Loopback only: the caller is
-# Crossplane core in this same container.
+# next on the port after, in list order (function_port, step 6). Loopback
+# only: the caller is Crossplane core in this same container.
 CP_FUNCTION_PORT_BASE="${CP_FUNCTION_PORT_BASE:-9450}"
 read -ra FUNCTION_NAMES <<< "${CP_FUNCTIONS}"
 for _f in ${FUNCTION_NAMES[@]+"${FUNCTION_NAMES[@]}"}; do
   [[ "${_f}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { printf '%s [control-plane] FATAL: CP_FUNCTIONS entry "%s" is not a DNS label (lower-case letters, digits and dashes)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${_f}" >&2; exit 1; }
+  # The name is also the log file, the supervised-process name and the
+  # GOMEMLIMIT component; it must not be one of the five core processes.
+  case "${_f}" in etcd|kube-apiserver|kube-controller-manager|crossplane|provider-upjet-railway)
+    printf '%s [control-plane] FATAL: CP_FUNCTIONS entry "%s" is the name of a core component; rename the function binary\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${_f}" >&2; exit 1 ;;
+  esac
 done
 unset _f
+# Ports are positional, so a duplicate name would be two processes under one
+# Function object; the second registration would silently win.
+_dup="$(printf '%s\n' ${FUNCTION_NAMES[@]+"${FUNCTION_NAMES[@]}"} | sort | uniq -d | head -1 || true)"
+[ -z "${_dup}" ] || { printf '%s [control-plane] FATAL: CP_FUNCTIONS lists "%s" more than once (got "%s")\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${_dup}" "${CP_FUNCTIONS}" >&2; exit 1; }
+unset _dup
 [[ "${CP_FUNCTION_PORT_BASE}" =~ ^[1-9][0-9]*$ ]] && [ "${CP_FUNCTION_PORT_BASE}" -ge 1024 ] \
   && [ $(( CP_FUNCTION_PORT_BASE + ${#FUNCTION_NAMES[@]} )) -le 65536 ] \
   || { printf '%s [control-plane] FATAL: CP_FUNCTION_PORT_BASE must be a port from 1024 with room for %s function(s) below 65536 (got "%s")\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${#FUNCTION_NAMES[@]}" "${CP_FUNCTION_PORT_BASE}" >&2; exit 1; }
-# function_port INDEX -> the port of the INDEX-th (0-based) function in CP_FUNCTIONS.
-function_port() { printf '%s' $(( CP_FUNCTION_PORT_BASE + $1 )); }
+# The function range must not include a port the plane itself listens on: a
+# function that lost the race for, say, 8080 would die before readiness and
+# fail the boot with a less direct message. Every CP_*_PORT above is defined
+# by this point, which is why this block sits below them.
+if [ "${#FUNCTION_NAMES[@]}" -gt 0 ]; then
+  _lo="${CP_FUNCTION_PORT_BASE}"; _hi=$(( CP_FUNCTION_PORT_BASE + ${#FUNCTION_NAMES[@]} - 1 ))
+  for _v in CP_APISERVER_PORT CP_ETCD_CLIENT_PORT CP_ETCD_PEER_PORT CP_KCM_PORT CP_CROSSPLANE_METRICS_PORT CP_CROSSPLANE_HEALTH_PORT CP_CROSSPLANE_WEBHOOK_PORT CP_PROVIDER_METRICS_PORT; do
+    [[ "${!_v}" =~ ^[0-9]+$ ]] || continue   # a non-numeric port fails where it is used
+    if [ "${!_v}" -ge "${_lo}" ] && [ "${!_v}" -le "${_hi}" ]; then
+      printf '%s [control-plane] FATAL: the function port range 127.0.0.1:%s-%s (CP_FUNCTION_PORT_BASE=%s, one port per CP_FUNCTIONS entry) overlaps %s=%s; move CP_FUNCTION_PORT_BASE\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${_lo}" "${_hi}" "${CP_FUNCTION_PORT_BASE}" "${_v}" "${!_v}" >&2; exit 1
+    fi
+  done
+  unset _lo _hi _v
+fi
 
 # CRD source directories, colon separated. The image ships both; the native
 # proof points these at a checkout.
@@ -878,23 +900,30 @@ check_capacity() {
 
 # Share of the container memory limit each component gets as GOMEMLIMIT, in
 # percent: 85 for the five core processes plus 3 per composition function (91
-# with the default two), the rest for bash, the page cache and the terraform
-# processes (which inherit the provider's value). A function renders templates
-# for one request at a time and idles at a few tens of MiB, hence the small
-# share. GOMEMLIMIT is a soft limit: it makes a Go runtime collect harder as it
-# approaches, not die. Prints the variable name and returns 1 on a malformed
+# with the default two; five functions reach exactly 100 and a sixth fails the
+# total check in detect_memory_limit), the rest for bash, the page cache and
+# the terraform processes (which inherit the provider's value). A function
+# renders templates for one request at a time and idles at about 30 MiB RSS,
+# hence the small share. Membership in CP_FUNCTIONS, not a name prefix,
+# decides what a function is: a function called anything gets its 3%. GOMEMLIMIT
+# is a soft limit: it makes a Go runtime collect harder as it approaches, not
+# die. Prints the variable name and returns 1 on a malformed
 # CP_GOMEMLIMIT_PCT_<NAME> override.
 GOMEMLIMIT_COMPONENTS="kube-apiserver etcd provider-upjet-railway kube-controller-manager crossplane${FUNCTION_NAMES[*]+ ${FUNCTION_NAMES[*]}}"
+GOMEMLIMIT_FUNCTION_MIN_BYTES=67108864   # 64 MiB: below it a function's GC never rests
 gomemlimit_share() {
-  local pct var ov
+  local pct var ov f
   case "$1" in
     kube-apiserver)          pct=35 ;;
     etcd)                    pct=15 ;;
     provider-upjet-railway)  pct=15 ;;
     kube-controller-manager) pct=10 ;;
     crossplane)              pct=10 ;;
-    function-*)              pct=3 ;;
-    *)                       pct=0 ;;
+    *)
+      pct=0
+      for f in ${FUNCTION_NAMES[@]+"${FUNCTION_NAMES[@]}"}; do
+        [ "${f}" != "$1" ] || pct=3
+      done ;;
   esac
   var="CP_GOMEMLIMIT_PCT_$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
   ov="${!var:-}"
@@ -912,7 +941,9 @@ detect_memory_limit() {
     share="$(gomemlimit_share "${n}")" || fail "${share} must be a percentage (0-100)"
     sum=$(( sum + share )); shares="${shares}${shares:+, }${n} ${share}%"
   done
-  [ "${sum}" -le 100 ] || fail "GOMEMLIMIT shares add up to ${sum}% (${shares}); keep the total at or under 100"
+  # Over 100 the shares promise more than the container has; at the default 3%
+  # each, the sixth function is where that happens.
+  [ "${sum}" -le 100 ] || fail "GOMEMLIMIT shares add up to ${sum}% (${shares}); keep the total at or under 100 (fewer functions in CP_FUNCTIONS, or lower CP_GOMEMLIMIT_PCT_<NAME> overrides)"
   if [ -n "${v}" ]; then
     [[ "${v}" =~ ^[0-9]+$ ]] || fail "CP_MEMORY_LIMIT_BYTES must be an integer number of bytes, got '${v}'"
   else
@@ -932,6 +963,17 @@ detect_memory_limit() {
   else
     [ "${v}" -ge 1073741824 ] \
       || log "WARNING: memory limit is $(mib "${v}") MiB; the control plane was not tested under 1 GiB"
+    # A function idles at about 30 MiB RSS; a GOMEMLIMIT under 64 MiB leaves
+    # the GC running continuously against it. Warn rather than fail: the
+    # function still works, only slower, and the fix is a bigger container.
+    local fn fshare fbytes
+    for fn in ${FUNCTION_NAMES[@]+"${FUNCTION_NAMES[@]}"}; do
+      fshare="$(gomemlimit_share "${fn}")"
+      [ "${fshare}" -gt 0 ] || continue   # 0 means no GOMEMLIMIT for it
+      fbytes=$(( v * fshare / 100 ))
+      [ "${fbytes}" -ge "${GOMEMLIMIT_FUNCTION_MIN_BYTES}" ] \
+        || log "WARNING: GOMEMLIMIT for ${fn} would be $(mib "${fbytes}") MiB (${fshare}% of $(mib "${v}") MiB), under the $(mib "${GOMEMLIMIT_FUNCTION_MIN_BYTES}") MiB a function needs to idle (about 30 MiB RSS) without collecting continuously; give the container more memory or raise CP_GOMEMLIMIT_PCT_$(printf '%s' "${fn}" | tr 'a-z-' 'A-Z_')"
+    done
     log "memory limit $(mib "${v}") MiB (${src}); GOMEMLIMIT shares: ${shares}"
   fi
 }
@@ -1466,38 +1508,11 @@ apply_crds() {
 }
 
 # ------------------------------------------------------------------------------
-# Step 6: composition functions
+# TLS material shared by steps 5 and 6
 #
-# Crossplane core dials each function with the mTLS client identity `core
-# init` wrote to Secret crossplane-tls-client, verifying the function's serving
-# certificate against the root CA in Secret crossplane-root-ca with ordinary
-# hostname verification. So each function gets, every boot, a serving
-# certificate signed by that root CA with an IP SAN for 127.0.0.1, plus a copy
-# of the root CA certificate as the ca.crt it verifies Crossplane's client
-# certificate against. All of it lives under the ephemeral run dir: the root CA
-# key is Crossplane's, and it is only borrowed for the length of a boot.
-#
-# Which process answers for a function is decided by the FunctionRevision:
-# Crossplane's function runner lists FunctionRevisions labelled
-# pkg.crossplane.io/package=<name> with spec.desiredState Active and dials
-# status.endpoint, and a Composition pipeline is only valid when every such
-# revision reports the "composition" capability. Under the External package
-# runtime nothing sets either field (only the Deployment runtime does), so
-# register_functions writes them. Both objects carry crossplane.io/paused:
-# "true" so the package manager's reconcilers never try to pull the image
-# behind the placeholder spec.package/spec.image and never recompute the status
-# we set; paused, they only add a ReconcilePaused condition.
-#
-# Order: AFTER crossplane core start, deliberately. function-sdk-go (v0.7.1)
-# starts a Prometheus metrics server on ":8080", all interfaces, with no flag
-# or variable to move or disable it, and ignores the bind error. Crossplane
-# core's own metrics port is 8080 by default, and Crossplane refuses to start
-# when it is taken (seen on the first Railway deploy of this step: "listen tcp
-# :8080: bind: address already in use", a crash loop). Starting Crossplane
-# first makes it the owner of 8080 and turns every function's metrics server
-# into a silent no-op; a dial Crossplane attempts before a function is up is
-# an ordinary reconcile error it retries. The functions therefore listen on
-# loopback only, which the harness asserts.
+# `core init` leaves Crossplane's mTLS identities in Secrets; out of cluster
+# there is no projected volume, so both Crossplane core (step 5) and the
+# functions' readiness probe (step 6) read them from the ephemeral run dir.
 # ------------------------------------------------------------------------------
 # unpack_tls_secret SECRET DIR [KEY...]: write the named keys of a TLS Secret
 # in the Crossplane namespace to DIR, mode 0600 (default keys: tls.crt tls.key
@@ -1529,6 +1544,100 @@ unpack_crossplane_client_tls() {
     kc -n "${CP_CROSSPLANE_NAMESPACE}" get secret crossplane-tls-client
   unpack_tls_secret crossplane-tls-client "${CP_RUN_DIR}/tls/client"
 }
+
+# ------------------------------------------------------------------------------
+# Step 5: crossplane core
+#
+# `crossplane core start` unconditionally loads an mTLS client certificate --
+# it is the identity it presents to composition Functions over gRPC -- and
+# fails to start if the files are missing. `core init` puts them in a Secret;
+# out of cluster there is no projected volume, so unpack the Secret to disk.
+#
+# --package-runtime=External stops the package manager from ever creating a
+# Deployment for a Provider or Function package: nothing could schedule it.
+# ------------------------------------------------------------------------------
+start_crossplane() {
+  unpack_crossplane_client_tls
+
+  local args=(
+    core start
+    --namespace "${CP_CROSSPLANE_NAMESPACE}"
+    --tls-client-certs-dir "${CP_RUN_DIR}/tls/client"
+    --package-runtime External
+    --leader-election=false
+    --metrics-port "${CP_CROSSPLANE_METRICS_PORT}"
+    --health-probe-port "${CP_CROSSPLANE_HEALTH_PORT}"
+  )
+  if [ "${CP_ENABLE_WEBHOOKS}" = "true" ]; then
+    unpack_tls_secret crossplane-tls-server "${CP_RUN_DIR}/tls/server"
+    args+=(
+      --webhook-enabled=true
+      --tls-server-certs-dir "${CP_RUN_DIR}/tls/server"
+      --webhook-port "${CP_CROSSPLANE_WEBHOOK_PORT}"
+    )
+  else
+    args+=(--webhook-enabled=false)
+  fi
+
+  start_bg crossplane env \
+    KUBECONFIG="${KUBECONFIG_INTERNAL}" \
+    POD_NAMESPACE="${CP_CROSSPLANE_NAMESPACE}" \
+    XPKG_CACHE_DIR="${CP_HOME}/cache/xpkg" \
+    XFN_CACHE_DIR="${CP_HOME}/cache/xfn" \
+    "${CP_BIN_DIR}/crossplane" "${args[@]}"
+
+  wait_ready "crossplane core /readyz" "${CP_READY_TIMEOUT}" \
+    curl -fsS "http://127.0.0.1:${CP_CROSSPLANE_HEALTH_PORT}/readyz"
+}
+
+# ------------------------------------------------------------------------------
+# Step 6: composition functions
+#
+# Crossplane core dials each function with the mTLS client identity `core
+# init` wrote to Secret crossplane-tls-client, verifying the function's serving
+# certificate against the root CA in Secret crossplane-root-ca with ordinary
+# hostname verification. So each function gets, every boot, a serving
+# certificate signed by that root CA with an IP SAN for 127.0.0.1, plus a copy
+# of the root CA certificate as the ca.crt it verifies Crossplane's client
+# certificate against. All of it lives under the ephemeral run dir: the root CA
+# key is Crossplane's, and it is only borrowed for the length of the signing;
+# start_functions removes it from disk once the last certificate is signed.
+#
+# Which process answers for a function is decided by the FunctionRevision:
+# Crossplane's function runner lists FunctionRevisions labelled
+# pkg.crossplane.io/package=<name> with spec.desiredState Active and dials
+# status.endpoint, and a Composition pipeline is only valid when every such
+# revision reports the "composition" capability. Under the External package
+# runtime nothing sets either field (only the Deployment runtime does), so
+# register_functions writes them. Both objects carry crossplane.io/paused:
+# "true" so the package manager's reconcilers never try to pull the image
+# behind the placeholder spec.package/spec.image and never recompute the status
+# we set; paused, they only add a ReconcilePaused condition. Both also carry
+# the label below, which is how register_functions tells its own objects from
+# anyone else's when it removes stale registrations.
+#
+# Order: AFTER crossplane core start, deliberately. function-sdk-go (v0.7.1)
+# starts a Prometheus metrics server on ":8080", all interfaces, with no flag
+# or variable to move or disable it, and ignores the bind error. Crossplane
+# core's own metrics port is 8080 by default, and Crossplane refuses to start
+# when it is taken (seen on the first Railway deploy of this step: "listen tcp
+# :8080: bind: address already in use", a crash loop). Starting Crossplane
+# first makes it the owner of 8080 and turns every function's metrics server
+# into a silent no-op; a dial Crossplane attempts before a function is up is
+# an ordinary reconcile error it retries. The functions therefore listen on
+# loopback only, which the harness asserts. An SDK that made the metrics bind
+# fatal would stop the function before readiness, which the wait_ready gate
+# catches, so a function bump that changes this fails the boot rather than
+# passing silently.
+# ------------------------------------------------------------------------------
+# The label on every Function and FunctionRevision this supervisor writes.
+SUPERVISOR_LABEL_KEY="app.kubernetes.io/managed-by"
+SUPERVISOR_LABEL_VALUE="control-plane-supervisor"
+
+# function_port INDEX -> the port of the INDEX-th (0-based) function in
+# CP_FUNCTIONS: CP_FUNCTION_PORT_BASE + INDEX (validated in the configuration
+# block, which needs only the base and the count).
+function_port() { printf '%s' $(( CP_FUNCTION_PORT_BASE + $1 )); }
 
 # function_tls_ok PORT: the readiness predicate for one function, an mTLS
 # handshake made the way Crossplane makes it: its client certificate, the
@@ -1580,12 +1689,28 @@ start_functions() {
       --tls-certs-dir "${dir}"
     wait_ready "${name} mTLS on 127.0.0.1:${port}" "${CP_READY_TIMEOUT}" function_tls_ok "${port}"
   done
+
+  # The root CA key is Crossplane's, borrowed only to sign the certificates
+  # above, and every process in this container runs as one uid, so a copy left
+  # on disk is readable by all of them for the container's life. Remove it (and
+  # the serial file openssl keeps beside it) now that the last certificate is
+  # signed. tls.crt stays: function_tls_ok and the per-function ca.crt copies
+  # need it. start_functions runs once per boot (main), so nothing signs again
+  # until the next boot unpacks the Secret afresh.
+  rm -f "${CP_RUN_DIR}/tls/root-ca/tls.key" "${CP_RUN_DIR}/tls/root-ca/tls.srl"
+  [ ! -e "${CP_RUN_DIR}/tls/root-ca/tls.key" ] || fail "could not remove the borrowed root CA key ${CP_RUN_DIR}/tls/root-ca/tls.key"
+  log "root CA key removed from ${CP_RUN_DIR}/tls/root-ca after signing ${#FUNCTION_NAMES[@]} function certificate(s)"
 }
 
+# Registers each configured function (Function/<name>, FunctionRevision/
+# <name>-local) and removes the registrations of functions that are no longer
+# configured. status.endpoint is writable only through the status subresource
+# of a cluster-scoped object, i.e. by cluster admins, and Crossplane dials it
+# with CA verification against its own root CA; the registration is therefore
+# exactly as trusted as the API server's admins, no more and no less.
 register_functions() {
-  [ "${#FUNCTION_NAMES[@]}" -gt 0 ] || return 0
   local i name port
-  for i in "${!FUNCTION_NAMES[@]}"; do
+  for i in ${FUNCTION_NAMES[@]+"${!FUNCTION_NAMES[@]}"}; do
     name="${FUNCTION_NAMES[$i]}"; port="$(function_port "$i")"
     # Server-side apply so a reboot re-asserts the same objects without a
     # diff fight. spec.package and spec.image are required strings, and the
@@ -1598,6 +1723,8 @@ apiVersion: pkg.crossplane.io/v1
 kind: Function
 metadata:
   name: ${name}
+  labels:
+    ${SUPERVISOR_LABEL_KEY}: ${SUPERVISOR_LABEL_VALUE}
   annotations:
     crossplane.io/paused: "true"
 spec:
@@ -1609,6 +1736,7 @@ metadata:
   name: ${name}-local
   labels:
     pkg.crossplane.io/package: ${name}
+    ${SUPERVISOR_LABEL_KEY}: ${SUPERVISOR_LABEL_VALUE}
   annotations:
     crossplane.io/paused: "true"
 spec:
@@ -1624,51 +1752,34 @@ EOF
       || fail "could not set status.endpoint/status.capabilities on FunctionRevision/${name}-local; without them Crossplane cannot dial ${name} and every pipeline using it stays invalid"
     log "function ${name} registered: port ${port}, FunctionRevision/${name}-local endpoint 127.0.0.1:${port}, capabilities [composition]"
   done
-}
 
-# ------------------------------------------------------------------------------
-# Step 5: crossplane core
-#
-# `crossplane core start` unconditionally loads an mTLS client certificate --
-# it is the identity it presents to composition Functions over gRPC -- and
-# fails to start if the files are missing. `core init` puts them in a Secret;
-# out of cluster there is no projected volume, so unpack the Secret to disk.
-#
-# --package-runtime=External stops the package manager from ever creating a
-# Deployment for a Provider or Function package: nothing could schedule it.
-# ------------------------------------------------------------------------------
-start_crossplane() {
-  unpack_crossplane_client_tls
-
-  local args=(
-    core start
-    --namespace "${CP_CROSSPLANE_NAMESPACE}"
-    --tls-client-certs-dir "${CP_RUN_DIR}/tls/client"
-    --package-runtime External
-    --leader-election=false
-    --metrics-port "${CP_CROSSPLANE_METRICS_PORT}"
-    --health-probe-port "${CP_CROSSPLANE_HEALTH_PORT}"
-  )
-  if [ "${CP_ENABLE_WEBHOOKS}" = "true" ]; then
-    unpack_tls_secret crossplane-tls-server "${CP_RUN_DIR}/tls/server"
-    args+=(
-      --webhook-enabled=true
-      --tls-server-certs-dir "${CP_RUN_DIR}/tls/server"
-      --webhook-port "${CP_CROSSPLANE_WEBHOOK_PORT}"
-    )
-  else
-    args+=(--webhook-enabled=false)
-  fi
-
-  start_bg crossplane env \
-    KUBECONFIG="${KUBECONFIG_INTERNAL}" \
-    POD_NAMESPACE="${CP_CROSSPLANE_NAMESPACE}" \
-    XPKG_CACHE_DIR="${CP_HOME}/cache/xpkg" \
-    XFN_CACHE_DIR="${CP_HOME}/cache/xfn" \
-    "${CP_BIN_DIR}/crossplane" "${args[@]}"
-
-  wait_ready "crossplane core /readyz" "${CP_READY_TIMEOUT}" \
-    curl -fsS "http://127.0.0.1:${CP_CROSSPLANE_HEALTH_PORT}/readyz"
+  # Ports are positional, so a name removed from or reordered in CP_FUNCTIONS
+  # leaves the previous boot's FunctionRevision/<old>-local pointing at a port
+  # another function now owns, and Crossplane would route <old>'s pipeline
+  # steps to the wrong process. Delete every object carrying this supervisor's
+  # label that no configured name accounts for. Unlabelled objects were not
+  # written here and are never touched. Runs with CP_FUNCTIONS empty too: that
+  # is the "every name removed" case.
+  local selector="${SUPERVISOR_LABEL_KEY}=${SUPERVISOR_LABEL_VALUE}" listing obj kind oname keep
+  listing="$(kc get function.pkg.crossplane.io,functionrevision.pkg.crossplane.io -l "${selector}" -o name)" \
+    || fail "could not list the Function/FunctionRevision objects labelled ${selector}; a stale registration from an earlier CP_FUNCTIONS could route a pipeline to the wrong port"
+  while IFS= read -r obj; do
+    [ -n "${obj}" ] || continue
+    kind="${obj%%/*}"; oname="${obj#*/}"
+    keep=0
+    for name in ${FUNCTION_NAMES[@]+"${FUNCTION_NAMES[@]}"}; do
+      case "${kind}" in
+        function.pkg.crossplane.io)         [ "${oname}" != "${name}" ]       || keep=1 ;;
+        functionrevision.pkg.crossplane.io) [ "${oname}" != "${name}-local" ] || keep=1 ;;
+      esac
+    done
+    [ "${keep}" -eq 0 ] || continue
+    if kc delete "${obj}" --ignore-not-found >/dev/null; then
+      log "deleted stale ${obj} (labelled ${selector}, no longer in CP_FUNCTIONS)"
+    else
+      fail "could not delete stale ${obj}; its status.endpoint may point at a port another function now owns"
+    fi
+  done <<< "${listing}"
 }
 
 # ------------------------------------------------------------------------------
@@ -1879,8 +1990,8 @@ main() {
   fi
   log "  client cert validity:  ${CP_CLIENT_CERT_DAYS} days (renewed on restart past the midpoint)"
   if [ "${#FUNCTION_NAMES[@]}" -gt 0 ]; then
-    local fl="" fi_
-    for fi_ in "${!FUNCTION_NAMES[@]}"; do fl="${fl}${fl:+, }${FUNCTION_NAMES[$fi_]}@127.0.0.1:$(function_port "${fi_}")"; done
+    local fl="" fidx
+    for fidx in "${!FUNCTION_NAMES[@]}"; do fl="${fl}${fl:+, }${FUNCTION_NAMES[$fidx]}@127.0.0.1:$(function_port "${fidx}")"; done
     log "  functions:             ${fl}"
   else
     log "  functions:             none (CP_FUNCTIONS empty)"

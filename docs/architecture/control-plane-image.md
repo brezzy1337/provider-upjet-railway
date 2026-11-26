@@ -79,7 +79,13 @@ snapshot has to contain the Dockerfile the `RAILWAY_DOCKERFILE_PATH` variable na
 - The composition functions (`function-go-templating`, `function-auto-ready`; see
   [Composition functions](control-plane.md#composition-functions)) are built from their GitHub tags
   in the `functions-build` stage, a plain `go build` at the root of each cloned module, and copied
-  beside the other binaries so the supervisor finds each `CP_FUNCTIONS` entry by name.
+  beside the other binaries so the supervisor finds each `CP_FUNCTIONS` entry by name. Each tag pin
+  has a commit pin beside it (`FUNCTION_GO_TEMPLATING_COMMIT`, `FUNCTION_AUTO_READY_COMMIT`, the
+  same values in the Makefile): a tag can be moved after the fact, the commit it resolved to when
+  pinned cannot, so the stage and `hack/native-cluster.sh build` compare the clone's `HEAD` with
+  the pin and fail when they differ. The `crossplane-build` and `tfprovider-build` stages still
+  clone by tag alone, and the fetched Kubernetes, etcd and Terraform binaries have no checksums;
+  both are open items.
 - The Go pin follows the newest `go` directive among the modules the image builds: the stages set
   `GOTOOLCHAIN=local`, which refuses to download a newer toolchain, and both functions' `go.mod`
   require 1.26.11, which moved `GO_VERSION` from 1.26.7 to 1.26.11 on 2026-11-26. Check a function's

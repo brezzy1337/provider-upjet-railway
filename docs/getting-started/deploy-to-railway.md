@@ -138,10 +138,13 @@ either: when a build failed after a volume change, Railway removed the running d
 so a redeploy on a live plane is a short outage at best and a longer one if the build breaks.
 The two deploys of 2026-11-26 (the composition functions) give the timings for a later deploy: the
 first, deployment `f9cc19bd` at 19:26 UTC, built in 2 min 50 s cold with the new Go image and
-crash-looped on port 8080 (above); the second, deployment `1ff06fe8` of commit `0471c3b`, `railway
-up` at 19:38:12 UTC, started its container at 19:39:31, 79 s from upload to container start with a
-warm layer cache, and logged `control plane UP` at 19:39:45, a 14 s boot, both functions READY on
-127.0.0.1:9450 and 9451 and no drain warning with `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` at 70.
+crash-looped on port 8080 (above); the second, deployment `1ff06fe8` of the start-order fix,
+`railway up` at 19:38:12 UTC, started its container at 19:39:31, 79 s from upload to container
+start with a warm layer cache, and logged `control plane UP` at 19:39:45, a 14 s boot, both
+functions READY on 127.0.0.1:9450 and 9451 and no drain warning with
+`RAILWAY_DEPLOYMENT_DRAINING_SECONDS` at 70. Those numbers were taken before the review fixes of
+the same PR (root CA key removal, the registration prune, the boot validation); the fixes have run
+on the harness only ([2026-11-26 report](../reports/2026-11-26.md)).
 Changing the volume's mount path also redeploys, from the service's stored code snapshot rather
 than a new upload. Secrets rotation and the encryption-key rotation are described in the
 [Architecture](../architecture/control-plane.md) page; an etcd snapshot is taken on the volume at

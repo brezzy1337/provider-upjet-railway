@@ -1,16 +1,17 @@
 # Harness fixture for hack/native-cluster.sh verify (Phase 3, item 1). Not a
-# product API. One pipeline step renders a namespaced Railway Project through
-# function-go-templating; function-auto-ready marks the XR Ready once the
-# Project is. The Project relies on the CRD default providerConfigRef
-# (ClusterProviderConfig/default), which the supervisor writes at boot.
+# product API. The default, hermetic round trip: one pipeline step renders a
+# core ConfigMap through function-go-templating (Crossplane 2 composes any
+# Kubernetes resource; the ConfigMap lands in the XR's namespace) and
+# function-auto-ready marks the XR Ready once the ConfigMap exists. No provider
+# and no external API is involved, so every verify can run it.
 apiVersion: apiextensions.crossplane.io/v1
 kind: Composition
 metadata:
-  name: xrailwayproject.harness.railway.crossplane.io
+  name: xspike-configmap
 spec:
   compositeTypeRef:
     apiVersion: harness.railway.crossplane.io/v1alpha1
-    kind: XRailwayProject
+    kind: XSpike
   mode: Pipeline
   pipeline:
   - step: render
@@ -22,14 +23,13 @@ spec:
       source: Inline
       inline:
         template: |
-          apiVersion: railway.m.crossplane.io/v1alpha1
-          kind: Project
+          apiVersion: v1
+          kind: ConfigMap
           metadata:
             annotations:
-              gotemplating.fn.crossplane.io/composition-resource-name: project
-          spec:
-            forProvider:
-              name: {{ .observed.composite.resource.spec.name | quote }}
+              gotemplating.fn.crossplane.io/composition-resource-name: config
+          data:
+            name: {{ .observed.composite.resource.spec.name | quote }}
   - step: ready
     functionRef:
       name: function-auto-ready

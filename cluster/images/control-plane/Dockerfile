@@ -28,6 +28,12 @@ ARG ETCD_VERSION=v3.6.14
 ARG CROSSPLANE_VERSION=2.2.1
 ARG FUNCTION_GO_TEMPLATING_VERSION=0.13.3
 ARG FUNCTION_AUTO_READY_VERSION=0.7.4
+# The commits the two function tags resolved to on 2026-11-26. A tag is
+# mutable, the commit is not: functions-build fails loudly if a tag moves.
+# crossplane-build and tfprovider-build still clone by tag alone; that gap is
+# listed as open in the docs.
+ARG FUNCTION_GO_TEMPLATING_COMMIT=451e2a21fafc5ae7de2031bc3050cc11e1e51f31
+ARG FUNCTION_AUTO_READY_COMMIT=8dc4b24c1e8994560f89119bda550330ed1fb37a
 ARG TERRAFORM_VERSION=1.5.7
 ARG TERRAFORM_PROVIDER_SOURCE=terraform-community-providers/railway
 ARG TERRAFORM_PROVIDER_VERSION=0.6.2
@@ -108,12 +114,19 @@ ARG TARGETOS
 ARG TARGETARCH
 ARG FUNCTION_GO_TEMPLATING_VERSION
 ARG FUNCTION_AUTO_READY_VERSION
+ARG FUNCTION_GO_TEMPLATING_COMMIT
+ARG FUNCTION_AUTO_READY_COMMIT
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 RUN apk add --no-cache git
+# Clone by tag, then assert the commit: a tag is mutable, the commit is not,
+# so a tag that was moved (upstream or by an attacker) fails the build here
+# instead of shipping whatever it points at now.
 RUN git clone --quiet --depth 1 --branch "v${FUNCTION_GO_TEMPLATING_VERSION}" \
       https://github.com/crossplane-contrib/function-go-templating.git /src/function-go-templating \
+    && test "$(git -C /src/function-go-templating rev-parse HEAD)" = "${FUNCTION_GO_TEMPLATING_COMMIT}" \
     && git clone --quiet --depth 1 --branch "v${FUNCTION_AUTO_READY_VERSION}" \
-      https://github.com/crossplane-contrib/function-auto-ready.git /src/function-auto-ready
+      https://github.com/crossplane-contrib/function-auto-ready.git /src/function-auto-ready \
+    && test "$(git -C /src/function-auto-ready rev-parse HEAD)" = "${FUNCTION_AUTO_READY_COMMIT}"
 WORKDIR /src/function-go-templating
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/function-go-templating .
 WORKDIR /src/function-auto-ready

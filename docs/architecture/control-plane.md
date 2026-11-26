@@ -238,10 +238,12 @@ Crossplane dials over mTLS. The package manager runs functions as Deployments, w
 could schedule, so they run the way the provider does: as supervised processes (Phase 3, item 1,
 done 2026-11-26 on the harness and on Railway; the [2026-11-26 report](../reports/2026-11-26.md) has
 both runs). Two are built into the image from their GitHub tags, `function-go-templating`
-v0.13.3 and `function-auto-ready` v0.7.4, pinned in the Dockerfile `ARG`s
-`FUNCTION_GO_TEMPLATING_VERSION` and `FUNCTION_AUTO_READY_VERSION` and in the Makefile, which the
-harness reads. Both modules require Go 1.26.11, which moved the image's Go pin (see [The
-control-plane image](control-plane-image.md#keeping-the-dockerfile-portable)).
+v0.13.3 and `function-auto-ready` v0.7.4, pinned by tag and by commit in the Dockerfile `ARG`s
+(`FUNCTION_GO_TEMPLATING_VERSION` and `_COMMIT`, `FUNCTION_AUTO_READY_VERSION` and `_COMMIT`) and
+in the Makefile, which the harness reads; the build and the harness fail when the tag no longer
+resolves to the pinned commit (see [The control-plane
+image](control-plane-image.md#keeping-the-dockerfile-portable)). Both modules require Go 1.26.11,
+which moved the image's Go pin.
 
 **Processes and ports.** `CP_FUNCTIONS` (default `function-go-templating function-auto-ready`)
 names the functions, each a binary of that name under `CP_BIN_DIR`; the first listens on
@@ -261,8 +263,12 @@ function a serving certificate signed by it: CN the function's name, SANs `local
 `CP_INTERNAL_CERT_DAYS`, written under `run/tls/functions/<name>/` beside a `ca.crt` that is the
 root CA certificate. The cluster CA signs nothing here, and the harness checks that the serving
 certificate verifies against the root CA and not against the cluster CA. The root CA key is
-Crossplane's, borrowed for the length of a boot and never written to the volume. The hourly
-watchdog covers the functions' certificates like the others.
+Crossplane's, borrowed only to sign, then deleted: once the last function certificate is signed
+the supervisor removes `tls.key` from `run/tls/root-ca/` (only `tls.crt` stays, for the readiness
+probe and the per-function `ca.crt` copies) and logs `root CA key removed from ... after signing 2
+function certificate(s)`; it is never written to the volume, and the harness checks that the key is
+absent and the certificate present. The hourly watchdog covers the functions' certificates like the
+others.
 
 **Readiness.** A function is ready when `openssl s_client -alpn h2`, presenting Crossplane's own
 client certificate, reports `Verify return code: 0 (ok)` and `ALPN protocol: h2` and no `SSL alert`.
@@ -297,11 +303,26 @@ rule requires `spec.package` to look like `registry/repository:tag` (a first att
 `supervised.local/control-plane/<name>:process`, as `spec.package` and as `spec.image`; nothing
 resolves it. Both carry `crossplane.io/paused: "true"`, so the package manager's reconcilers only
 set a `ReconcilePaused` condition and never fetch the placeholder image or recompute the status.
-Three limits to be plain about. `kubectl get functions` shows them without `INSTALLED` or `HEALTHY`,
-because the reconcilers that set those columns are paused. Removing a name from `CP_FUNCTIONS`
-leaves its two objects behind: there is no owner reference and nothing garbage-collects them, so an
-operator deletes them by hand. And a Composition refers to a function by this name
-(`functionRef.name`), so the names in `CP_FUNCTIONS` are part of the plane's API.
+Both also carry the label `app.kubernetes.io/managed-by: control-plane-supervisor`, and after
+registering, the supervisor deletes every labelled `Function` or `FunctionRevision` whose name is
+not in `CP_FUNCTIONS` (the harness checks the label on both objects). The prune is not tidiness:
+ports are positional, so a name removed from or reordered in the list would leave the previous
+boot's `FunctionRevision/<old>-local` pointing at a port another function now owns, and Crossplane
+would route `<old>`'s pipeline steps to the wrong process without an error. Unlabelled objects
+were not written by the supervisor and are never touched; a failed list or delete fails the boot.
+Two limits to be plain about. `kubectl get functions` shows them without `INSTALLED` or `HEALTHY`,
+because the reconcilers that set those columns are paused. And a Composition refers to a function
+by this name (`functionRef.name`), so the names in `CP_FUNCTIONS` are part of the plane's API.
+
+**Validation at boot.** Before anything starts, `CP_FUNCTIONS` is checked and a bad list is fatal
+with a message naming the fix: a name that is not a DNS label; a name listed twice (the second
+registration would silently win); a name equal to a core component (`etcd`, `kube-apiserver`,
+`kube-controller-manager`, `crossplane`, `provider-upjet-railway`), since the name is also the log
+file, the supervised-process name and the `GOMEMLIMIT` component; and a function port range
+(`CP_FUNCTION_PORT_BASE` plus one port per entry) that overlaps any port the plane itself listens
+on: `CP_APISERVER_PORT`, etcd's client and peer ports, `CP_KCM_PORT`, Crossplane's metrics, health
+and webhook ports, and the provider's metrics port. Without the last check a function that lost
+the race for, say, 8080 would die before readiness and fail the boot with a less direct message.
 
 **Order and drain.** The boot order is etcd, kube-apiserver, kube-controller-manager, CRDs,
 `crossplane core start`, the functions, the provider: the functions are step 6, after Crossplane
@@ -309,18 +330,26 @@ core (step 5), and deliberately not before it. function-sdk-go v0.7.1 (`Serve` i
 Prometheus metrics server on `DefaultMetricsAddress = ":8080"` in every function, on all interfaces,
 with no flag or environment variable in either function's CLI to move or disable it, and it ignores
 a failed bind (`_ = metricsServer.ListenAndServe() // Ignore errors`). Crossplane core's metrics
-port defaults to 8080 as well, and Crossplane refuses to start when the port is taken. The first
-Railway deploy of the functions started them first and crash-looped: `crossplane core start` failed
-with `failed to start metrics server: failed to create listener: listen tcp :8080: bind: address
-already in use`, and the supervisor's 180 s readiness gate restarted the container. The harness had
-hidden the collision because it shifted Crossplane's metrics to 18080, so the first function took
-:8080 locally without consequence. With Crossplane first, it owns 8080, every function's metrics
+port defaults to 8080 as well, and Crossplane refuses to start when the port is taken; the first
+Railway deploy with the functions started first crash-looped on exactly that, and the harness had
+hidden the collision (the incident and the blind spot are in the [2026-11-26
+report](../reports/2026-11-26.md)). With Crossplane first, it owns 8080, every function's metrics
 bind fails silently, and the functions listen on their loopback gRPC port only; a dial Crossplane
 attempts before a function is up is an ordinary reconcile error it retries. `EXPOSE 8080` in the
-Dockerfile remains Crossplane's metrics. The harness no longer shifts `CP_CROSSPLANE_METRICS_PORT`
-(it stays 8080, so 8080 must be free on the host) and checks both halves: `crossplane core owns its
-metrics port 8080 (controller-runtime metrics served there)` and, per function, `<fn> listens on
-loopback only (its SDK metrics bind on :8080 lost to Crossplane core)`. Shutdown is reverse start
+Dockerfile remains Crossplane's metrics. The harness keeps `CP_CROSSPLANE_METRICS_PORT` at 8080
+(so 8080 must be free on the host) and checks both halves: `crossplane core owns its metrics port
+8080 (controller-runtime metrics served there)` and, per function, `<fn> listens on loopback only
+(its SDK metrics bind on :8080 lost to Crossplane core)`.
+
+The alternative, moving Crossplane's metrics off 8080 so that the order no longer matters, was
+considered at review and not taken: the first function to start would then win the bind and serve
+its SDK metrics on all interfaces, unauthenticated, where today every function is loopback-only.
+The order also fails loudly if the SDK ever changes: an SDK that made the lost bind fatal would
+exit before the mTLS readiness gate, which fails the boot, so a function bump cannot pass silently.
+The clean long-term fix stays a small upstream patch adding `--metrics-address` to the functions,
+carried like `hack/upstream/`.
+
+**Drain.** Shutdown is reverse start
 order, so the functions stop before Crossplane, which costs Crossplane a few failed dials while it is
 itself stopping. With two functions the plane has seven components and the worst-case shutdown is
 7 x `CP_SHUTDOWN_TIMEOUT` = 70 s; the supervisor's Railway warning says `70 is recommended ...
@@ -328,11 +357,15 @@ worst case 7 components x CP_SHUTDOWN_TIMEOUT 10 s`, and the live service's
 `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` was raised from 60 to 70 on 2026-11-26
 ([runbook](../getting-started/deploy-to-railway.md)).
 
-**Memory.** Each function gets a 3% `GOMEMLIMIT` share (`CP_GOMEMLIMIT_PCT_<NAME>` overrides it),
-which brings the total to 91% with the default two. Measured on the harness after one composition
-round trip, from `/proc` `VmRSS`: function-go-templating 30 MiB, function-auto-ready 31 MiB
-(crossplane 78 MiB, etcd 78 MiB, kube-apiserver 482 MiB, kube-controller-manager 76 MiB, the
-provider 57 MiB).
+**Memory.** Every name in `CP_FUNCTIONS` gets a 3% `GOMEMLIMIT` share (membership in the list,
+not a `function-` prefix, decides what a function is; `CP_GOMEMLIMIT_PCT_<NAME>` overrides one
+share), which brings the total to 91% with the default two; five functions reach exactly 100% and a
+sixth fails the boot, since the shares would promise more than the container has. When the
+container's limit is known, a function whose share comes to under 64 MiB gets a boot warning that
+names `CP_GOMEMLIMIT_PCT_<NAME>` as the knob: a function idles at about 30 MiB RSS (measured on the
+harness; the per-process numbers are in the [2026-11-26 report](../reports/2026-11-26.md)), and a
+limit below twice that leaves its GC collecting continuously. A warning, not a failure: the
+function still works, only slower, and the fix is a bigger container.
 
 **Compositions and the namespaced provider.** What a Composition composes in Crossplane 2.x is the
 namespaced managed resource (`railway.m.crossplane.io`; its `Project` is served at `v1alpha1`),
@@ -341,7 +374,8 @@ therefore writes `ClusterProviderConfig/default` (`railway.m.crossplane.io/v1bet
 legacy `ProviderConfig/default`, from the same `railway-creds` Secret.
 
 **Adding a function.** Build its binary into the image under `CP_BIN_DIR` (the `functions-build`
-stage clones a tag and runs `go build`; pin the version in the Dockerfile `ARG`s and the Makefile,
+stage clones a tag, checks that it resolves to the pinned commit and runs `go build`; pin the tag
+and the commit in the Dockerfile `ARG`s and the Makefile,
 check that its `go.mod` does not require a newer Go than the image's pin, because
 `GOTOOLCHAIN=local` refuses to download one, and check that its SDK still treats a failed metrics
 bind on :8080 as a no-op, because an SDK that made it fatal would break the start order above), add
@@ -351,10 +385,15 @@ out named. Keep the count low: each function is a process with a port, a certifi
 share and 10 s of worst-case drain.
 
 The harness proves the whole path through the fixture under `hack/fixtures/functions-spike/` (a
-harness fixture, not a product API): an XRD, a two-step pipeline (`render` through
-function-go-templating, `ready` through function-auto-ready), the `CompositionRevision` reaching
-`ValidPipeline=True`, the XR rendered into a `Project` with the XR's name, the XR Ready, and the
-Project gone when the XR is deleted.
+harness fixture, not a product API): the XRD `xspikes.harness.railway.crossplane.io` (kind
+`XSpike`, one field, `spec.name`) and two Compositions with the same two-step pipeline (`render`
+through function-go-templating, `ready` through function-auto-ready). The default,
+`xspike-configmap`, is hermetic: the `CompositionRevision` reaches `ValidPipeline=True`, the XR
+`spike` is rendered into a core `v1 ConfigMap` labelled `crossplane.io/composite=spike` whose
+`data.name` is the XR's `spec.name`, function-auto-ready marks the XR Ready (no provider involved),
+and deleting the XR removes the ConfigMap; nothing leaves the local API server. The second,
+`xspike-railway-project`, renders a Railway `Project` and runs only with `VERIFY_LIVE_RAILWAY=1`,
+because it creates and deletes a real Railway project; without it, that path is one SKIP line.
 
 ## Capacity: etcd quota, snapshots and memory
 

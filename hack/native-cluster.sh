@@ -40,14 +40,19 @@
 # not resolve here.
 #
 # Composition functions (Phase 3): function-go-templating and function-auto-ready
-# are built from source into $BIN like crossplane core and supervised as two
-# more processes, listening with mTLS on 127.0.0.1:19450 and 127.0.0.1:19451
-# (CP_FUNCTION_PORT_BASE, one port per name in CP_FUNCTIONS order). `verify`
-# checks the processes, their certificate chains, the FunctionRevision
-# registrations, and runs a round trip through hack/fixtures/functions-spike
-# (XRD + Composition + XR rendering one Railway Project). The Project itself
-# only reaches Ready with a real RAILWAY_TOKEN; with a fake one that step is a
-# SKIP, the rendering and the deletion are still asserted.
+# are built from source into $BIN like crossplane core (tag and commit pinned in
+# the Makefile; build refuses a clone whose HEAD is not the pinned commit) and
+# supervised as two more processes, listening with mTLS on 127.0.0.1:19450 and
+# 127.0.0.1:19451 (CP_FUNCTION_PORT_BASE, one port per name in CP_FUNCTIONS
+# order). `verify` checks the processes, their certificate chains, the
+# FunctionRevision registrations, and runs a hermetic round trip through
+# hack/fixtures/functions-spike (XRD + Composition + XR rendering one core
+# ConfigMap, Ready through function-auto-ready, nothing leaves the API server).
+# VERIFY_LIVE_RAILWAY=1 adds the second Composition, which renders a Railway
+# Project: it creates and deletes a real project with the RAILWAY_TOKEN `up` was
+# given (observed to reach Ready even with the fake token), so it is opt-in and
+# otherwise one SKIP line. Within it, the Ready step prints SKIP only when the
+# provider reports an authorization error on the Project.
 #
 # State lives in .work/native (gitignored). Set NATIVE_WORK to relocate.
 # ==============================================================================
@@ -66,11 +71,15 @@ ETCD_VERSION="${ETCD_VERSION:-v3.6.14}"
 CROSSPLANE_VERSION="${CROSSPLANE_VERSION:-$(awk -F'= ' '/^CROSSPLANE_VERSION/{print $2}' Makefile)}"
 FUNCTION_GO_TEMPLATING_VERSION="${FUNCTION_GO_TEMPLATING_VERSION:-$(awk -F'= ' '/^FUNCTION_GO_TEMPLATING_VERSION/{print $2}' Makefile)}"
 FUNCTION_AUTO_READY_VERSION="${FUNCTION_AUTO_READY_VERSION:-$(awk -F'= ' '/^FUNCTION_AUTO_READY_VERSION/{print $2}' Makefile)}"
+# The commit each function tag resolved to when it was pinned; a tag is mutable,
+# the commit is not, so build() checks the clone's HEAD against these.
+FUNCTION_GO_TEMPLATING_COMMIT="${FUNCTION_GO_TEMPLATING_COMMIT:-$(awk -F'= ' '/^FUNCTION_GO_TEMPLATING_COMMIT/{print $2}' Makefile)}"
+FUNCTION_AUTO_READY_COMMIT="${FUNCTION_AUTO_READY_COMMIT:-$(awk -F'= ' '/^FUNCTION_AUTO_READY_COMMIT/{print $2}' Makefile)}"
 TERRAFORM_VERSION="${TERRAFORM_VERSION:-$(awk -F'= ' '/^export TERRAFORM_VERSION/{print $2}' Makefile)}"
 TERRAFORM_PROVIDER_VERSION="${TERRAFORM_PROVIDER_VERSION:-$(awk -F'= ' '/^export TERRAFORM_PROVIDER_VERSION/{print $2}' Makefile)}"
 TERRAFORM_PROVIDER_REPO="${TERRAFORM_PROVIDER_REPO:-https://github.com/terraform-community-providers/terraform-provider-railway}"
 
-# Ports are shifted off the defaults so this can coexist with anything else.
+# Most ports are shifted off the defaults so this can coexist with anything else.
 export CP_APISERVER_PORT="${CP_APISERVER_PORT:-16443}"
 export CP_ETCD_CLIENT_PORT="${CP_ETCD_CLIENT_PORT:-12379}"
 export CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-12380}"
@@ -179,17 +188,32 @@ build() {
 
   # Composition functions ship as xpkg images, which a nodeless plane cannot
   # run, so they are built from their tags like crossplane core and supervised
-  # as processes. Both build with a plain `go build .` at the tag root.
-  local fn ver
+  # as processes. Both build with a plain `go build .` at the tag root. The
+  # pins come from the Makefile as FUNCTION_<NAME>_VERSION / _COMMIT, the
+  # variable name derived from the function name (function-go-templating ->
+  # FUNCTION_GO_TEMPLATING).
+  local fn var ver_var commit_var ver commit head
   for fn in function-go-templating function-auto-ready; do
-    case "$fn" in
-      function-go-templating) ver="${FUNCTION_GO_TEMPLATING_VERSION}" ;;
-      function-auto-ready)    ver="${FUNCTION_AUTO_READY_VERSION}" ;;
-    esac
-    if [ ! -x "$BIN/$fn" ]; then
-      say "building ${fn} v${ver} from source"
-      [ -d "$SRC/$fn" ] || git clone --quiet --depth 1 \
+    var="${fn^^}"; var="${var//-/_}"
+    ver_var="${var}_VERSION"; commit_var="${var}_COMMIT"
+    ver="${!ver_var}"; commit="${!commit_var}"
+    [ -n "$ver" ] && [ -n "$commit" ] || {
+      echo "Makefile lacks ${ver_var} or ${commit_var} (both pins are required for ${fn})" >&2; exit 1; }
+    if [ ! -d "$SRC/$fn" ]; then
+      say "cloning ${fn} v${ver}"
+      git clone --quiet --depth 1 \
         --branch "v${ver}" "https://github.com/crossplane-contrib/${fn}.git" "$SRC/$fn"
+    fi
+    # A tag can be moved after the fact; the commit it resolved to when it was
+    # pinned cannot. Checked on every build, clone fresh or not, so a clone left
+    # from an earlier pin is caught as well as a moved upstream tag.
+    head="$(git -C "$SRC/$fn" rev-parse HEAD)"
+    [ "$head" = "$commit" ] || {
+      echo "$SRC/$fn is at commit ${head}, but ${commit_var} in the Makefile pins ${commit} (tag v${ver})." >&2
+      echo "If the pin was bumped on purpose: rm -rf '$SRC/$fn' '$BIN/$fn' and run: $0 build. If not, the upstream tag moved: stop and inspect before trusting it." >&2
+      exit 1; }
+    if [ ! -x "$BIN/$fn" ]; then
+      say "building ${fn} v${ver} (${commit:0:12}) from source"
       ( cd "$SRC/$fn" && CGO_ENABLED=0 go build -o "$BIN/$fn" . )
     fi
   done
@@ -309,16 +333,10 @@ gc_probe() {
     | "${k[@]}" apply -f - >/dev/null || return 1
   "${k[@]}" -n gc-probe get configmap gc-owned >/dev/null 2>&1 || return 1
   "${k[@]}" -n gc-probe delete configmap gc-owner >/dev/null || return 1
-  local i
-  for i in $(seq 1 30); do
-    "${k[@]}" -n gc-probe get configmap gc-owned >/dev/null 2>&1 || {
-      "${k[@]}" delete ns gc-probe --wait=false >/dev/null 2>&1
-      return 0
-    }
-    sleep 1
-  done
+  local rc=0
+  wait_until 30 bash -c '! "$1" --kubeconfig "$2" -n gc-probe get configmap gc-owned >/dev/null 2>&1' _ "$KUBECTL" "$KC" || rc=1
   "${k[@]}" delete ns gc-probe --wait=false >/dev/null 2>&1
-  return 1
+  return "$rc"
 }
 
 # wait_until SECONDS cmd...: poll once a second, true as soon as cmd succeeds.
@@ -328,57 +346,104 @@ wait_until() {
   return 1
 }
 
+# mtls_refused HOST:PORT [openssl identity flags...]: a function server refused
+# the client by a TLS alert (never a timeout, exit 124). Function servers
+# enforce ALPN h2, so the probe offers it. Reads root_ca from the caller
+# (verify sets it); exported into bash -c probes with `declare -f`.
+mtls_refused() {
+  local target="$1"; shift
+  local out rc
+  out="$(timeout 10 openssl s_client -alpn h2 -connect "$target" -CAfile "${root_ca}" -ign_eof "$@" 2>&1 </dev/null)"; rc=$?
+  [ "$rc" -ne 124 ] && printf '%s' "$out" | grep -q 'SSL alert number'
+}
+
 # Round trip through hack/fixtures/functions-spike: a Composition whose
-# pipeline runs through both supervised functions must render a namespaced
-# Railway Project from an XR, and deleting the XR must remove it again. Runs
-# inside verify (it uses `check` and `fails`). Setup failures are failures, as
-# in gc_probe: each step that a dead API server could fake is asserted on its
-# own, and a failed setup step ends the probe instead of cascading.
+# pipeline runs through both supervised functions must render a composed
+# resource from an XR, the XR must reach Ready, and deleting the XR must remove
+# the composed resource again. The default path composes a core ConfigMap, so
+# it needs no provider and nothing leaves the API server; the Railway Project
+# path (same XRD, second Composition) creates a real project and runs only with
+# VERIFY_LIVE_RAILWAY=1. Runs inside verify (it uses `check` and `fails`).
+# Setup failures are failures, as in gc_probe: each step that a dead API server
+# could fake is asserted on its own, and a failed setup step ends the probe
+# instead of cascading.
 functions_probe() {
   local k=("$BIN/kubectl" --kubeconfig "$KC") fx="${REPO}/hack/fixtures/functions-spike"
-  local ns=functions-spike xr=spike comp=xrailwayproject.harness.railway.crossplane.io
+  local ns=functions-spike xr=spike xr_live=spike-railway
+  local comp=xspike-configmap comp_live=xspike-railway-project
   # Fully qualified resource names: the XRD's CRD may be seconds old when the
   # probe runs and short names depend on a discovery cache.
-  local xrd=xrailwayprojects.harness.railway.crossplane.io xrk=xrailwayprojects.harness.railway.crossplane.io
-  local want msg
-  check "functions-spike XRD and Composition apply" "${k[@]}" apply -f "$fx/xrd.yaml" -f "$fx/composition.yaml" || return 0
+  local xrd=xspikes.harness.railway.crossplane.io xrk=xspikes.harness.railway.crossplane.io
+  local c want msg
+  check "functions-spike XRD and both Compositions apply" \
+    "${k[@]}" apply -f "$fx/xrd.yaml" -f "$fx/composition.yaml" -f "$fx/composition-railway-project.yaml" || return 0
   check "XRD ${xrd} is Established" \
     "${k[@]}" wait --for=condition=Established "compositeresourcedefinition.apiextensions.crossplane.io/${xrd}" --timeout=60s || return 0
   # ValidPipeline is set by the revision controller only after every function
   # in the pipeline has an active FunctionRevision advertising the composition
   # capability; it is the proof that the hand-written registrations are read.
-  check "CompositionRevision of ${comp} reports ValidPipeline=True (functions advertise the composition capability)" \
-    wait_until 60 bash -c '"$1" --kubeconfig "$2" get compositionrevision -l "crossplane.io/composition-name=$3" \
-      -o jsonpath="{range .items[*]}{range .status.conditions[?(@.type==\"ValidPipeline\")]}{.status}{\"\n\"}{end}{end}" | grep -qx True' \
-    _ "$BIN/kubectl" "$KC" "$comp" || return 0
+  for c in "$comp" "$comp_live"; do
+    check "CompositionRevision of ${c} reports ValidPipeline=True (functions advertise the composition capability)" \
+      wait_until 60 bash -c '"$1" --kubeconfig "$2" get compositionrevision -l "crossplane.io/composition-name=$3" \
+        -o jsonpath="{range .items[*]}{range .status.conditions[?(@.type==\"ValidPipeline\")]}{.status}{\"\n\"}{end}{end}" | grep -qx True' \
+      _ "$BIN/kubectl" "$KC" "$c" || return 0
+  done
   "${k[@]}" create ns "$ns" --dry-run=client -o yaml | "${k[@]}" apply -f - >/dev/null 2>&1
   # A leftover XR from an interrupted run would make "rendered" trivially true.
-  "${k[@]}" -n "$ns" delete "$xrk" "$xr" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  wait_until 90 bash -c '! "$1" --kubeconfig "$2" -n "$3" get "$5" "$4" >/dev/null 2>&1' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$xrk" \
-    || { printf 'FAIL  a previous functions-spike XR could not be removed before the round trip\n'; fails=$((fails+1)); return 0; }
-  check "functions-spike XR applies" "${k[@]}" apply -f "$fx/xr.yaml" || return 0
+  for c in "$xr" "$xr_live"; do
+    "${k[@]}" -n "$ns" delete "$xrk" "$c" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    wait_until 90 bash -c '! "$1" --kubeconfig "$2" -n "$3" get "$5" "$4" >/dev/null 2>&1' _ "$BIN/kubectl" "$KC" "$ns" "$c" "$xrk" \
+      || { printf 'FAIL  a previous functions-spike XR (%s) could not be removed before the round trip\n' "$c"; fails=$((fails+1)); return 0; }
+  done
+
+  # Default path: hermetic. function-auto-ready knows how to judge a ConfigMap,
+  # so the XR reaches Ready with no provider in the loop.
+  check "functions-spike XR ${xr} (Composition ${comp}) applies" "${k[@]}" apply -f "$fx/xr.yaml" || return 0
   want="$("${k[@]}" -n "$ns" get "$xrk" "$xr" -o jsonpath='{.spec.name}' 2>/dev/null)"
   [ -n "$want" ] || { printf 'FAIL  XR %s has no spec.name to compare against\n' "$xr"; fails=$((fails+1)); return 0; }
-  check "composition pipeline rendered the Project through function-go-templating" \
-    wait_until 90 bash -c '"$1" --kubeconfig "$2" -n "$3" get project.railway.m.crossplane.io -l "crossplane.io/composite=$4" \
-      -o jsonpath="{range .items[*]}{.spec.forProvider.name}{\"\n\"}{end}" | grep -qxF "$5"' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$want"
-  if wait_until 60 bash -c '"$1" --kubeconfig "$2" -n "$3" get "$5" "$4" \
-      -o jsonpath="{.status.conditions[?(@.type==\"Ready\")].status}" | grep -qx True' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$xrk"; then
-    printf 'PASS  XR Ready (Project reconciled against Railway)\n'
-  else
-    msg="$("${k[@]}" -n "$ns" get project.railway.m.crossplane.io -l "crossplane.io/composite=$xr" \
-      -o jsonpath='{.items[0].status.conditions[?(@.type=="Synced")].message}' 2>/dev/null)"
-    if printf '%s' "$msg" | grep -qiE 'not authorized|401|authoriz|token'; then
-      printf 'SKIP  XR Ready (the provider cannot create the Project with this RAILWAY_TOKEN; expected with the fake token)\n'
-    else
-      printf 'FAIL  XR Ready (Project reconciled against Railway)\n'; fails=$((fails+1))
-      printf 'Project Synced condition: %s\n' "${msg:-<none yet>}" >&2
-    fi
-  fi
+  check "composition pipeline rendered a ConfigMap through function-go-templating (label crossplane.io/composite=${xr}, data.name = spec.name)" \
+    wait_until 90 bash -c '"$1" --kubeconfig "$2" -n "$3" get configmap -l "crossplane.io/composite=$4" \
+      -o jsonpath="{range .items[*]}{.data.name}{\"\n\"}{end}" | grep -qxF "$5"' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$want"
+  check "XR ${xr} Ready=True (function-auto-ready on the composed ConfigMap, no provider involved)" \
+    wait_until 60 bash -c '"$1" --kubeconfig "$2" -n "$3" get "$5" "$4" \
+      -o jsonpath="{.status.conditions[?(@.type==\"Ready\")].status}" | grep -qx True' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$xrk"
   "${k[@]}" -n "$ns" delete "$xrk" "$xr" --wait=false >/dev/null 2>&1 || true
-  check "deleting the XR removes the composed Project" \
-    wait_until 90 bash -c '[ -z "$("$1" --kubeconfig "$2" -n "$3" get project.railway.m.crossplane.io -l "crossplane.io/composite=$4" -o name 2>/dev/null)" ] \
+  check "deleting XR ${xr} removes the composed ConfigMap" \
+    wait_until 90 bash -c '[ -z "$("$1" --kubeconfig "$2" -n "$3" get configmap -l "crossplane.io/composite=$4" -o name 2>/dev/null)" ] \
       && ! "$1" --kubeconfig "$2" -n "$3" get "$5" "$4" >/dev/null 2>&1' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$xrk"
+
+  # Opt-in path: the same pipeline shape rendering a Railway Project, which the
+  # provider reconciles against the real API (a project is created and deleted
+  # in the workspace the token belongs to; the fake token has been observed to
+  # get a Ready Project too, so this is never run by default).
+  if [ "${VERIFY_LIVE_RAILWAY:-}" = "1" ]; then
+    xr="$xr_live"
+    check "functions-spike XR ${xr} (Composition ${comp_live}) applies" "${k[@]}" apply -f "$fx/xr-railway-project.yaml" || return 0
+    want="$("${k[@]}" -n "$ns" get "$xrk" "$xr" -o jsonpath='{.spec.name}' 2>/dev/null)"
+    [ -n "$want" ] || { printf 'FAIL  XR %s has no spec.name to compare against\n' "$xr"; fails=$((fails+1)); return 0; }
+    check "composition pipeline rendered the Project through function-go-templating (label crossplane.io/composite=${xr}, spec.forProvider.name = spec.name)" \
+      wait_until 90 bash -c '"$1" --kubeconfig "$2" -n "$3" get project.railway.m.crossplane.io -l "crossplane.io/composite=$4" \
+        -o jsonpath="{range .items[*]}{.spec.forProvider.name}{\"\n\"}{end}" | grep -qxF "$5"' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$want"
+    if wait_until 60 bash -c '"$1" --kubeconfig "$2" -n "$3" get "$5" "$4" \
+        -o jsonpath="{.status.conditions[?(@.type==\"Ready\")].status}" | grep -qx True' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$xrk"; then
+      printf 'PASS  XR %s Ready=True (Project reconciled against Railway)\n' "$xr"
+    else
+      msg="$("${k[@]}" -n "$ns" get project.railway.m.crossplane.io -l "crossplane.io/composite=$xr" \
+        -o jsonpath='{.items[0].status.conditions[?(@.type=="Synced")].message}' 2>/dev/null)"
+      if printf '%s' "$msg" | grep -qiE 'not authorized|401|authoriz|token'; then
+        printf 'SKIP  XR %s Ready=True (the provider reports an authorization error creating the Project with this RAILWAY_TOKEN)\n' "$xr"
+      else
+        printf 'FAIL  XR %s Ready=True (Project reconciled against Railway)\n' "$xr"; fails=$((fails+1))
+        printf 'Project Synced condition: %s\n' "${msg:-<none yet>}" >&2
+      fi
+    fi
+    "${k[@]}" -n "$ns" delete "$xrk" "$xr" --wait=false >/dev/null 2>&1 || true
+    check "deleting XR ${xr} removes the composed Project" \
+      wait_until 90 bash -c '[ -z "$("$1" --kubeconfig "$2" -n "$3" get project.railway.m.crossplane.io -l "crossplane.io/composite=$4" -o name 2>/dev/null)" ] \
+        && ! "$1" --kubeconfig "$2" -n "$3" get "$5" "$4" >/dev/null 2>&1' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$xrk"
+  else
+    printf 'SKIP  functions-spike Railway Project round trip (set VERIFY_LIVE_RAILWAY=1; it creates and deletes a real Railway project)\n'
+  fi
   "${k[@]}" delete ns "$ns" --wait=false >/dev/null 2>&1 || true
 }
 
@@ -561,8 +626,9 @@ verify() {
   check "etcd has no alarm raised" bash -c "$(declare -f ectl); BIN='$BIN'"'
     out=$(ectl alarm list) || exit 1; [ -z "$out" ]'
   if [ -n "${CP_MEMORY_LIMIT_BYTES:-}" ]; then
-    # Same table as gomemlimit_share in the supervisor (each enabled composition
-    # function gets 3); the sum must stay under the limit.
+    # Same table as gomemlimit_share in the supervisor (every name in
+    # CP_FUNCTIONS gets 3, by membership in the list); the sum must stay under
+    # the limit.
     check "GOMEMLIMIT on every Go component is its share of CP_MEMORY_LIMIT_BYTES (sum under the limit)" bash -c '
       limit=$2; sum=0; fns=""
       for n in $3; do fns="$fns $n=3"; done
@@ -646,7 +712,7 @@ verify() {
 
   # Owner-reference cascading deletion is the garbage collector's job, and the
   # garbage collector lives in kube-controller-manager. Prove it actually runs.
-  check "garbage collector collects orphaned children" bash -c "$(declare -f gc_probe); \
+  check "garbage collector collects orphaned children" bash -c "$(declare -f gc_probe wait_until); \
     KUBECTL='$BIN/kubectl' KC='$KC' gc_probe"
 
   # Phase 3: composition functions as supervised processes. Each function is a
@@ -655,16 +721,16 @@ verify() {
   # dials it with the client identity from crossplane-tls-client, and a paused
   # FunctionRevision with a hand-written status points the pipeline at the
   # loopback endpoint. Function servers enforce ALPN h2, so every TLS probe
-  # offers it; refusals are asserted by the alert text, never by a timeout.
+  # offers it (mtls_refused, top level); refusals are asserted by the alert
+  # text, never by a timeout.
   local run_dir="${CP_RUN_DIR:-${HOME_DIR}/run}" root_ca="${CP_RUN_DIR:-${HOME_DIR}/run}/tls/root-ca/tls.crt"
-  mtls_refused() {   # mtls_refused HOST:PORT [openssl identity flags...]: refused by a TLS alert (never a timeout, exit 124)
-    local target="$1"; shift
-    local out rc
-    out="$(timeout 10 openssl s_client -alpn h2 -connect "$target" -CAfile "${root_ca}" -ign_eof "$@" 2>&1 </dev/null)"; rc=$?
-    [ "$rc" -ne 124 ] && printf '%s' "$out" | grep -q 'SSL alert number'
-  }
   local fn port idx=0
   [ -n "$(functions_list)" ] || printf 'SKIP  composition function checks and the functions-spike round trip (CP_FUNCTIONS set empty: functions disabled)\n'
+  # The supervisor signs the function certificates with Crossplane's root CA
+  # key and then removes its copy of the key from the run directory; only the
+  # certificate (the trust anchor the probes below use) may remain on disk.
+  [ -z "$(functions_list)" ] || check "Crossplane root CA private key removed after signing (run/tls/root-ca/tls.key absent, tls.crt present)" bash -c \
+    'test ! -e "$1/tls/root-ca/tls.key" && test -s "$1/tls/root-ca/tls.crt"' _ "$run_dir"
   for fn in $(functions_list); do
     port="$(function_port "$idx")"; idx=$((idx+1))
     check "${fn} runs from \$BIN with --address 127.0.0.1:${port}" bash -c '
@@ -705,6 +771,12 @@ verify() {
         -o go-template="{{.spec.desiredState}} {{index .metadata.annotations \"crossplane.io/paused\"}} {{.status.endpoint}} {{range .status.capabilities}}{{.}},{{end}}") "$4" || exit 1
       [ "$1" = Active ] && [ "$2" = true ] && [ "$3" = "127.0.0.1:$5" ] && case ",$4" in *,composition,*) exit 0;; esac; exit 1' \
       _ "$BIN/kubectl" "$KC" "$fn" "$port"
+    # Both registration objects are the supervisor's, and say so, so a reader
+    # of the cluster can tell them from a package the package manager installed.
+    check "Function/${fn} and FunctionRevision/${fn}-local carry app.kubernetes.io/managed-by=control-plane-supervisor" bash -c '
+      "$1" --kubeconfig "$2" get "function.pkg.crossplane.io/$3" "functionrevision.pkg.crossplane.io/$3-local" \
+        -o go-template="{{range .items}}{{index .metadata.labels \"app.kubernetes.io/managed-by\"}}{{\"\n\"}}{{end}}" \
+        | grep -cx control-plane-supervisor | grep -qx 2' _ "$BIN/kubectl" "$KC" "$fn"
   done
   [ -z "$(functions_list)" ] || functions_probe
 

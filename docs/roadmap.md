@@ -19,7 +19,7 @@ the control-plane service itself and the user application. See
 | Build and unit tests | Passed 2026-11-20 on Go 1.26.11: `go build`, `go test`, `golangci-lint` with 0 issues. The patched Terraform provider builds from `hack/upstream/` and its tests pass. |
 | Live verification | `Project` create → visible in Railway → delete → gone, via kind + Crossplane 2.2.1 + the provider out-of-cluster (2026-08-25, repeated through the native control plane 2026-08-26, and over the internet from the Railway-hosted control plane 2026-11-25). No other kind has been exercised live. |
 | Upstream dependency | Blocked on [PR #93](https://github.com/terraform-community-providers/terraform-provider-railway/pull/93) (open, no activity since 2026-08-25). Upstream shipped 0.6.3 on 2026-10-19 **without** the fix. We build from a patch; see [The not-found patch](upstream/not-found-patch.md). |
-| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](reports/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5), B2 (PR #6), B3 (PR #7), B4 (PR #8), B5 (PR #9) and etcd client authentication (PR #10) done and reviewed in the [Phase 2 review](reports/phase-2-review.md). **Deployed to Railway 2026-11-25** (project `do-k8-crossplane-control-plane`, service `control-plane`, sfo): boots in 16 s, reachable over the internet through the TCP proxy, `Project` smoke test passed; two deploy-day fixes, PR #13 (Dockerfile for Railway's validator) and PR #14 (token character set). Phase 2 done; see the [2026-11-25 report](reports/2026-11-25.md). Phase 3 under way: item 1, composition functions as supervised processes, **done 2026-11-26 on the harness and on Railway**: `hack/native-cluster.sh verify` 73 PASS, 0 FAIL, 1 SKIP, and on the live plane a Composition composed a `Project` over the internet that appeared in the Railway account and was gone after the XR's deletion. The first deploy crash-looped on metrics port 8080, which the functions' SDK squats; the functions now start after Crossplane core (commit `0471c3b`). See the [2026-11-26 report](reports/2026-11-26.md). |
+| Control plane | Phase 1 done; merged to `main` 2026-11-21 (PR #3): `cluster/images/control-plane/` and `hack/native-cluster.sh`. Results and review findings in the [Phase 1 review](reports/phase-1-review.md). Phase 2 started 2026-11-21: B1 (PR #5), B2 (PR #6), B3 (PR #7), B4 (PR #8), B5 (PR #9) and etcd client authentication (PR #10) done and reviewed in the [Phase 2 review](reports/phase-2-review.md). **Deployed to Railway 2026-11-25** (project `do-k8-crossplane-control-plane`, service `control-plane`, sfo): boots in 16 s, reachable over the internet through the TCP proxy, `Project` smoke test passed; two deploy-day fixes, PR #13 (Dockerfile for Railway's validator) and PR #14 (token character set). Phase 2 done; see the [2026-11-25 report](reports/2026-11-25.md). Phase 3 under way: item 1, composition functions as supervised processes, **done 2026-11-26 on the harness and on Railway** (design in [Composition functions](architecture/control-plane.md#composition-functions), the runs in the [2026-11-26 report](reports/2026-11-26.md)). |
 | Package publishing | No xpkg or image has been pushed to a registry yet. CI workflows exist from the Upjet template but have not been exercised for a release. |
 
 ## Decisions
@@ -81,20 +81,13 @@ function as a supervised process, since every XRD depends on it.
 Decided 2026-11-26. In order:
 
 1. **Composition functions as supervised processes.** Done 2026-11-26, on the harness and on
-   Railway ([2026-11-26 report](reports/2026-11-26.md)). Every Composition needs one, and a function
-   is a gRPC server that must serve a certificate signed by Crossplane's root CA, in a plane with no
-   pods to run it in. The spike runs `function-go-templating` v0.13.3 and `function-auto-ready`
-   v0.7.4 as supervised processes, each with a per-boot serving certificate from Crossplane's root
-   CA and a paused `Function` plus `FunctionRevision` whose `status.endpoint` and
-   `status.capabilities` the supervisor writes (under the External package runtime nothing else
-   does), started after `crossplane core start` because their SDK binds a metrics server on
-   Crossplane's port 8080 and the first Railway deploy crash-looped on it (order fixed in commit
-   `0471c3b`), and proves a Composition pipeline through them: `hack/native-cluster.sh verify`
-   73 PASS, 0 FAIL, 1 SKIP after the order fix (70/0/1 twice before it, once across a restart), and
-   on Railway (deployment `1ff06fe8`, 14 s boot) an XR composed a `Project` that appeared in the
-   Railway account and was gone 36 s after the XR's deletion. Design and limits in
-   [Architecture](architecture/control-plane.md#composition-functions). `function-kcl` was not
-   needed; keep the count low, each is a process.
+   Railway. Every Composition needs one, and a function is a gRPC server that must serve a
+   certificate signed by Crossplane's root CA, in a plane with no pods to run it in; the plane
+   runs `function-go-templating` and `function-auto-ready` as supervised processes and a
+   Composition pipeline through them composed an object on the live plane. Design and limits in
+   [Composition functions](architecture/control-plane.md#composition-functions); the runs and the
+   numbers in the [2026-11-26 report](reports/2026-11-26.md). `function-kcl` was not needed; keep
+   the count low, each is a process.
 2. **DigitalOcean.** The DigitalOcean provider as another supervised process, a `KubernetesCluster`
    XRD with a DOKS Composition, a real cluster provisioned, its kubeconfig read back as a connection
    Secret, and from that Secret a per-cluster `ProviderConfig` for provider-kubernetes and

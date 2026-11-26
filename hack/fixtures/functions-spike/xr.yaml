@@ -1,7 +1,8 @@
 # Harness fixture for hack/native-cluster.sh verify (Phase 3, item 1). Not a
-# product API. The namespace functions-spike is created by verify.
+# product API. The default XR: selects the hermetic ConfigMap Composition. The
+# namespace functions-spike is created by verify.
 apiVersion: harness.railway.crossplane.io/v1alpha1
-kind: XRailwayProject
+kind: XSpike
 metadata:
   name: spike
   namespace: functions-spike
@@ -9,4 +10,4 @@ spec:
   name: upjet-functions-spike
   crossplane:
     compositionRef:
-      name: xrailwayproject.harness.railway.crossplane.io
+      name: xspike-configmap
