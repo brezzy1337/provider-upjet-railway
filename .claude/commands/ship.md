@@ -14,7 +14,8 @@ Context (gathered for you):
 - Existing PR for this branch: !`gh pr view --json number,url,state,title 2>/dev/null || echo none`
 
 Run the ship pipeline for the current branch against base branch **`main`**. Treat $ARGUMENTS as
-an optional one-line summary of the change. The chain is sequential and you, the central thread,
+an optional one-line summary of the change, optionally followed by `--slack-thread <ts>`: the
+Slack thread `/code-todo` opened for this change, which every update below then continues. The chain is sequential and you, the central thread,
 own it: sub-agents cannot spawn sub-agents. Slack destination and state rules are in the
 "Ship workflow" section of `CLAUDE.md`.
 
@@ -40,11 +41,15 @@ to the first stage that is not yet recorded there.
 2. **Draft the PR.** Delegate to the `pr-author` sub-agent for a title and body.
    **GATE 1: do not open the PR.** Show me the draft and the base branch and wait for my explicit
    "yes". `git push` and `gh pr create` are not pre-authorized, so they will prompt; that prompt is
-   the gate. After opening, delegate to `slack-notifier` with `PR_OPENED`, then append the returned
+   the gate. After opening, delegate to `slack-notifier` with `PR_OPENED` (and the `--slack-thread`
+   `ts` when one was given, so it replies in `/code-todo`'s thread), then append the thread's
    `<!-- slack-thread: <ts> -->` marker to the PR body with `gh pr edit --body`.
 
 3. **Review: fan out, then consolidate.** Scale the panel to the diff:
    - Docs-only or a one-line change: run `factual-reviewer` alone, or skip and say why.
+   - Anything touching `.claude/`, `.github/` or `CLAUDE.md` (pipeline configuration) always gets
+     `security-reviewer` plus `factual-reviewer` and `consistency-reviewer`, however small: it
+     changes what later runs may do, so the docs-only rule does not apply to it.
    - Anything touching `config/`, `internal/`, `hack/`, `cluster/`, `.github/` or `go.mod`:
      dispatch all five read-only lenses **in parallel** in one message: `factual-reviewer`,
      `architecture-reviewer`, `security-reviewer`, `consistency-reviewer`, `redundancy-checker`.
@@ -58,7 +63,7 @@ to the first stage that is not yet recorded there.
    `gh pr merge --squash --delete-branch`. If CI checks are still running (`gh pr checks`), say so
    and wait for them rather than merging on red or unknown.
 
-5. **Notify.** Delegate to `slack-notifier` with `MERGED`. All three updates go in the same thread.
+5. **Notify.** Delegate to `slack-notifier` with `MERGED`. All updates go in the same thread.
 
 Never work around a gate, a red preflight, a blocking review, or failing CI to ship faster. If
 something blocks, stop and tell me the reason.
