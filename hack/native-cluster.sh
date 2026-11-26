@@ -74,7 +74,12 @@ TERRAFORM_PROVIDER_REPO="${TERRAFORM_PROVIDER_REPO:-https://github.com/terraform
 export CP_APISERVER_PORT="${CP_APISERVER_PORT:-16443}"
 export CP_ETCD_CLIENT_PORT="${CP_ETCD_CLIENT_PORT:-12379}"
 export CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-12380}"
-export CP_CROSSPLANE_METRICS_PORT="${CP_CROSSPLANE_METRICS_PORT:-18080}"
+# Not shifted: function-sdk-go squats ":8080" for metrics on every function
+# and Crossplane core defaults its metrics to 8080 too, so keeping Crossplane
+# on the real port here reproduces the collision the supervisor's start order
+# resolves (the first Railway deploy crash-looped on it with the port shifted
+# away locally). Needs 8080 free on this host.
+export CP_CROSSPLANE_METRICS_PORT="${CP_CROSSPLANE_METRICS_PORT:-8080}"
 export CP_CROSSPLANE_HEALTH_PORT="${CP_CROSSPLANE_HEALTH_PORT:-18081}"
 export CP_PROVIDER_METRICS_PORT="${CP_PROVIDER_METRICS_PORT:-18090}"
 # Composition functions: the supervisor gives the i-th name in CP_FUNCTIONS the
@@ -429,6 +434,9 @@ verify() {
     compositionrevisions.apiextensions.crossplane.io
   check "crossplane core /readyz" curl -fsS "http://127.0.0.1:${CP_CROSSPLANE_HEALTH_PORT}/readyz"
   check "crossplane core /healthz" curl -fsS "http://127.0.0.1:${CP_CROSSPLANE_HEALTH_PORT}/healthz"
+  # Crossplane, not a function's SDK, must be what answers on the metrics port.
+  check "crossplane core owns its metrics port ${CP_CROSSPLANE_METRICS_PORT} (controller-runtime metrics served there)" bash -c \
+    "curl -fsS http://127.0.0.1:${CP_CROSSPLANE_METRICS_PORT}/metrics | grep -q '^controller_runtime_'"
   check "provider metrics" curl -fsS "http://127.0.0.1:${CP_PROVIDER_METRICS_PORT}/metrics"
   check "provider controllers running" bash -c \
     "curl -fsS http://127.0.0.1:${CP_PROVIDER_METRICS_PORT}/metrics | grep -q 'controller_runtime_active_workers.*project'"
@@ -684,6 +692,13 @@ verify() {
       mtls_refused "127.0.0.1:$1"' _ "$port"
     check "${fn} refuses a client certificate from the cluster CA, admin-internal (TLS alert)" bash -c "root_ca='$root_ca'; $(declare -f mtls_refused)"'
       [ -r "$2/admin-internal.key" ] && mtls_refused "127.0.0.1:$1" -cert "$2/admin-internal.crt" -key "$2/admin-internal.key"' _ "$port" "$pki"
+    # function-sdk-go starts a metrics server on ":8080", all interfaces, and
+    # ignores a failed bind. Crossplane core starts first and owns 8080, so the
+    # function must end up listening on its loopback gRPC port and nothing else.
+    check "${fn} listens on loopback only (its SDK metrics bind on :8080 lost to Crossplane core)" bash -c '
+      p=$(pgrep -f "^$1/bin/$2 " | head -1); [ -n "$p" ] || exit 1
+      l=$(netstat -ltnp 2>/dev/null | awk -v pid="$p/" "\$NF ~ \"^\" pid {print \$4}"); [ -n "$l" ] || exit 1
+      ! printf "%s\n" "$l" | grep -qvE "^(127\.0\.0\.1|::1):"' _ "${NATIVE_WORK}" "$fn"
     check "Function/${fn} exists" "${k[@]}" get function.pkg.crossplane.io "$fn"
     check "FunctionRevision/${fn}-local is Active, paused, endpoint 127.0.0.1:${port}, capability composition" bash -c '
       set -- $("$1" --kubeconfig "$2" get functionrevision.pkg.crossplane.io "$3-local" \

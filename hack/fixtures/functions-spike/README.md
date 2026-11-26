@@ -14,10 +14,13 @@ control plane supervises (`function-go-templating`, `function-auto-ready`).
 `verify` applies the XRD and Composition, waits for the CompositionRevision to report
 `ValidPipeline=True` (the proof that each function's `FunctionRevision` carries the `composition`
 capability), creates the namespace, applies the XR, and waits for a `Project` labelled
-`crossplane.io/composite=spike` whose `spec.forProvider.name` equals the XR's `spec.name`. With a
-real `RAILWAY_TOKEN` the XR then reaches `Ready=True`; with the fake token the provider is refused
-by Railway and verify prints a SKIP for that step. The XR is deleted at the end and the Project
-must disappear.
+`crossplane.io/composite=spike` whose `spec.forProvider.name` equals the XR's `spec.name`, then for
+the XR to reach `Ready=True`. The round trip talks to the real Railway API: with a real
+`RAILWAY_TOKEN` it creates a project in your workspace; with the harness's fake token it was observed
+(2026-11-26) to still reach `Ready` with a UUID external name, which looks like Railway creating an
+unowned temporary project for an unauthenticated request (an inference, not verified with Railway).
+Verify prints a SKIP instead only when the provider reports an authorization error. The XR is deleted
+at the end and the Project must disappear.
 
 Validate structurally with:
 
