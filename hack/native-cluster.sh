@@ -39,6 +39,16 @@
 # URL). verify then skips the two kubeconfig round trips, since the host does
 # not resolve here.
 #
+# Composition functions (Phase 3): function-go-templating and function-auto-ready
+# are built from source into $BIN like crossplane core and supervised as two
+# more processes, listening with mTLS on 127.0.0.1:19450 and 127.0.0.1:19451
+# (CP_FUNCTION_PORT_BASE, one port per name in CP_FUNCTIONS order). `verify`
+# checks the processes, their certificate chains, the FunctionRevision
+# registrations, and runs a round trip through hack/fixtures/functions-spike
+# (XRD + Composition + XR rendering one Railway Project). The Project itself
+# only reaches Ready with a real RAILWAY_TOKEN; with a fake one that step is a
+# SKIP, the rendering and the deletion are still asserted.
+#
 # State lives in .work/native (gitignored). Set NATIVE_WORK to relocate.
 # ==============================================================================
 set -euo pipefail
@@ -54,6 +64,8 @@ HOME_DIR="${NATIVE_WORK}/home"
 KUBERNETES_VERSION="${KUBERNETES_VERSION:-v1.35.8}"
 ETCD_VERSION="${ETCD_VERSION:-v3.6.14}"
 CROSSPLANE_VERSION="${CROSSPLANE_VERSION:-$(awk -F'= ' '/^CROSSPLANE_VERSION/{print $2}' Makefile)}"
+FUNCTION_GO_TEMPLATING_VERSION="${FUNCTION_GO_TEMPLATING_VERSION:-$(awk -F'= ' '/^FUNCTION_GO_TEMPLATING_VERSION/{print $2}' Makefile)}"
+FUNCTION_AUTO_READY_VERSION="${FUNCTION_AUTO_READY_VERSION:-$(awk -F'= ' '/^FUNCTION_AUTO_READY_VERSION/{print $2}' Makefile)}"
 TERRAFORM_VERSION="${TERRAFORM_VERSION:-$(awk -F'= ' '/^export TERRAFORM_VERSION/{print $2}' Makefile)}"
 TERRAFORM_PROVIDER_VERSION="${TERRAFORM_PROVIDER_VERSION:-$(awk -F'= ' '/^export TERRAFORM_PROVIDER_VERSION/{print $2}' Makefile)}"
 TERRAFORM_PROVIDER_REPO="${TERRAFORM_PROVIDER_REPO:-https://github.com/terraform-community-providers/terraform-provider-railway}"
@@ -65,6 +77,17 @@ export CP_ETCD_PEER_PORT="${CP_ETCD_PEER_PORT:-12380}"
 export CP_CROSSPLANE_METRICS_PORT="${CP_CROSSPLANE_METRICS_PORT:-18080}"
 export CP_CROSSPLANE_HEALTH_PORT="${CP_CROSSPLANE_HEALTH_PORT:-18081}"
 export CP_PROVIDER_METRICS_PORT="${CP_PROVIDER_METRICS_PORT:-18090}"
+# Composition functions: the supervisor gives the i-th name in CP_FUNCTIONS the
+# port base+i on 127.0.0.1. CP_FUNCTIONS is exported only when the caller set
+# it (set-and-empty disables the functions in the supervisor, which reads
+# ${CP_FUNCTIONS-default}), so the supervisor's own default list is what is
+# under test unless the caller says otherwise.
+export CP_FUNCTION_PORT_BASE="${CP_FUNCTION_PORT_BASE:-19450}"
+[ -z "${CP_FUNCTIONS+set}" ] || export CP_FUNCTIONS
+# Mirror of the supervisor's defaults, for verify: the function list, and the
+# port of the function at index i (0-based) in that list.
+functions_list() { printf '%s' "${CP_FUNCTIONS-function-go-templating function-auto-ready}"; }
+function_port() { printf '%s' "$(( CP_FUNCTION_PORT_BASE + $1 ))"; }
 
 MIRROR="${NATIVE_WORK}/provider-mirror"
 PLUGIN_DIR="${MIRROR}/registry.terraform.io/terraform-community-providers/railway/${TERRAFORM_PROVIDER_VERSION}/linux_amd64"
@@ -149,6 +172,23 @@ build() {
     ( cd "$SRC/crossplane" && CGO_ENABLED=0 go build -o "$BIN/crossplane" ./cmd/crossplane )
   fi
 
+  # Composition functions ship as xpkg images, which a nodeless plane cannot
+  # run, so they are built from their tags like crossplane core and supervised
+  # as processes. Both build with a plain `go build .` at the tag root.
+  local fn ver
+  for fn in function-go-templating function-auto-ready; do
+    case "$fn" in
+      function-go-templating) ver="${FUNCTION_GO_TEMPLATING_VERSION}" ;;
+      function-auto-ready)    ver="${FUNCTION_AUTO_READY_VERSION}" ;;
+    esac
+    if [ ! -x "$BIN/$fn" ]; then
+      say "building ${fn} v${ver} from source"
+      [ -d "$SRC/$fn" ] || git clone --quiet --depth 1 \
+        --branch "v${ver}" "https://github.com/crossplane-contrib/${fn}.git" "$SRC/$fn"
+      ( cd "$SRC/$fn" && CGO_ENABLED=0 go build -o "$BIN/$fn" . )
+    fi
+  done
+
   if [ ! -x "${PLUGIN_DIR}/terraform-provider-railway_v${TERRAFORM_PROVIDER_VERSION}" ]; then
     say "building patched terraform-provider-railway v${TERRAFORM_PROVIDER_VERSION}"
     # Upstream PR #93 is still open and no release (0.6.3 included) carries it,
@@ -184,6 +224,7 @@ EOF
   "$BIN/kube-apiserver" --version
   "$BIN/kubectl" version --client 2>/dev/null | head -1
   "$BIN/terraform" version | head -1
+  ls -l "$BIN/function-go-templating" "$BIN/function-auto-ready"
   ls -l "${PLUGIN_DIR}"
 }
 
@@ -273,6 +314,67 @@ gc_probe() {
   done
   "${k[@]}" delete ns gc-probe --wait=false >/dev/null 2>&1
   return 1
+}
+
+# wait_until SECONDS cmd...: poll once a second, true as soon as cmd succeeds.
+wait_until() {
+  local n="$1" t; shift
+  for t in $(seq 1 "$n"); do "$@" >/dev/null 2>&1 && return 0; sleep 1; done
+  return 1
+}
+
+# Round trip through hack/fixtures/functions-spike: a Composition whose
+# pipeline runs through both supervised functions must render a namespaced
+# Railway Project from an XR, and deleting the XR must remove it again. Runs
+# inside verify (it uses `check` and `fails`). Setup failures are failures, as
+# in gc_probe: each step that a dead API server could fake is asserted on its
+# own, and a failed setup step ends the probe instead of cascading.
+functions_probe() {
+  local k=("$BIN/kubectl" --kubeconfig "$KC") fx="${REPO}/hack/fixtures/functions-spike"
+  local ns=functions-spike xr=spike comp=xrailwayproject.harness.railway.crossplane.io
+  # Fully qualified resource names: the XRD's CRD may be seconds old when the
+  # probe runs and short names depend on a discovery cache.
+  local xrd=xrailwayprojects.harness.railway.crossplane.io xrk=xrailwayprojects.harness.railway.crossplane.io
+  local want msg
+  check "functions-spike XRD and Composition apply" "${k[@]}" apply -f "$fx/xrd.yaml" -f "$fx/composition.yaml" || return 0
+  check "XRD ${xrd} is Established" \
+    "${k[@]}" wait --for=condition=Established "compositeresourcedefinition.apiextensions.crossplane.io/${xrd}" --timeout=60s || return 0
+  # ValidPipeline is set by the revision controller only after every function
+  # in the pipeline has an active FunctionRevision advertising the composition
+  # capability; it is the proof that the hand-written registrations are read.
+  check "CompositionRevision of ${comp} reports ValidPipeline=True (functions advertise the composition capability)" \
+    wait_until 60 bash -c '"$1" --kubeconfig "$2" get compositionrevision -l "crossplane.io/composition-name=$3" \
+      -o jsonpath="{range .items[*]}{range .status.conditions[?(@.type==\"ValidPipeline\")]}{.status}{\"\n\"}{end}{end}" | grep -qx True' \
+    _ "$BIN/kubectl" "$KC" "$comp" || return 0
+  "${k[@]}" create ns "$ns" --dry-run=client -o yaml | "${k[@]}" apply -f - >/dev/null 2>&1
+  # A leftover XR from an interrupted run would make "rendered" trivially true.
+  "${k[@]}" -n "$ns" delete "$xrk" "$xr" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  wait_until 90 bash -c '! "$1" --kubeconfig "$2" -n "$3" get "$5" "$4" >/dev/null 2>&1' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$xrk" \
+    || { printf 'FAIL  a previous functions-spike XR could not be removed before the round trip\n'; fails=$((fails+1)); return 0; }
+  check "functions-spike XR applies" "${k[@]}" apply -f "$fx/xr.yaml" || return 0
+  want="$("${k[@]}" -n "$ns" get "$xrk" "$xr" -o jsonpath='{.spec.name}' 2>/dev/null)"
+  [ -n "$want" ] || { printf 'FAIL  XR %s has no spec.name to compare against\n' "$xr"; fails=$((fails+1)); return 0; }
+  check "composition pipeline rendered the Project through function-go-templating" \
+    wait_until 90 bash -c '"$1" --kubeconfig "$2" -n "$3" get project.railway.m.crossplane.io -l "crossplane.io/composite=$4" \
+      -o jsonpath="{range .items[*]}{.spec.forProvider.name}{\"\n\"}{end}" | grep -qxF "$5"' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$want"
+  if wait_until 60 bash -c '"$1" --kubeconfig "$2" -n "$3" get "$5" "$4" \
+      -o jsonpath="{.status.conditions[?(@.type==\"Ready\")].status}" | grep -qx True' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$xrk"; then
+    printf 'PASS  XR Ready (Project reconciled against Railway)\n'
+  else
+    msg="$("${k[@]}" -n "$ns" get project.railway.m.crossplane.io -l "crossplane.io/composite=$xr" \
+      -o jsonpath='{.items[0].status.conditions[?(@.type=="Synced")].message}' 2>/dev/null)"
+    if printf '%s' "$msg" | grep -qiE 'not authorized|401|authoriz|token'; then
+      printf 'SKIP  XR Ready (the provider cannot create the Project with this RAILWAY_TOKEN; expected with the fake token)\n'
+    else
+      printf 'FAIL  XR Ready (Project reconciled against Railway)\n'; fails=$((fails+1))
+      printf 'Project Synced condition: %s\n' "${msg:-<none yet>}" >&2
+    fi
+  fi
+  "${k[@]}" -n "$ns" delete "$xrk" "$xr" --wait=false >/dev/null 2>&1 || true
+  check "deleting the XR removes the composed Project" \
+    wait_until 90 bash -c '[ -z "$("$1" --kubeconfig "$2" -n "$3" get project.railway.m.crossplane.io -l "crossplane.io/composite=$4" -o name 2>/dev/null)" ] \
+      && ! "$1" --kubeconfig "$2" -n "$3" get "$5" "$4" >/dev/null 2>&1' _ "$BIN/kubectl" "$KC" "$ns" "$xr" "$xrk"
+  "${k[@]}" delete ns "$ns" --wait=false >/dev/null 2>&1 || true
 }
 
 verify() {
@@ -428,6 +530,10 @@ verify() {
       "! '$BIN/kubectl' --kubeconfig '$KC' -n '$ns' get secret railway-creds -o jsonpath='{.metadata.annotations}' | grep -q last-applied-configuration"
     check "ProviderConfig/default points at railway-creds" bash -c \
       "'$BIN/kubectl' --kubeconfig '$KC' get providerconfig.railway.crossplane.io default -o jsonpath='{.spec.credentials.secretRef.name}' | grep -qx railway-creds"
+    # Namespaced managed resources (the ones a Composition renders) default to
+    # ClusterProviderConfig/default in the .m. group; it must exist as well.
+    check "ClusterProviderConfig/default (railway.m.crossplane.io) points at railway-creds" bash -c \
+      "'$BIN/kubectl' --kubeconfig '$KC' get clusterproviderconfig.railway.m.crossplane.io default -o jsonpath='{.spec.credentials.secretRef.name}' | grep -qx railway-creds"
     check "RAILWAY_TOKEN value is on no process command line" bash -c '
       for f in /proc/[0-9]*/cmdline; do
         p=${f#/proc/}; p=${p%/cmdline}; [ "$p" = "$$" ] && continue
@@ -437,7 +543,7 @@ verify() {
     check "RAILWAY_TOKEN value appears in no log under CP_LOG_DIR (audit log included)" bash -c '
       ! grep -rqF -f <(printf "%s\n" "${RAILWAY_TOKEN}") "$1"' _ "${CP_LOG_DIR}"
   else
-    printf 'SKIP  railway-creds Secret, annotation, ProviderConfig, command-line, log and residual checks (RAILWAY_TOKEN unset for verify)\n'
+    printf 'SKIP  railway-creds Secret, annotation, ProviderConfig, ClusterProviderConfig, command-line, log and residual checks (RAILWAY_TOKEN unset for verify)\n'
   fi
 
   # B5: quota on etcd, snapshots on the volume, GOMEMLIMIT on every Go process.
@@ -447,17 +553,19 @@ verify() {
   check "etcd has no alarm raised" bash -c "$(declare -f ectl); BIN='$BIN'"'
     out=$(ectl alarm list) || exit 1; [ -z "$out" ]'
   if [ -n "${CP_MEMORY_LIMIT_BYTES:-}" ]; then
-    # Same table as gomemlimit_share in the supervisor; the sum must stay under the limit.
+    # Same table as gomemlimit_share in the supervisor (each enabled composition
+    # function gets 3); the sum must stay under the limit.
     check "GOMEMLIMIT on every Go component is its share of CP_MEMORY_LIMIT_BYTES (sum under the limit)" bash -c '
-      limit=$2; sum=0
-      for spec in kube-apiserver=35 etcd=15 provider=15 kube-controller-manager=10 crossplane=10; do
+      limit=$2; sum=0; fns=""
+      for n in $3; do fns="$fns $n=3"; done
+      for spec in kube-apiserver=35 etcd=15 provider=15 kube-controller-manager=10 crossplane=10 $fns; do
         n=${spec%=*}; pct=${spec#*=}
         p=$(pgrep -f "^$1/bin/$n " | head -1); [ -n "$p" ] || { echo "no $n" >&2; exit 1; }
         want="GOMEMLIMIT=$(( limit * pct / 100 / 1048576 ))MiB"
         tr "\0" "\n" < "/proc/$p/environ" | grep -qx "$want" || { echo "$n lacks $want" >&2; exit 1; }
         sum=$(( sum + limit * pct / 100 ))
       done
-      [ "$sum" -lt "$limit" ]' _ "${NATIVE_WORK}" "${CP_MEMORY_LIMIT_BYTES}"
+      [ "$sum" -lt "$limit" ]' _ "${NATIVE_WORK}" "${CP_MEMORY_LIMIT_BYTES}" "$(functions_list)"
   else
     printf 'SKIP  GOMEMLIMIT check (CP_MEMORY_LIMIT_BYTES empty: cgroup detection mode)\n'
   fi
@@ -533,9 +641,62 @@ verify() {
   check "garbage collector collects orphaned children" bash -c "$(declare -f gc_probe); \
     KUBECTL='$BIN/kubectl' KC='$KC' gc_probe"
 
+  # Phase 3: composition functions as supervised processes. Each function is a
+  # gRPC server on loopback behind mTLS: its serving certificate is issued by
+  # the supervisor under Crossplane's root CA (never the cluster CA), Crossplane
+  # dials it with the client identity from crossplane-tls-client, and a paused
+  # FunctionRevision with a hand-written status points the pipeline at the
+  # loopback endpoint. Function servers enforce ALPN h2, so every TLS probe
+  # offers it; refusals are asserted by the alert text, never by a timeout.
+  local run_dir="${CP_RUN_DIR:-${HOME_DIR}/run}" root_ca="${CP_RUN_DIR:-${HOME_DIR}/run}/tls/root-ca/tls.crt"
+  mtls_refused() {   # mtls_refused HOST:PORT [openssl identity flags...]: refused by a TLS alert (never a timeout, exit 124)
+    local target="$1"; shift
+    local out rc
+    out="$(timeout 10 openssl s_client -alpn h2 -connect "$target" -CAfile "${root_ca}" -ign_eof "$@" 2>&1 </dev/null)"; rc=$?
+    [ "$rc" -ne 124 ] && printf '%s' "$out" | grep -q 'SSL alert number'
+  }
+  local fn port idx=0
+  [ -n "$(functions_list)" ] || printf 'SKIP  composition function checks and the functions-spike round trip (CP_FUNCTIONS set empty: functions disabled)\n'
+  for fn in $(functions_list); do
+    port="$(function_port "$idx")"; idx=$((idx+1))
+    check "${fn} runs from \$BIN with --address 127.0.0.1:${port}" bash -c '
+      p=$(pgrep -f "^$1/bin/$2 " | head -1); [ -n "$p" ] || exit 1
+      c=$(tr "\0" "\n" < "/proc/$p/cmdline")
+      printf "%s\n" "$c" | grep -qx -- "--address=127.0.0.1:$3" \
+        || printf "%s\n" "$c" | grep -A1 -x -- --address | grep -qx "127.0.0.1:$3"' _ "${NATIVE_WORK}" "$fn" "$port"
+    check "${fn} serving certificate verifies against Crossplane's root CA, not the cluster CA, and names IP 127.0.0.1" bash -c '
+      c="$1/tls/functions/$2/tls.crt"; test -s "$c" || exit 1
+      openssl verify -CAfile "$3" "$c" >/dev/null 2>&1 \
+        && ! openssl verify -CAfile "$4/ca.crt" "$c" >/dev/null 2>&1 \
+        && openssl x509 -noout -ext subjectAltName -in "$c" | grep -q "IP Address:127.0.0.1"' _ "$run_dir" "$fn" "$root_ca" "$pki"
+    # TLS 1.3 reports "Verify return code: 0 (ok)" before the server has seen
+    # the client certificate, so the chain check alone would pass without one;
+    # with -ign_eof the refusal then shows as a post-handshake alert. Required:
+    # the chain verifies, ALPN settled on h2, no alert arrived, and the server
+    # sent its HTTP/2 SETTINGS frame (type 0x04 on stream 0), which only
+    # happens once mTLS completed.
+    check "${fn} completes an mTLS handshake (ALPN h2, no alert) with Crossplane's own client identity and answers with an HTTP/2 SETTINGS frame" bash -c '
+      f=$(mktemp); timeout 5 openssl s_client -alpn h2 -connect "127.0.0.1:$3" -CAfile "$2" -cert "$1/tls/client/tls.crt" -key "$1/tls/client/tls.key" -ign_eof </dev/null >"$f" 2>&1
+      grep -aq "Verify return code: 0 (ok)" "$f" && grep -aq "ALPN protocol: h2" "$f" && ! grep -aq "SSL alert number" "$f" \
+        && od -An -tx1 "$f" | tr -d " \n" | grep -qE "0000[0-9a-f]{2}0400000000"; rc=$?
+      rm -f "$f"; exit $rc' _ "$run_dir" "$root_ca" "$port"
+    check "${fn} refuses a TLS client without a certificate (TLS alert)" bash -c "root_ca='$root_ca'; $(declare -f mtls_refused)"'
+      mtls_refused "127.0.0.1:$1"' _ "$port"
+    check "${fn} refuses a client certificate from the cluster CA, admin-internal (TLS alert)" bash -c "root_ca='$root_ca'; $(declare -f mtls_refused)"'
+      [ -r "$2/admin-internal.key" ] && mtls_refused "127.0.0.1:$1" -cert "$2/admin-internal.crt" -key "$2/admin-internal.key"' _ "$port" "$pki"
+    check "Function/${fn} exists" "${k[@]}" get function.pkg.crossplane.io "$fn"
+    check "FunctionRevision/${fn}-local is Active, paused, endpoint 127.0.0.1:${port}, capability composition" bash -c '
+      set -- $("$1" --kubeconfig "$2" get functionrevision.pkg.crossplane.io "$3-local" \
+        -o go-template="{{.spec.desiredState}} {{index .metadata.annotations \"crossplane.io/paused\"}} {{.status.endpoint}} {{range .status.capabilities}}{{.}},{{end}}") "$4" || exit 1
+      [ "$1" = Active ] && [ "$2" = true ] && [ "$3" = "127.0.0.1:$5" ] && case ",$4" in *,composition,*) exit 0;; esac; exit 1' \
+      _ "$BIN/kubectl" "$KC" "$fn" "$port"
+  done
+  [ -z "$(functions_list)" ] || functions_probe
+
   say "cluster contents"
   "${k[@]}" get crd -o name | wc -l | xargs printf 'CRDs: %s\n'
   "${k[@]}" get providerconfig.railway.crossplane.io 2>&1 | head -3 || true
+  "${k[@]}" get functionrevision.pkg.crossplane.io 2>&1 | head -4 || true
 
   [ "$fails" -eq 0 ] || { echo "$fails check(s) failed" >&2; return 1; }
   say "all checks passed"

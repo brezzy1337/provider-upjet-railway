@@ -1,0 +1,28 @@
+# Harness fixture for hack/native-cluster.sh verify (Phase 3, item 1). Not a
+# product API: a throwaway namespaced XRD whose only field is the Project name.
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: xrailwayprojects.harness.railway.crossplane.io
+spec:
+  scope: Namespaced
+  group: harness.railway.crossplane.io
+  names:
+    kind: XRailwayProject
+    plural: xrailwayprojects
+  versions:
+  - name: v1alpha1
+    served: true
+    referenceable: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              name:
+                type: string
+                description: Name of the Railway project the composition renders.
+            required:
+            - name

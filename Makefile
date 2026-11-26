@@ -60,6 +60,9 @@ CRDDIFF_VERSION = v0.12.1
 CROSSPLANE_CLI_VERSION = v2.2.1
 # for e2e testing
 CROSSPLANE_VERSION = 2.2.1
+# composition functions built into the control-plane image (cluster/images/control-plane)
+FUNCTION_GO_TEMPLATING_VERSION = 0.13.3
+FUNCTION_AUTO_READY_VERSION = 0.7.4
 -include build/makelib/k8s_tools.mk
 
 # ====================================================================================

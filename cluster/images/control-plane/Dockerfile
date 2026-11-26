@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # ==============================================================================
 # Nodeless Crossplane control plane: etcd + kube-apiserver + Crossplane core +
-# provider-upjet-railway, supervised in one container.
+# composition functions + provider-upjet-railway, supervised in one container.
 #
 # FULLY SELF-CONTAINED. The build context is nothing but this git tree, and
 # every binary is compiled or fetched inside the image, so Railway (or any
@@ -17,13 +17,17 @@
 # docs/architecture/control-plane-image.md.
 # ==============================================================================
 
-ARG GO_VERSION=1.26.7
+# 1.26.11: the two composition functions below declare `go 1.26.11` in their
+# go.mod, and GOTOOLCHAIN=local refuses to download a newer toolchain.
+ARG GO_VERSION=1.26.11
 ARG ALPINE_VERSION=3.23.4
 
 # Pins. Keep in sync with hack/native-cluster.sh and the repo Makefile.
 ARG KUBERNETES_VERSION=v1.35.8
 ARG ETCD_VERSION=v3.6.14
 ARG CROSSPLANE_VERSION=2.2.1
+ARG FUNCTION_GO_TEMPLATING_VERSION=0.13.3
+ARG FUNCTION_AUTO_READY_VERSION=0.7.4
 ARG TERRAFORM_VERSION=1.5.7
 ARG TERRAFORM_PROVIDER_SOURCE=terraform-community-providers/railway
 ARG TERRAFORM_PROVIDER_VERSION=0.6.2
@@ -90,6 +94,32 @@ RUN mkdir -p /out/crds /out/webhookconfigurations \
     && cp -r /src/cluster/webhookconfigurations/. /out/webhookconfigurations/
 
 # ==============================================================================
+# Stage: functions-build -- composition functions from source
+#
+# Composition functions are distributed as xpkg images that Crossplane's
+# package manager would run as Deployments. This plane has no nodes, so it
+# cannot run them that way; like Crossplane core they are built from their
+# tags and run as supervised processes (control-plane.sh, start_functions),
+# registered by hand with a paused Function + FunctionRevision. Each is a
+# plain `go build` at the root of its module.
+# ==============================================================================
+FROM golang:${GO_VERSION}-alpine AS functions-build
+ARG TARGETOS
+ARG TARGETARCH
+ARG FUNCTION_GO_TEMPLATING_VERSION
+ARG FUNCTION_AUTO_READY_VERSION
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
+RUN apk add --no-cache git
+RUN git clone --quiet --depth 1 --branch "v${FUNCTION_GO_TEMPLATING_VERSION}" \
+      https://github.com/crossplane-contrib/function-go-templating.git /src/function-go-templating \
+    && git clone --quiet --depth 1 --branch "v${FUNCTION_AUTO_READY_VERSION}" \
+      https://github.com/crossplane-contrib/function-auto-ready.git /src/function-auto-ready
+WORKDIR /src/function-go-templating
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/function-go-templating .
+WORKDIR /src/function-auto-ready
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/function-auto-ready .
+
+# ==============================================================================
 # Stage: tfprovider-build -- patched terraform-provider-railway
 #
 # Upstream PR #93 (remove resources from state on not-found) is still open; the
@@ -152,9 +182,13 @@ COPY cluster/images/provider-upjet-railway/terraformrc.hcl ${TF_CLI_CONFIG_FILE}
 COPY --from=tfprovider-build /out/ ${PLUGIN_DIR}/
 
 # ---- binaries ---------------------------------------------------------------
+# Composition functions land beside the rest as function-go-templating and
+# function-auto-ready: the supervisor finds each CP_FUNCTIONS entry by name
+# under CP_BIN_DIR.
 COPY --from=fetch             /out/           /usr/local/bin/
 COPY --from=crossplane-build  /out/crossplane /usr/local/bin/crossplane
 COPY --from=provider-build    /out/provider   /usr/local/bin/provider
+COPY --from=functions-build   /out/           /usr/local/bin/
 COPY cluster/images/control-plane/control-plane.sh /usr/local/bin/control-plane.sh
 
 # ---- CRDs to install at boot ------------------------------------------------
@@ -186,6 +220,8 @@ RUN mkdir -p ${CP_HOME}/log ${CP_HOME}/run ${CP_HOME}/cache ${CP_HOME}/tf ${CP_S
 # 6443 kube-apiserver (put a Railway *TCP* proxy in front: HTTP domains
 #      terminate TLS at the edge and this API server serves its own TLS).
 # 8080 crossplane core metrics, 8081 crossplane core health, 8090 provider metrics.
+# The composition functions (CP_FUNCTION_PORT_BASE, 9450 and up) listen on
+# loopback only, for Crossplane core in this same container; not exposed.
 EXPOSE 6443 8080 8081 8090
 
 ENTRYPOINT ["/usr/local/bin/control-plane.sh"]
