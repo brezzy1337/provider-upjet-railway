@@ -2,7 +2,7 @@
 
 This provider is one part of a larger system. The goal is a **Crossplane control plane that runs on
 Railway** and provisions Kubernetes clusters on DigitalOcean, AWS and GCP. A user applies a
-cloud-agnostic `KubernetesCluster` claim; a Composition picks the DOKS, EKS or GKE implementation; the
+cloud-agnostic `KubernetesCluster` object (a namespaced Crossplane 2.x composite resource); a Composition picks the DOKS, EKS or GKE implementation; the
 new cluster's kubeconfig comes back as a Crossplane connection secret. The workloads those clusters
 exist for are [Hermes](https://hermes-agent.nousresearch.com) AI agent instances (one long-running
 gateway process per agent, persistent volume, a model-provider key and channel tokens as Secrets,

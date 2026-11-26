@@ -91,13 +91,16 @@ Decided 2026-11-26. In order:
    Secret, and from that Secret a per-cluster `ProviderConfig` for provider-kubernetes and
    provider-helm, which also join the plane as supervised processes. Check the DigitalOcean
    provider's maintenance status first; it is a hand-written native provider, not an Upjet one.
-3. **The `Workload` XRD with presets.** One claim-able, namespaced kind instead of a `HermesAgent`
-   XRD: `spec.clusterRef` names the `KubernetesCluster`, `spec.preset` picks a Composition
-   (selected by label, or by a function branching on the field), and the schema enforces one block
-   per preset with CEL rules. Every preset renders to the same two kinds, provider-helm's `Release`
+3. **The `Workload` XRD with presets.** One namespaced composite resource (Crossplane 2.x: used
+   directly, no claim) instead of a `HermesAgent` XRD: `spec.clusterRef` names the
+   `KubernetesCluster`, `spec.preset` picks a Composition (by label through
+   `spec.crossplane.compositionSelector`, or by a function branching on the field), and the schema
+   enforces one block per preset with CEL validation rules. Every preset renders to the same two kinds, provider-helm's `Release`
    and provider-kubernetes's `Object`, so a new preset is a new Composition, not an API change.
    - `hermes`, first: model-provider key, channel tokens, volume size, replicas; renders a
-     Deployment, a PersistentVolumeClaim at `/opt/data`, a Service on 8642 and an Ingress.
+     Deployment, a PersistentVolumeClaim, a Service and an Ingress (the mount path `/opt/data`, the
+     port 8642 and the image come from the Hermes Docker guidance and are confirmed in the preset
+     spike, not before).
    - `helm`, custom: chart repository, name, version, values; one `Release`.
    - `manifests`, custom: a list of Kubernetes objects inline or by Git or OCI reference; one
      `Object` per manifest.
@@ -108,6 +111,7 @@ Decided 2026-11-26. In order:
      operator.
    - Optional later: a thin `HermesAgent` XRD that composes a `Workload` with `preset: hermes`, so
      both front doors exist on one implementation.
+   The same model applies to `KubernetesCluster`: a namespaced composite resource, no claim.
 4. **The endpoint written back** to the application's Railway service as a `Variable` through this
    provider, closing the loop described in the [Introduction](architecture/introduction.md).
 5. **EKS and GKE** as additional `KubernetesCluster` Composition variants using the Upjet family

@@ -32,7 +32,7 @@ flowchart LR
     rwapi["Railway GraphQL API"]
     subgraph do["DigitalOcean (Phase 3)"]
         doks["DOKS cluster"]
-        hermes["Workload: Hermes preset, or a custom chart or manifests<br/>Deployment, PVC, Service"]
+        hermes["Workload: Hermes preset, or a custom chart or manifests<br/>Deployment, PVC, Service, Ingress"]
         doks --- hermes
     end
     app -- "1. kubectl / client-go over the TCP proxy" --> api
@@ -46,14 +46,15 @@ flowchart LR
    as a sealed variable, and speaks to the API server over HTTPS through the Railway TCP proxy. It
    uses `kubectl`, `client-go` or any Kubernetes client. Railway's own API plays no part in this
    step; Railway hosts both ends.
-2. **A `KubernetesCluster` claim** (Phase 3, planned) names a provider, a region and a node size.
+2. **A `KubernetesCluster` object** (Phase 3, planned; a namespaced Crossplane composite resource,
+   used directly, no claim) names a provider, a region and a node size.
    Crossplane matches it to a Composition, the Composition drives the DigitalOcean provider, and the
    new cluster's kubeconfig comes back as a Crossplane connection Secret inside the control plane.
-3. **A `Workload` claim** (Phase 3, after the cluster XRD, planned) names that cluster and a preset:
-   `hermes` for an agent with its own tight schema, or `helm` and `manifests` for anything else.
-   The preset's Composition uses provider-kubernetes or provider-helm with the connection Secret to
-   apply the Deployment, PersistentVolumeClaim and Service, or the chart or manifests, inside the
-   cluster. Nothing in this step goes through Railway. The [roadmap](../roadmap.md#phase-3-first-cloud-and-the-workload-catalogue-next)
+3. **A `Workload` object** (Phase 3, after the cluster XRD, planned) names that cluster and a
+   preset: `hermes` for an agent with its own tight schema, or `helm` and `manifests` for anything
+   else. The preset's Composition uses provider-kubernetes or provider-helm with the connection
+   Secret to apply the Deployment, PersistentVolumeClaim, Service and Ingress, or the chart or
+   manifests, inside the cluster. Nothing in this step goes through Railway. The [roadmap](../roadmap.md#phase-3-first-cloud-and-the-workload-catalogue-next)
    has the preset catalogue and the guardrails for the custom presets.
 4. **The agent answers on the cluster's ingress**, and the application calls it there.
 
