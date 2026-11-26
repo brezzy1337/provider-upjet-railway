@@ -114,12 +114,20 @@ Decided 2026-11-26. In order:
    The same model applies to `KubernetesCluster`: a namespaced composite resource, no claim.
 4. **The endpoint written back** to the application's Railway service as a `Variable` through this
    provider, closing the loop described in the [Introduction](architecture/introduction.md).
-5. **EKS and GKE** as additional `KubernetesCluster` Composition variants using the Upjet family
-   providers, once DigitalOcean works end to end.
 
 Done when a `Workload` with `preset: hermes` on a provisioned DOKS cluster answers on the cluster's
 ingress, and a `helm` or `manifests` workload lands beside it. The per-platform Railway templates
-follow this phase (see Phase 2).
+follow this phase (see Phase 2). The work is kicked off from the handoff
+`.claude/handoff/phase-3-functions-spike.md`.
+
+### Phase 4: more clouds
+
+Decided 2026-11-26 to keep out of Phase 3: **EKS and GKE** as additional `KubernetesCluster`
+Composition variants using the Upjet family providers (`provider-aws-eks`, `provider-aws-ec2`,
+`provider-aws-iam`; `provider-gcp-container`, `provider-gcp-compute`), each with its own credentials
+wired the way the Railway token is. The AWS family alone brings hundreds of CRDs and the 2 to 4 GB
+memory budget the Architecture page names, so this waits until the DigitalOcean path works end to
+end and the `Workload` catalogue is in use.
 
 ## Provider backlog
 
