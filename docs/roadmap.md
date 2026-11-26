@@ -125,9 +125,9 @@ follow this phase (see Phase 2). The work is kicked off from the handoff
 Decided 2026-11-26 to keep out of Phase 3: **EKS and GKE** as additional `KubernetesCluster`
 Composition variants using the Upjet family providers (`provider-aws-eks`, `provider-aws-ec2`,
 `provider-aws-iam`; `provider-gcp-container`, `provider-gcp-compute`), each with its own credentials
-wired the way the Railway token is. The AWS family alone brings hundreds of CRDs and the 2 to 4 GB
-memory budget the Architecture page names, so this waits until the DigitalOcean path works end to
-end and the `Workload` catalogue is in use.
+wired the way the Railway token is. The AWS family providers add a large CRD set to the API server
+and the 2 to 4 GB memory budget the Architecture page names, so this waits until the DigitalOcean
+path works end to end and the `Workload` catalogue is in use.
 
 ## Provider backlog
 

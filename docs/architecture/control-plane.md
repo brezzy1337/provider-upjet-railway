@@ -80,7 +80,8 @@ Lessons that changed the design, in brief (the full list is in
 See the [roadmap](../roadmap.md). Phase 1 is done ([Phase 1 review](../reports/phase-1-review.md)); Phase 2's
 hardening, every finding of that review, is done ([Phase 2 review](../reports/phase-2-review.md)) and the plane
 has run on Railway since 2026-11-25 with the smoke test passed over the internet
-([runbook](../getting-started/deploy-to-railway.md)); Phase 3 adds DigitalOcean, then EKS and GKE.
+([runbook](../getting-started/deploy-to-railway.md)); Phase 3 adds DigitalOcean and the `Workload`
+catalogue; EKS and GKE follow in Phase 4.
 
 ## The state root
 

@@ -34,13 +34,16 @@ Context (verify before relying on it):
   variables and a fake token such as `fake_token-for-b4-test`) is the only local test; pass
   `CP_ENCRYPTION_KEY` and `RAILWAY_TOKEN` to it from files inside a script, never in the Bash
   command line, because its `verify` scans every process command line for the token. A cold start
-  takes 40 to 55 s here, a restart 25 s. The Railway build takes under 3 min cold, about 70 s warm;
+  took 40 s on 2026-11-25 (recorded) and up to 55 s earlier the same day, a restart 25 s (both
+  session observations, not in a report). The Railway build takes under 3 min cold, about 70 s warm;
   deploy a committed tree with `railway up --service control-plane --detach --json` and read the
   boot log with `railway logs -d -n 400 <deployment id>`; deployment status `SUCCESS` means the
   container started, not that the plane is up.
-- Process: `/code-todo` does not exist in this project yet; author it first with the
-  `subagent-code-todo` skill (it builds on `subagent-orchestration` and the existing `/ship`
-  pipeline and agents in `.claude/agents/`), then kick off the todo below with it. Branch per
+- Process: `/code-todo` does not exist in this project yet (`.claude/commands/` holds only
+  `ship.md`); author it first with the `subagent-code-todo` skill, which builds on
+  `subagent-orchestration` and the existing `/ship` pipeline and agents in `.claude/agents/`
+  (verify both skill names in the session's skill list; they are not in the repo), then kick off the
+  todo below with it. Branch per
   change; native harness before any PR when `cluster/` or `hack/` change; ship through `/ship`
   (preflight, PR, five-lens review, merge; both human gates need an explicit yes); Slack updates go
   to #railway-upjet-provider; when waiting on CI filter `gh run list --workflow CI` by the head SHA.
@@ -52,20 +55,24 @@ Context (verify before relying on it):
 The todo, Phase 3 item 1 (done when a Composition that uses a function composes an object on the
 live plane):
 1. Pick the function and build it from source into the image like Crossplane core is
-   (`function-go-templating` for rendering and branching, `function-auto-ready` for readiness;
-   functions are shipped as xpkg images, so the binary comes from `go build` at a pinned tag, with
-   the pin as a Dockerfile ARG and in `hack/native-cluster.sh` the same way the other pins are).
-   No BuildKit cache mounts, no `VOLUME` (Railway's validator).
-2. Supervise it: start each function as another process after Crossplane core is ready, with a
-   serving certificate the supervisor issues and signs with Crossplane's root CA (the
-   `crossplane-root-ca` Secret that `crossplane core init` creates; the supervisor already reads
-   Crossplane's TLS Secret for the client side), listening on loopback; give it a `GOMEMLIMIT`
+   (`function-go-templating` for rendering and branching, `function-auto-ready` for readiness; the
+   roadmap also allows `function-kcl`). Functions are distributed as xpkg images, so the working
+   assumption is a `go build` at a pinned tag, with the pin as a Dockerfile ARG and in
+   `hack/native-cluster.sh` the same way the other pins are; confirm the build works before relying
+   on it. No BuildKit cache mounts, no `VOLUME` (Railway's validator rejects both, verified).
+2. Supervise it (plan, to be confirmed against Crossplane 2.2.1): start each function as another
+   process after Crossplane core is ready, with a serving certificate the supervisor issues and
+   signs with Crossplane's root CA (the `crossplane-root-ca` Secret that `crossplane core init`
+   creates; the supervisor already reads Crossplane's TLS Secret for the client side), listening on
+   loopback; give it a `GOMEMLIMIT`
    share (add it to `GOMEMLIMIT_COMPONENTS`, keep the total at or under 100); stop it in the same
    shutdown order as the others.
-3. Register it: with `--package-runtime=External` the package manager will not create a
-   Deployment, so write the `Function` object and make its `FunctionRevision` report the loopback
-   endpoint the way the Phase 1 notes describe ("endpoint written by hand"); confirm what Crossplane
-   2.2.1 expects by reading its source for the External runtime rather than assuming.
+3. Register it (plan, to be confirmed): with `--package-runtime=External` the package manager will
+   not create a Deployment (verified in the supervisor); the Phase 1 notes' probable fix is to write
+   the `Function` object and set its `FunctionRevision` `status.endpoint` to the loopback address by
+   hand (roadmap Phase 3, item 1; `.claude/handoff/railway-control-plane-handoff.md`), untested;
+   confirm what Crossplane 2.2.1 expects by reading its source for the External runtime rather than
+   assuming.
 4. Prove it: a throwaway XRD (for example `XRailwayProject`, namespaced, Crossplane 2.x, no claim)
    whose Composition is a pipeline using the function to render one Railway `Project`; apply an XR
    on the native harness, see the `Project` created and `Ready`, delete the XR, see it gone. Add
