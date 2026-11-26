@@ -33,11 +33,13 @@ processes:
 | `kube-apiserver`          | The API, serving its own TLS end-to-end                              |
 | `kube-controller-manager` | Only node-independent controllers: garbage collector, namespace, service accounts, resource quota, TTL |
 | `crossplane core`         | XRDs and Compositions, started with `--package-runtime=External`    |
+| Composition functions     | `function-go-templating` and `function-auto-ready`, gRPC servers on loopback behind mTLS from Crossplane's root CA, started after `crossplane core` so that Crossplane owns metrics port 8080 (see [Composition functions](#composition-functions)) |
 | Providers                 | This one and, later, the cloud providers, each a binary plus its CRDs applied at boot |
 
 There are no kubelets and no scheduler because nothing here runs pods: providers reconcile objects
-straight into cloud APIs. That is also why providers run as processes rather than Crossplane packages.
-The package manager would create Deployments that could never schedule.
+straight into cloud APIs. That is also why providers and composition functions run as processes
+rather than Crossplane packages. The package manager would create Deployments that could never
+schedule.
 
 **Exposure.** Railway HTTP domains terminate TLS at the edge, so the API server sits behind a Railway
 TCP proxy on 6443 with the proxy hostname in its serving certificate; the supervisor reads the
@@ -70,8 +72,14 @@ Lessons that changed the design, in brief (the full list is in
 * `crossplane core start` needs a client certificate directory even when no Functions run.
 * Webhooks are off, which disables the Usage protection controllers. A hand-written EndpointSlice
   pointing at the container's own IP is the probable fix, untested.
-* Compositions need a Function, which is a gRPC server with mTLS; it will run as another supervised
-  process with a certificate signed by Crossplane's root CA.
+* Compositions need a Function, which is a gRPC server with mTLS. Done in Phase 3: two functions run
+  as supervised processes with certificates signed by Crossplane's root CA, registered by hand
+  because the External runtime registers nothing (see [Composition functions](#composition-functions)).
+* function-sdk-go (v0.7.1) starts a metrics server on `:8080` in every function, with no flag or
+  variable to move or disable it, and ignores a failed bind; Crossplane core's metrics default to
+  8080 too, and it refuses to start when the port is taken. So the functions start after
+  `crossplane core start`, never before: the first Railway deploy with the opposite order
+  crash-looped (see [Composition functions](#composition-functions)).
 * Railway containers are dual-stack and `hostname -i` returns IPv6 first; the supervisor prefers IPv4.
 * A separate front-proxy CA is required or kube-controller-manager logs errors forever.
 
@@ -80,8 +88,10 @@ Lessons that changed the design, in brief (the full list is in
 See the [roadmap](../roadmap.md). Phase 1 is done ([Phase 1 review](../reports/phase-1-review.md)); Phase 2's
 hardening, every finding of that review, is done ([Phase 2 review](../reports/phase-2-review.md)) and the plane
 has run on Railway since 2026-11-25 with the smoke test passed over the internet
-([runbook](../getting-started/deploy-to-railway.md)); Phase 3 adds DigitalOcean and the `Workload`
-catalogue; EKS and GKE follow in Phase 4.
+([runbook](../getting-started/deploy-to-railway.md)); Phase 3 is under way: its first item,
+composition functions as supervised processes, is done on the harness and on Railway (2026-11-26,
+[report](../reports/2026-11-26.md): a Composition composed a `Project` on the live plane over the
+internet), and DigitalOcean and the `Workload` catalogue follow; EKS and GKE follow in Phase 4.
 
 ## The state root
 
@@ -221,6 +231,131 @@ provider from etcd. That separation needs the uid split proper: per-component ow
 files and the etcd data directory, a PKI directory the provider cannot traverse, and a reduced RBAC
 identity for the provider in place of `system:masters`.
 
+## Composition functions
+
+Every Composition in Crossplane 2.x is a pipeline of functions, and a function is a gRPC server that
+Crossplane dials over mTLS. The package manager runs functions as Deployments, which nothing here
+could schedule, so they run the way the provider does: as supervised processes (Phase 3, item 1,
+done 2026-11-26 on the harness and on Railway; the [2026-11-26 report](../reports/2026-11-26.md) has
+both runs). Two are built into the image from their GitHub tags, `function-go-templating`
+v0.13.3 and `function-auto-ready` v0.7.4, pinned in the Dockerfile `ARG`s
+`FUNCTION_GO_TEMPLATING_VERSION` and `FUNCTION_AUTO_READY_VERSION` and in the Makefile, which the
+harness reads. Both modules require Go 1.26.11, which moved the image's Go pin (see [The
+control-plane image](control-plane-image.md#keeping-the-dockerfile-portable)).
+
+**Processes and ports.** `CP_FUNCTIONS` (default `function-go-templating function-auto-ready`)
+names the functions, each a binary of that name under `CP_BIN_DIR`; the first listens on
+`127.0.0.1:CP_FUNCTION_PORT_BASE` (default 9450; the harness uses 19450), the next on the port
+after. Loopback only: the only caller is Crossplane core in the same container, and the SDK's own
+metrics listener never binds (see **Order and drain** below). A name must be a
+DNS label, since it becomes an object name and a certificate CN. `CP_FUNCTIONS=` (set empty)
+disables functions: nothing is started or registered, and the boot log says so.
+
+**The certificate chain.** Crossplane dials a function with the client certificate `crossplane core
+init` wrote to Secret `crossplane-tls-client`, verifies the function's serving certificate against
+the root CA in Secret `crossplane-root-ca` (keys `tls.crt`, `tls.key`) with ordinary hostname
+verification, and the function verifies Crossplane's certificate against the same root CA. So the
+supervisor unpacks the root CA to the ephemeral `run/tls/root-ca/` and, every boot, issues each
+function a serving certificate signed by it: CN the function's name, SANs `localhost`, the name,
+`127.0.0.1` and `::1` (the IP SAN is the one Crossplane checks), EKU `serverAuth`, valid
+`CP_INTERNAL_CERT_DAYS`, written under `run/tls/functions/<name>/` beside a `ca.crt` that is the
+root CA certificate. The cluster CA signs nothing here, and the harness checks that the serving
+certificate verifies against the root CA and not against the cluster CA. The root CA key is
+Crossplane's, borrowed for the length of a boot and never written to the volume. The hourly
+watchdog covers the functions' certificates like the others.
+
+**Readiness.** A function is ready when `openssl s_client -alpn h2`, presenting Crossplane's own
+client certificate, reports `Verify return code: 0 (ok)` and `ALPN protocol: h2` and no `SSL alert`.
+The verify line alone is not enough: under TLS 1.3 the handshake completes before the server has
+seen the client certificate, so a rejected one arrives as an alert afterwards; and the gRPC server
+refuses anything but h2. On the harness both functions were ready 1 s after start. The harness
+adds two negative controls, no client certificate and a certificate from the cluster CA
+(`admin-internal`), each refused with a TLS alert, and on the positive control also requires the
+server's HTTP/2 SETTINGS frame, which only arrives once mTLS completed.
+
+**What the External runtime needs**, read from Crossplane 2.2.1's source
+(`internal/xfn/function_runner.go`, `internal/xfn/capabilities.go`,
+`internal/controller/pkg/revision/reconciler.go`,
+`internal/controller/apiextensions/composite/reconciler.go`), three lessons:
+
+* The function runner finds the process to dial by listing `FunctionRevision`s labelled
+  `pkg.crossplane.io/package=<name>` with `spec.desiredState: Active` and dialling
+  `status.endpoint`, with mTLS and ordinary hostname verification (hence the `127.0.0.1` IP SAN).
+* The composite reconciler refuses to compose until the `CompositionRevision` reports
+  `ValidPipeline=True`, which the capability checker grants only when every active
+  `FunctionRevision` of the pipeline carries `status.capabilities` containing `composition`.
+* Under `--package-runtime=External` nothing writes either field; only the Deployment runtime's
+  hooks do, through a Service. So the supervisor writes them.
+
+**Registration and its limits.** Once the functions are ready (step 6, after `crossplane core
+start`; see **Order and drain**), the supervisor applies, with server-side apply so a reboot re-asserts the same objects, a
+`Function/<name>` and a `FunctionRevision/<name>-local` (label `pkg.crossplane.io/package=<name>`,
+`desiredState: Active`, `revision: 1`), then patches `status.endpoint` (`127.0.0.1:<port>`) and
+`status.capabilities` (`[composition]`) through the status subresource. The `Function` CRD's CEL
+rule requires `spec.package` to look like `registry/repository:tag` (a first attempt with
+`local://<name>` was refused at boot), so both objects carry the placeholder
+`supervised.local/control-plane/<name>:process`, as `spec.package` and as `spec.image`; nothing
+resolves it. Both carry `crossplane.io/paused: "true"`, so the package manager's reconcilers only
+set a `ReconcilePaused` condition and never fetch the placeholder image or recompute the status.
+Three limits to be plain about. `kubectl get functions` shows them without `INSTALLED` or `HEALTHY`,
+because the reconcilers that set those columns are paused. Removing a name from `CP_FUNCTIONS`
+leaves its two objects behind: there is no owner reference and nothing garbage-collects them, so an
+operator deletes them by hand. And a Composition refers to a function by this name
+(`functionRef.name`), so the names in `CP_FUNCTIONS` are part of the plane's API.
+
+**Order and drain.** The boot order is etcd, kube-apiserver, kube-controller-manager, CRDs,
+`crossplane core start`, the functions, the provider: the functions are step 6, after Crossplane
+core (step 5), and deliberately not before it. function-sdk-go v0.7.1 (`Serve` in `sdk.go`) starts a
+Prometheus metrics server on `DefaultMetricsAddress = ":8080"` in every function, on all interfaces,
+with no flag or environment variable in either function's CLI to move or disable it, and it ignores
+a failed bind (`_ = metricsServer.ListenAndServe() // Ignore errors`). Crossplane core's metrics
+port defaults to 8080 as well, and Crossplane refuses to start when the port is taken. The first
+Railway deploy of the functions started them first and crash-looped: `crossplane core start` failed
+with `failed to start metrics server: failed to create listener: listen tcp :8080: bind: address
+already in use`, and the supervisor's 180 s readiness gate restarted the container. The harness had
+hidden the collision because it shifted Crossplane's metrics to 18080, so the first function took
+:8080 locally without consequence. With Crossplane first, it owns 8080, every function's metrics
+bind fails silently, and the functions listen on their loopback gRPC port only; a dial Crossplane
+attempts before a function is up is an ordinary reconcile error it retries. `EXPOSE 8080` in the
+Dockerfile remains Crossplane's metrics. The harness no longer shifts `CP_CROSSPLANE_METRICS_PORT`
+(it stays 8080, so 8080 must be free on the host) and checks both halves: `crossplane core owns its
+metrics port 8080 (controller-runtime metrics served there)` and, per function, `<fn> listens on
+loopback only (its SDK metrics bind on :8080 lost to Crossplane core)`. Shutdown is reverse start
+order, so the functions stop before Crossplane, which costs Crossplane a few failed dials while it is
+itself stopping. With two functions the plane has seven components and the worst-case shutdown is
+7 x `CP_SHUTDOWN_TIMEOUT` = 70 s; the supervisor's Railway warning says `70 is recommended ...
+worst case 7 components x CP_SHUTDOWN_TIMEOUT 10 s`, and the live service's
+`RAILWAY_DEPLOYMENT_DRAINING_SECONDS` was raised from 60 to 70 on 2026-11-26
+([runbook](../getting-started/deploy-to-railway.md)).
+
+**Memory.** Each function gets a 3% `GOMEMLIMIT` share (`CP_GOMEMLIMIT_PCT_<NAME>` overrides it),
+which brings the total to 91% with the default two. Measured on the harness after one composition
+round trip, from `/proc` `VmRSS`: function-go-templating 30 MiB, function-auto-ready 31 MiB
+(crossplane 78 MiB, etcd 78 MiB, kube-apiserver 482 MiB, kube-controller-manager 76 MiB, the
+provider 57 MiB).
+
+**Compositions and the namespaced provider.** What a Composition composes in Crossplane 2.x is the
+namespaced managed resource (`railway.m.crossplane.io`; its `Project` is served at `v1alpha1`),
+whose `providerConfigRef` defaults to `kind: ClusterProviderConfig, name: default`. The supervisor
+therefore writes `ClusterProviderConfig/default` (`railway.m.crossplane.io/v1beta1`) beside the
+legacy `ProviderConfig/default`, from the same `railway-creds` Secret.
+
+**Adding a function.** Build its binary into the image under `CP_BIN_DIR` (the `functions-build`
+stage clones a tag and runs `go build`; pin the version in the Dockerfile `ARG`s and the Makefile,
+check that its `go.mod` does not require a newer Go than the image's pin, because
+`GOTOOLCHAIN=local` refuses to download one, and check that its SDK still treats a failed metrics
+bind on :8080 as a no-op, because an SDK that made it fatal would break the start order above), add
+the name to `CP_FUNCTIONS`, and refer to it from
+a Composition by that name. A listed name without an executable fails the boot with the two ways
+out named. Keep the count low: each function is a process with a port, a certificate, a GOMEMLIMIT
+share and 10 s of worst-case drain.
+
+The harness proves the whole path through the fixture under `hack/fixtures/functions-spike/` (a
+harness fixture, not a product API): an XRD, a two-step pipeline (`render` through
+function-go-templating, `ready` through function-auto-ready), the `CompositionRevision` reaching
+`ValidPipeline=True`, the XR rendered into a `Project` with the XR's name, the XR Ready, and the
+Project gone when the XR is deleted.
+
 ## Capacity: etcd quota, snapshots and memory
 
 **etcd quota.** `--quota-backend-bytes` is `CP_ETCD_QUOTA_BYTES`. The default, `auto`, is half the
@@ -286,8 +421,9 @@ path is not exercised end to end yet; `etcdutl snapshot status` on every harness
 **Memory.** Every component is a Go process, and a container at its memory limit gets an OOM kill
 of whichever process the kernel picks. Each component is started with `GOMEMLIMIT` set to a share of
 the container's limit: kube-apiserver 35%, etcd 15%, the provider 15%, kube-controller-manager 10%,
-Crossplane 10%, leaving 15% for bash and the page cache; `CP_GOMEMLIMIT_PCT_<NAME>` overrides one
-share, and the total must stay at or under 100. The limit comes from `CP_MEMORY_LIMIT_BYTES` or, when
+Crossplane 10%, that is 85 for the five core processes, plus 3% per composition function (91 with
+the default two), leaving the rest for bash, the page cache and the terraform processes;
+`CP_GOMEMLIMIT_PCT_<NAME>` overrides one share, and the total must stay at or under 100. The limit comes from `CP_MEMORY_LIMIT_BYTES` or, when
 that is unset, from the cgroup (`memory.max`, then the v1 file), which works where the container
 sees its own cgroup (Railway exposes it, cgroup v2, seen on the first deploy); where it does not, the boot warns and sets nothing, and `CP_MEMORY_LIMIT_BYTES`
 is the supported override. `CP_GOMEMLIMIT_ENABLED=false` turns it off. Three limits to be plain
