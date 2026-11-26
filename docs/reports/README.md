@@ -36,6 +36,7 @@ each phase review lists its reports.
 
 | Date | Phase | Summary |
 |------|-------|---------|
+| [2026-11-26](2026-11-26.md) | 3 | Planning: the Phase 3 workload layer becomes a `Workload` XRD with presets (Hermes first, custom chart and manifests with guardrails); Phase 3 rewritten as an ordered plan |
 | [2026-11-25](2026-11-25.md) | [2](phase-2-review.md) | First deploy to Railway: the Phase 1 project reused, two deploy-day fixes (Dockerfile validator, token character set), the control plane up and the `Project` smoke test passed over the internet; Phase 2 done |
 | [2026-11-24](2026-11-24.md) | [2](phase-2-review.md) | Preparing the first Railway deploy: the supervisor configures its public endpoint from Railway's own variables; the deploy and template runbook |
 | [2026-11-22](2026-11-22.md) | [2](phase-2-review.md) | Phase 2 B2: start as root to own the volume, then drop privileges via `su-exec`; session 2: B3, secrets at rest, audit, 90-day exported credentials; session 3: B4, the Railway token out of every component's environment; session 4: B5, etcd quota, snapshots on the volume, GOMEMLIMIT per process; session 5: etcd client authentication, the last Phase 1 finding; session 6: the Phase 2 review page |
