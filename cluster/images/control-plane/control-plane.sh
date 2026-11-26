@@ -10,12 +10,16 @@
 #   3. kube-controller-manager (optional; garbage collector + namespace only)
 #   4. CRDs                    (Crossplane core via `crossplane core init`,
 #                               plus this provider's package/crds)
-#   5. crossplane core start   (out-of-cluster, package manager set to External)
-#   6. provider-upjet-railway  (out-of-cluster, patched Terraform mirror)
+#   5. composition functions   (one process per CP_FUNCTIONS entry on loopback,
+#                               mTLS from Crossplane's root CA, then a paused
+#                               Function + FunctionRevision pointing at it)
+#   6. crossplane core start   (out-of-cluster, package manager set to External)
+#   7. provider-upjet-railway  (out-of-cluster, patched Terraform mirror)
 #
 # There is no kubelet and no scheduler: nothing in this control plane runs Pods.
-# Providers are supervised processes, not Crossplane Packages, precisely because
-# the package manager would create Deployments that could never be scheduled.
+# Providers and composition functions are supervised processes, not Crossplane
+# Packages, precisely because the package manager would create Deployments that
+# could never be scheduled.
 #
 # Secrets are never baked into the image: $RAILWAY_TOKEN arrives as an
 # environment variable, is read once and removed from the environment before
@@ -131,6 +135,30 @@ CP_CONTROLLERS="${CP_CONTROLLERS:-garbagecollector,namespace,serviceaccount,serv
 CP_PROVIDER_METRICS_PORT="${CP_PROVIDER_METRICS_PORT:-8090}"
 CP_PROVIDER_ARGS="${CP_PROVIDER_ARGS:-}"
 
+# Composition functions, space separated: each is a binary of that name under
+# CP_BIN_DIR, started as its own supervised process (step 5) and registered as
+# Function/<name> with FunctionRevision/<name>-local, so a Composition's
+# pipeline refers to it by this name (functionRef.name). The package manager
+# cannot run functions here (no Pods), hence processes, like the provider.
+# Set to the empty string to disable functions: nothing is started or
+# registered (hence "-" not ":-" below: unset means the default, empty means
+# none). A name is a DNS label: it becomes an object name and the certificate CN.
+CP_FUNCTIONS="${CP_FUNCTIONS-function-go-templating function-auto-ready}"
+# The first listed function listens on 127.0.0.1:CP_FUNCTION_PORT_BASE, the
+# next on the port after, in list order. Loopback only: the caller is
+# Crossplane core in this same container.
+CP_FUNCTION_PORT_BASE="${CP_FUNCTION_PORT_BASE:-9450}"
+read -ra FUNCTION_NAMES <<< "${CP_FUNCTIONS}"
+for _f in ${FUNCTION_NAMES[@]+"${FUNCTION_NAMES[@]}"}; do
+  [[ "${_f}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { printf '%s [control-plane] FATAL: CP_FUNCTIONS entry "%s" is not a DNS label (lower-case letters, digits and dashes)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${_f}" >&2; exit 1; }
+done
+unset _f
+[[ "${CP_FUNCTION_PORT_BASE}" =~ ^[1-9][0-9]*$ ]] && [ "${CP_FUNCTION_PORT_BASE}" -ge 1024 ] \
+  && [ $(( CP_FUNCTION_PORT_BASE + ${#FUNCTION_NAMES[@]} )) -le 65536 ] \
+  || { printf '%s [control-plane] FATAL: CP_FUNCTION_PORT_BASE must be a port from 1024 with room for %s function(s) below 65536 (got "%s")\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${#FUNCTION_NAMES[@]}" "${CP_FUNCTION_PORT_BASE}" >&2; exit 1; }
+# function_port INDEX -> the port of the INDEX-th (0-based) function in CP_FUNCTIONS.
+function_port() { printf '%s' $(( CP_FUNCTION_PORT_BASE + $1 )); }
+
 # CRD source directories, colon separated. The image ships both; the native
 # proof points these at a checkout.
 CP_CRD_DIRS="${CP_CRD_DIRS:-${CP_HOME}/crds/railway}"
@@ -229,11 +257,15 @@ start_bg() {
 # (so terraform grandchildren forked by the provider go too), give it
 # CP_SHUTDOWN_TIMEOUT seconds, then KILL. Observed without this: kube-apiserver
 # outlived the supervisor by a quarter of an hour after a failed boot.
-# The budget is per component, so the worst case is 5 x CP_SHUTDOWN_TIMEOUT;
-# keep the platform's drain window (Railway: RAILWAY_DEPLOYMENT_DRAINING_SECONDS)
-# above that. A clean stop of all five took 7 s in testing.
+# The budget is per component, so the worst case is COMPONENT_COUNT x
+# CP_SHUTDOWN_TIMEOUT: the five core processes plus one per composition
+# function in CP_FUNCTIONS (7 x 10 s = 70 s with the default two). Keep the
+# platform's drain window (Railway: RAILWAY_DEPLOYMENT_DRAINING_SECONDS) above
+# that; apply_railway_defaults warns when it is not. A clean stop of the five
+# core processes took 7 s in testing; a function stops at once.
 CP_SHUTDOWN_TIMEOUT="${CP_SHUTDOWN_TIMEOUT:-10}"
 [[ "${CP_SHUTDOWN_TIMEOUT}" =~ ^[0-9]+$ ]] || CP_SHUTDOWN_TIMEOUT=10
+COMPONENT_COUNT=$(( 5 + ${#FUNCTION_NAMES[@]} ))
 shutdown() {
   local rc=$?
   trap - EXIT TERM INT
@@ -395,10 +427,10 @@ apply_railway_defaults() {
       *) log "WARNING: the Railway volume is mounted at ${mp} but CP_STATE_DIR is ${CP_STATE_DIR}; mount the volume at ${CP_STATE_DIR} (or set CP_STATE_DIR=${mp}). The persistence check below will fail" ;;
     esac
   fi
-  local drain="${RAILWAY_DEPLOYMENT_DRAINING_SECONDS:-0}" need=$(( CP_SHUTDOWN_TIMEOUT * 5 ))
+  local drain="${RAILWAY_DEPLOYMENT_DRAINING_SECONDS:-0}" need=$(( CP_SHUTDOWN_TIMEOUT * COMPONENT_COUNT ))
   [[ "${drain}" =~ ^[0-9]+$ ]] || drain=0
   [ "${drain}" -ge "${need}" ] \
-    || log "WARNING: RAILWAY_DEPLOYMENT_DRAINING_SECONDS is ${drain} (Railway's default is 0); ${need} is recommended so a redeploy lets every component stop before SIGKILL (a clean stop takes about 10 s, the worst case 5 x CP_SHUTDOWN_TIMEOUT)"
+    || log "WARNING: RAILWAY_DEPLOYMENT_DRAINING_SECONDS is ${drain} (Railway's default is 0); ${need} is recommended so a redeploy lets every component stop before SIGKILL (a clean stop takes about 10 s, the worst case ${COMPONENT_COUNT} components x CP_SHUTDOWN_TIMEOUT ${CP_SHUTDOWN_TIMEOUT} s)"
 }
 
 # ------------------------------------------------------------------------------
@@ -703,10 +735,15 @@ keypair_ok() {
 }
 
 # sign_cert NAME CA SUBJ EKU SANS DAYS: a key and certificate at NAME.key/.crt
-# signed by CA (a prefix under the PKI dir). Written to temp names and moved
-# into place, so a crash leaves either the old pair or the new one.
+# signed by CA. Both are prefixes under the PKI dir, or absolute prefixes when
+# they start with "/" (the composition functions' serving certificates live
+# under the ephemeral run dir and are signed by Crossplane's root CA unpacked
+# there, not by anything in the PKI dir). Written to temp names and moved into
+# place, so a crash leaves either the old pair or the new one.
 sign_cert() {
-  local name="${CP_PKI_DIR}/$1" ca="${CP_PKI_DIR}/$2" subj="$3" eku="$4" sans="$5" days="$6"
+  local name="$1" ca="$2" subj="$3" eku="$4" sans="$5" days="$6"
+  [[ "${name}" = /* ]] || name="${CP_PKI_DIR}/${name}"
+  [[ "${ca}" = /* ]]   || ca="${CP_PKI_DIR}/${ca}"
   openssl genrsa -out "${name}.key.tmp" 2048 2>/dev/null
   chmod 600 "${name}.key.tmp"
   openssl req -new -key "${name}.key.tmp" -subj "${subj}" -out "${name}.csr" 2>/dev/null
@@ -840,11 +877,14 @@ check_capacity() {
 }
 
 # Share of the container memory limit each component gets as GOMEMLIMIT, in
-# percent: 85 in total, the rest for bash, the page cache and the terraform
-# processes (which inherit the provider's value). GOMEMLIMIT is a soft limit:
-# it makes a Go runtime collect harder as it approaches, not die. Prints the
-# variable name and returns 1 on a malformed CP_GOMEMLIMIT_PCT_<NAME> override.
-GOMEMLIMIT_COMPONENTS="kube-apiserver etcd provider-upjet-railway kube-controller-manager crossplane"
+# percent: 85 for the five core processes plus 3 per composition function (91
+# with the default two), the rest for bash, the page cache and the terraform
+# processes (which inherit the provider's value). A function renders templates
+# for one request at a time and idles at a few tens of MiB, hence the small
+# share. GOMEMLIMIT is a soft limit: it makes a Go runtime collect harder as it
+# approaches, not die. Prints the variable name and returns 1 on a malformed
+# CP_GOMEMLIMIT_PCT_<NAME> override.
+GOMEMLIMIT_COMPONENTS="kube-apiserver etcd provider-upjet-railway kube-controller-manager crossplane${FUNCTION_NAMES[*]+ ${FUNCTION_NAMES[*]}}"
 gomemlimit_share() {
   local pct var ov
   case "$1" in
@@ -853,6 +893,7 @@ gomemlimit_share() {
     provider-upjet-railway)  pct=15 ;;
     kube-controller-manager) pct=10 ;;
     crossplane)              pct=10 ;;
+    function-*)              pct=3 ;;
     *)                       pct=0 ;;
   esac
   var="CP_GOMEMLIMIT_PCT_$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"
@@ -1358,22 +1399,31 @@ apply_crds() {
     --dry-run=client -o yaml | kc apply -f - >/dev/null
 
   apply_crd_dir "${CP_CROSSPLANE_CRDS_DIR}"
+  # functions/functionrevisions: register_functions writes them before
+  # Crossplane starts, so they are gated here rather than assumed.
   wait_ready "crossplane core CRDs established" 120 \
     bash -c "$(declare -f kc crd_established); \
              CP_BIN_DIR='${CP_BIN_DIR}' KUBECONFIG_INTERNAL='${KUBECONFIG_INTERNAL}'; \
              crd_established locks.pkg.crossplane.io \
              && crd_established compositions.apiextensions.crossplane.io \
-             && crd_established deploymentruntimeconfigs.pkg.crossplane.io"
+             && crd_established deploymentruntimeconfigs.pkg.crossplane.io \
+             && crd_established functions.pkg.crossplane.io \
+             && crd_established functionrevisions.pkg.crossplane.io"
 
   local d dirs
   IFS=':' read -ra dirs <<< "${CP_CRD_DIRS}"
   for d in "${dirs[@]}"; do apply_crd_dir "$d"; done
 
+  # Both API groups: the legacy cluster-scoped railway.crossplane.io and the
+  # namespaced railway.m.crossplane.io, whose ClusterProviderConfig
+  # write_railway_credentials writes and whose Project the compositions compose.
   wait_ready "railway CRDs established" 120 \
     bash -c "$(declare -f kc crd_established); \
              CP_BIN_DIR='${CP_BIN_DIR}' KUBECONFIG_INTERNAL='${KUBECONFIG_INTERNAL}'; \
              crd_established projects.railway.crossplane.io \
-             && crd_established providerconfigs.railway.crossplane.io"
+             && crd_established providerconfigs.railway.crossplane.io \
+             && crd_established projects.railway.m.crossplane.io \
+             && crd_established clusterproviderconfigs.railway.m.crossplane.io"
 
   local init_args=(
     core init
@@ -1416,21 +1466,40 @@ apply_crds() {
 }
 
 # ------------------------------------------------------------------------------
-# Step 5: crossplane core
+# Step 5: composition functions
 #
-# `crossplane core start` unconditionally loads an mTLS client certificate --
-# it is the identity it presents to composition Functions over gRPC -- and
-# fails to start if the files are missing. `core init` puts them in a Secret;
-# out of cluster there is no projected volume, so unpack the Secret to disk.
+# Crossplane core dials each function with the mTLS client identity `core
+# init` wrote to Secret crossplane-tls-client, verifying the function's serving
+# certificate against the root CA in Secret crossplane-root-ca with ordinary
+# hostname verification. So each function gets, every boot, a serving
+# certificate signed by that root CA with an IP SAN for 127.0.0.1, plus a copy
+# of the root CA certificate as the ca.crt it verifies Crossplane's client
+# certificate against. All of it lives under the ephemeral run dir: the root CA
+# key is Crossplane's, and it is only borrowed for the length of a boot.
 #
-# --package-runtime=External stops the package manager from ever creating a
-# Deployment for a Provider or Function package: nothing could schedule it.
+# Which process answers for a function is decided by the FunctionRevision:
+# Crossplane's function runner lists FunctionRevisions labelled
+# pkg.crossplane.io/package=<name> with spec.desiredState Active and dials
+# status.endpoint, and a Composition pipeline is only valid when every such
+# revision reports the "composition" capability. Under the External package
+# runtime nothing sets either field (only the Deployment runtime does), so
+# register_functions writes them. Both objects carry crossplane.io/paused:
+# "true" so the package manager's reconcilers never try to pull the image
+# behind the placeholder spec.package/spec.image and never recompute the status
+# we set; paused, they only add a ReconcilePaused condition.
 # ------------------------------------------------------------------------------
+# unpack_tls_secret SECRET DIR [KEY...]: write the named keys of a TLS Secret
+# in the Crossplane namespace to DIR, mode 0600 (default keys: tls.crt tls.key
+# ca.crt; the root CA Secret has no ca.crt). Base64 is decoded straight into
+# the file, so no key material passes through a command line.
 unpack_tls_secret() {
-  local secret="$1" dir="$2"
+  local secret="$1" dir="$2"; shift 2
+  local -a keys=("$@")
+  [ "${#keys[@]}" -gt 0 ] || keys=(tls.crt tls.key ca.crt)
   mkdir -p "${dir}"
+  chmod 700 "${dir}"   # a default ACL can beat umask
   local k
-  for k in tls.crt tls.key ca.crt; do
+  for k in "${keys[@]}"; do
     # go-template rather than jsonpath: the keys contain dots, and quoting the
     # jsonpath escape through two layers of shell is a reliable way to get
     # silently-empty output.
@@ -1441,10 +1510,124 @@ unpack_tls_secret() {
   chmod 600 "${dir}"/*
 }
 
-start_crossplane() {
+# The client identity Crossplane presents to functions, unpacked to
+# CP_RUN_DIR/tls/client. Needed by the functions' readiness probe (step 5)
+# before `crossplane core start` loads it (step 6); idempotent.
+unpack_crossplane_client_tls() {
   wait_ready "crossplane TLS client secret" 60 \
     kc -n "${CP_CROSSPLANE_NAMESPACE}" get secret crossplane-tls-client
   unpack_tls_secret crossplane-tls-client "${CP_RUN_DIR}/tls/client"
+}
+
+# function_tls_ok PORT: the readiness predicate for one function, an mTLS
+# handshake made the way Crossplane makes it: its client certificate, the
+# root CA as trust anchor, ALPN h2 (the gRPC server refuses anything else).
+# "Verify return code: 0 (ok)" alone only proves the serving certificate, since
+# under TLS 1.3 a rejected client certificate arrives as an alert after the
+# handshake; so a negotiated h2 and the absence of any alert are required too.
+function_tls_ok() {
+  local out
+  out="$(openssl s_client -alpn h2 -connect "127.0.0.1:$1" \
+           -CAfile "${CP_RUN_DIR}/tls/root-ca/tls.crt" \
+           -cert "${CP_RUN_DIR}/tls/client/tls.crt" -key "${CP_RUN_DIR}/tls/client/tls.key" \
+           </dev/null 2>&1)" || true
+  printf '%s' "${out}" | grep -q 'Verify return code: 0 (ok)' \
+    && printf '%s' "${out}" | grep -q 'ALPN protocol: h2' \
+    && ! printf '%s' "${out}" | grep -q 'SSL alert number'
+}
+
+start_functions() {
+  [ "${#FUNCTION_NAMES[@]}" -gt 0 ] || { log "composition functions disabled (CP_FUNCTIONS empty)"; return 0; }
+  local i name port dir
+  for name in "${FUNCTION_NAMES[@]}"; do
+    [ -x "${CP_BIN_DIR}/${name}" ] || fail "CP_FUNCTIONS names ${name} but ${CP_BIN_DIR}/${name} is not an executable; build it into the image (Dockerfile, functions-build) or remove it from CP_FUNCTIONS"
+  done
+
+  wait_ready "crossplane root CA secret" 60 \
+    kc -n "${CP_CROSSPLANE_NAMESPACE}" get secret crossplane-root-ca
+  unpack_tls_secret crossplane-root-ca "${CP_RUN_DIR}/tls/root-ca" tls.crt tls.key
+  unpack_crossplane_client_tls
+
+  for i in "${!FUNCTION_NAMES[@]}"; do
+    name="${FUNCTION_NAMES[$i]}"; port="$(function_port "$i")"
+    dir="${CP_RUN_DIR}/tls/functions/${name}"
+    mkdir -p "${dir}"
+    chmod 700 "${dir}"
+    # CN and a DNS SAN of the function's own name, for anything that dials it
+    # by name; Crossplane dials 127.0.0.1, which is the SAN that matters.
+    log "issuing serving certificate for ${name} (${CP_INTERNAL_CERT_DAYS} days, Crossplane root CA)"
+    sign_cert "${dir}/tls" "${CP_RUN_DIR}/tls/root-ca/tls" "/CN=${name}" serverAuth \
+      "DNS:localhost,DNS:${name},IP:127.0.0.1,IP:::1" "${CP_INTERNAL_CERT_DAYS}"
+    cp -f "${CP_RUN_DIR}/tls/root-ca/tls.crt" "${dir}/ca.crt"
+    chmod 600 "${dir}"/*
+    # --tls-certs-dir is the flag's real name (kong derives it from the SDK's
+    # TLSCertsDir field; the help text's "--tls-server-certs-dir" is only the
+    # environment variable TLS_SERVER_CERTS_DIR). No kubeconfig: a function
+    # never talks to the API server, only answers Crossplane over gRPC.
+    start_bg "${name}" "${CP_BIN_DIR}/${name}" \
+      --address "127.0.0.1:${port}" \
+      --tls-certs-dir "${dir}"
+    wait_ready "${name} mTLS on 127.0.0.1:${port}" "${CP_READY_TIMEOUT}" function_tls_ok "${port}"
+  done
+}
+
+register_functions() {
+  [ "${#FUNCTION_NAMES[@]}" -gt 0 ] || return 0
+  local i name port
+  for i in "${!FUNCTION_NAMES[@]}"; do
+    name="${FUNCTION_NAMES[$i]}"; port="$(function_port "$i")"
+    # Server-side apply so a reboot re-asserts the same objects without a
+    # diff fight. spec.package and spec.image are required strings, and the
+    # Function CRD's CEL rule demands a registry/repository:tag shape, so the
+    # placeholder below looks like an image reference; nothing resolves it,
+    # which is fine because the paused reconcilers never fetch it (see the
+    # step comment). The same string goes in both objects.
+    kc apply --server-side --force-conflicts -f - >/dev/null <<EOF || fail "could not register Function/${name}"
+apiVersion: pkg.crossplane.io/v1
+kind: Function
+metadata:
+  name: ${name}
+  annotations:
+    crossplane.io/paused: "true"
+spec:
+  package: supervised.local/control-plane/${name}:process
+---
+apiVersion: pkg.crossplane.io/v1
+kind: FunctionRevision
+metadata:
+  name: ${name}-local
+  labels:
+    pkg.crossplane.io/package: ${name}
+  annotations:
+    crossplane.io/paused: "true"
+spec:
+  desiredState: Active
+  image: supervised.local/control-plane/${name}:process
+  revision: 1
+EOF
+    # The status subresource is what the function runner and the pipeline
+    # validator read: the endpoint to dial and the capability that makes a
+    # Composition pipeline referring to this function valid.
+    kc patch functionrevision "${name}-local" --subresource=status --type=merge \
+        -p "{\"status\":{\"endpoint\":\"127.0.0.1:${port}\",\"capabilities\":[\"composition\"]}}" >/dev/null \
+      || fail "could not set status.endpoint/status.capabilities on FunctionRevision/${name}-local; without them Crossplane cannot dial ${name} and every pipeline using it stays invalid"
+    log "function ${name} registered: port ${port}, FunctionRevision/${name}-local endpoint 127.0.0.1:${port}, capabilities [composition]"
+  done
+}
+
+# ------------------------------------------------------------------------------
+# Step 6: crossplane core
+#
+# `crossplane core start` unconditionally loads an mTLS client certificate --
+# it is the identity it presents to composition Functions over gRPC -- and
+# fails to start if the files are missing. `core init` puts them in a Secret;
+# out of cluster there is no projected volume, so unpack the Secret to disk.
+#
+# --package-runtime=External stops the package manager from ever creating a
+# Deployment for a Provider or Function package: nothing could schedule it.
+# ------------------------------------------------------------------------------
+start_crossplane() {
+  unpack_crossplane_client_tls
 
   local args=(
     core start
@@ -1478,7 +1661,7 @@ start_crossplane() {
 }
 
 # ------------------------------------------------------------------------------
-# Step 6: credentials + provider
+# Step 7: credentials + provider
 #
 # $RAILWAY_TOKEN must be a Railway *workspace or account* token. Project tokens
 # fail with "Not Authorized" because the Terraform provider only ever sends an
@@ -1524,7 +1707,7 @@ write_railway_credentials() {
     log "         by an earlier boot stays in place)."
     return 0
   fi
-  log "writing railway-creds Secret and ProviderConfig/default"
+  log "writing railway-creds Secret, ProviderConfig/default and ClusterProviderConfig/default"
   # printf is a builtin and kubectl reads the JSON from stdin, so the token is
   # on no command line and in no file. Server-side apply, because client-side
   # apply would store the data a second time in the last-applied-configuration
@@ -1547,6 +1730,24 @@ write_railway_credentials() {
   kc apply -f - >/dev/null <<EOF || fail "could not write ProviderConfig/default"
 apiVersion: railway.crossplane.io/v1beta1
 kind: ProviderConfig
+metadata:
+  name: default
+spec:
+  credentials:
+    source: Secret
+    secretRef:
+      namespace: ${CP_CROSSPLANE_NAMESPACE}
+      name: railway-creds
+      key: credentials
+EOF
+  # The namespaced managed resources (railway.m.crossplane.io, what a
+  # Composition composes) default their providerConfigRef to
+  # kind: ClusterProviderConfig, name: default, a different object from the
+  # legacy ProviderConfig above. Same credentials, both kept, so legacy
+  # cluster-scoped objects keep working.
+  kc apply -f - >/dev/null <<EOF || fail "could not write ClusterProviderConfig/default"
+apiVersion: railway.m.crossplane.io/v1beta1
+kind: ClusterProviderConfig
 metadata:
   name: default
 spec:
@@ -1646,6 +1847,10 @@ main() {
   start_apiserver
   start_controller_manager
   apply_crds
+  # Functions before Crossplane core, so the endpoints are up and registered
+  # before the function runner first dials them.
+  start_functions
+  register_functions
   start_crossplane
   write_railway_credentials "${railway_token}"
   start_provider
@@ -1660,6 +1865,13 @@ main() {
     log "  bearer token:          disabled (CP_ADMIN_TOKEN_ENABLED=false)"
   fi
   log "  client cert validity:  ${CP_CLIENT_CERT_DAYS} days (renewed on restart past the midpoint)"
+  if [ "${#FUNCTION_NAMES[@]}" -gt 0 ]; then
+    local fl="" fi_
+    for fi_ in "${!FUNCTION_NAMES[@]}"; do fl="${fl}${fl:+, }${FUNCTION_NAMES[$fi_]}@127.0.0.1:$(function_port "${fi_}")"; done
+    log "  functions:             ${fl}"
+  else
+    log "  functions:             none (CP_FUNCTIONS empty)"
+  fi
   # The token is a cluster-admin credential and this log stream is usually the
   # platform's deploy log, so print it only when explicitly asked. It is always
   # in the token kubeconfig above and in ${CP_PKI_DIR}/tokens.csv.
@@ -1710,6 +1922,11 @@ main() {
                etcd-server etcd-client-apiserver etcd-client-supervisor; do
         cert_fresh "${CP_PKI_DIR}/${c}.crt" $(( 7 * 86400 )) \
           || { log "certificate ${c} expires within 7 days -- restarting to reissue"; exit 1; }
+      done
+      # The functions' serving certificates are reissued at boot like the rest.
+      for c in ${FUNCTION_NAMES[@]+"${FUNCTION_NAMES[@]}"}; do
+        cert_fresh "${CP_RUN_DIR}/tls/functions/${c}/tls.crt" $(( 7 * 86400 )) \
+          || { log "serving certificate of ${c} expires within 7 days -- restarting to reissue"; exit 1; }
       done
     fi
     sleep 5
