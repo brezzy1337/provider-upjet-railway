@@ -1,6 +1,7 @@
 # The control-plane image on Railway's builder
 
-_Last updated 2026-11-25, from the first build of the image on Railway. The [Architecture](control-plane.md)
+_Last updated 2026-11-26 (the composition functions and the Go pin); the build observations are
+from the first build of the image on Railway, 2026-11-25. The [Architecture](control-plane.md)
 page says what runs inside the image; this page is about getting it built, and in particular about
 what Railway's builder accepts._
 
@@ -72,8 +73,20 @@ snapshot has to contain the Dockerfile the `RAILWAY_DOCKERFILE_PATH` variable na
 
 ## Keeping the Dockerfile portable
 
-- Pins (Go, Alpine, Kubernetes, etcd, Crossplane, Terraform, the Terraform provider) are `ARG`s at
-  the top of the file; keep them in step with `hack/native-cluster.sh` and the repository Makefile.
+- Pins (Go, Alpine, Kubernetes, etcd, Crossplane, Terraform, the Terraform provider, the two
+  composition functions) are `ARG`s at the top of the file; keep them in step with
+  `hack/native-cluster.sh` and the repository Makefile.
+- The composition functions (`function-go-templating`, `function-auto-ready`; see
+  [Composition functions](control-plane.md#composition-functions)) are built from their GitHub tags
+  in the `functions-build` stage, a plain `go build` at the root of each cloned module, and copied
+  beside the other binaries so the supervisor finds each `CP_FUNCTIONS` entry by name.
+- The Go pin follows the newest `go` directive among the modules the image builds: the stages set
+  `GOTOOLCHAIN=local`, which refuses to download a newer toolchain, and both functions' `go.mod`
+  require 1.26.11, which moved `GO_VERSION` from 1.26.7 to 1.26.11 on 2026-11-26. Check a function's
+  `go.mod` before bumping its version, and check that its function-sdk-go still ignores a failed
+  metrics bind on `:8080`: the functions start after Crossplane core so that Crossplane owns that
+  port (see [Composition functions](control-plane.md#composition-functions)). The functions add no
+  `EXPOSE`; they listen on loopback only, and `EXPOSE 8080` remains Crossplane's metrics.
 - Anything the image needs from the tree (`package/crds/`, `hack/upstream/*.patch`,
   `cluster/images/provider-upjet-railway/terraformrc.hcl`) is copied by path; moving those files
   breaks the build.
