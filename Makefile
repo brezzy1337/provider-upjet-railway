@@ -63,6 +63,18 @@ CROSSPLANE_VERSION = 2.2.1
 -include build/makelib/k8s_tools.mk
 
 # ====================================================================================
+# Composition functions built into the control-plane image (cluster/images/control-plane)
+#
+# Read by hack/native-cluster.sh; the Dockerfile ARGs duplicate them. A tag is
+# mutable, so the commit each tag resolved to is pinned beside it and the
+# harness refuses a clone whose HEAD differs.
+
+FUNCTION_GO_TEMPLATING_VERSION = 0.13.3
+FUNCTION_AUTO_READY_VERSION = 0.7.4
+FUNCTION_GO_TEMPLATING_COMMIT = 451e2a21fafc5ae7de2031bc3050cc11e1e51f31
+FUNCTION_AUTO_READY_COMMIT = 8dc4b24c1e8994560f89119bda550330ed1fb37a
+
+# ====================================================================================
 # Setup Images
 
 REGISTRY_ORGS ?= ghcr.io/crossplane-contrib

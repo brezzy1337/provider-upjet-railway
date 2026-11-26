@@ -1,0 +1,30 @@
+# Harness fixture for hack/native-cluster.sh verify (Phase 3, item 1). Not a
+# product API: a throwaway namespaced XRD whose only field is a name, which the
+# default Composition copies into a ConfigMap and the opt-in one into a Railway
+# Project. The control plane never depends on it.
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: xspikes.harness.railway.crossplane.io
+spec:
+  scope: Namespaced
+  group: harness.railway.crossplane.io
+  names:
+    kind: XSpike
+    plural: xspikes
+  versions:
+  - name: v1alpha1
+    served: true
+    referenceable: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              name:
+                type: string
+                description: Value the composition renders (ConfigMap data.name or Railway project name).
+            required:
+            - name

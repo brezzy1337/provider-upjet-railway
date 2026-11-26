@@ -1,6 +1,8 @@
 # Deploy the control plane to Railway
 
-_Last updated 2026-11-25, after the first deploy. The deploy and the `Project` smoke test over the
+_Last updated 2026-11-26 (the drain window is 70 s now that composition functions run in the
+container, and the two deploys of that day are noted under Later deploys); otherwise written after
+the first deploy, 2026-11-25. The deploy and the `Project` smoke test over the
 internet passed that day (the [2026-11-25 report](../reports/2026-11-25.md) has every number);
 what the page states about Railway's behaviour was observed on it, read from the service's own
 configuration, or carries the date it was checked in Railway's documentation, unless marked
@@ -19,7 +21,7 @@ only secrets a person supplies are two, plus three ordinary settings.
 | TCP proxy | application port `6443`, created **before the first deploy** | the API server serves its own TLS; Railway assigns the public `domain:port` |
 | `RAILWAY_TOKEN` | a Railway workspace (team) or account token, **sealed** | see [Authentication](authentication.md); project tokens are rejected |
 | `CP_ENCRYPTION_KEY` | `openssl rand -base64 32`, **sealed**, and backed up elsewhere | the image refuses to boot without it; a sealed variable cannot be read back, and losing the key makes every Secret in etcd unreadable |
-| `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` | `60` recommended | Railway's default SIGTERM-to-SIGKILL window is 0 s; a clean stop takes about 10 s, the worst case 50 s |
+| `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` | `70` recommended | Railway's default SIGTERM-to-SIGKILL window is 0 s; a clean stop takes about 10 s, the worst case 7 components x `CP_SHUTDOWN_TIMEOUT` 10 s = 70 s (five core processes plus one per composition function in `CP_FUNCTIONS`, two by default; see [Composition functions](../architecture/control-plane.md#composition-functions)). It was 60 before the functions; the live service was raised to 70 on 2026-11-26 with `--skip-deploys` |
 | `CP_MEMORY_LIMIT_BYTES` | not needed | Railway exposes the limit through cgroup v2 (`memory.max`); the boot line read `memory limit 22888 MiB (cgroup v2 memory.max)` on a Pro workspace |
 
 The supervisor reads `RAILWAY_TCP_PROXY_DOMAIN` and `RAILWAY_TCP_PROXY_PORT` and puts the proxy
@@ -34,7 +36,12 @@ service's manifest showed); the
 supervisor exits when a component dies and relies on being restarted. A boot that fails its
 configuration checks therefore restarts about every two seconds until the retry cap, and the
 deployment's status stays `SUCCESS` the whole time, because that status means the container
-started, not that the application is up: read the deploy log, not the status.
+started, not that the application is up: read the deploy log, not the status. A boot that fails in
+a component instead cycles more slowly: on 2026-11-26 the first deploy of the composition functions
+crash-looped because `crossplane core start` could not bind its metrics port 8080 (`listen tcp
+:8080: bind: address already in use`; the functions' SDK had taken it), and the supervisor's 180 s
+readiness gate restarted the container each time (the start order was then fixed; see
+[Composition functions](../architecture/control-plane.md#composition-functions)).
 
 ## The first deploy, with the CLI
 
@@ -55,7 +62,7 @@ and service that already existed, so `init` and `add` were not run; the volume w
 railway init --name crossplane-control-plane
 railway add --service control-plane \
   --variables RAILWAY_DOCKERFILE_PATH=cluster/images/control-plane/Dockerfile \
-  --variables RAILWAY_DEPLOYMENT_DRAINING_SECONDS=60
+  --variables RAILWAY_DEPLOYMENT_DRAINING_SECONDS=70
 railway volume add --service control-plane --mount-path /var/lib/control-plane/state
 railway tcp-proxy create --service control-plane --port 6443
 ```
@@ -129,6 +136,15 @@ after the shutdown began, with the same kubeconfig (same CA) and the state root 
 containers never shared the etcd directory. A failed replacement does not keep the old container
 either: when a build failed after a volume change, Railway removed the running deployment anyway,
 so a redeploy on a live plane is a short outage at best and a longer one if the build breaks.
+The two deploys of 2026-11-26 (the composition functions) give the timings for a later deploy: the
+first, deployment `f9cc19bd` at 19:26 UTC, built in 2 min 50 s cold with the new Go image and
+crash-looped on port 8080 (above); the second, deployment `1ff06fe8` of the start-order fix,
+`railway up` at 19:38:12 UTC, started its container at 19:39:31, 79 s from upload to container
+start with a warm layer cache, and logged `control plane UP` at 19:39:45, a 14 s boot, both
+functions READY on 127.0.0.1:9450 and 9451 and no drain warning with
+`RAILWAY_DEPLOYMENT_DRAINING_SECONDS` at 70. Those numbers were taken before the review fixes of
+the same PR (root CA key removal, the registration prune, the boot validation); the fixes have run
+on the harness only ([2026-11-26 report](../reports/2026-11-26.md)).
 Changing the volume's mount path also redeploys, from the service's stored code snapshot rather
 than a new upload. Secrets rotation and the encryption-key rotation are described in the
 [Architecture](../architecture/control-plane.md) page; an etcd snapshot is taken on the volume at

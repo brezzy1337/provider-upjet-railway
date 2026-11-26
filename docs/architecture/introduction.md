@@ -54,7 +54,7 @@ flowchart LR
    preset: `hermes` for an agent with its own tight schema, or `helm` and `manifests` for anything
    else. The preset's Composition uses provider-kubernetes or provider-helm with the connection
    Secret to apply the Deployment, PersistentVolumeClaim, Service and Ingress, or the chart or
-   manifests, inside the cluster. Nothing in this step goes through Railway. The [roadmap](../roadmap.md#phase-3-first-cloud-and-the-workload-catalogue-next)
+   manifests, inside the cluster. Nothing in this step goes through Railway. The [roadmap](../roadmap.md#phase-3-first-cloud-and-the-workload-catalogue-under-way)
    has the preset catalogue and the guardrails for the custom presets.
 4. **The agent answers on the cluster's ingress**, and the application calls it there.
 
@@ -65,11 +65,11 @@ Railway resource under the same declarative control as the clusters.
 
 ## What exists and what the flow still needs
 
-| Step | State on 2026-11-25 |
+| Step | State on 2026-11-26 |
 |------|---------------------|
 | Control plane on Railway, reachable from a Railway service | done ([2026-11-25 report](../reports/2026-11-25.md)) |
 | Manage Railway objects from `kubectl` | done; `Project` proven live, the other eight kinds generated the same way and unproven |
-| Composition function as a supervised process | the first spike of Phase 3; every Composition needs one |
+| Composition functions as supervised processes | done 2026-11-26 on the harness and on Railway: a Composition composed a `Project` on the live plane over the internet ([Composition functions](control-plane.md#composition-functions), [2026-11-26 report](../reports/2026-11-26.md)) |
 | DigitalOcean provider as a supervised process | Phase 3 |
 | `KubernetesCluster` XRD and a DOKS Composition | Phase 3 |
 | `Workload` XRD with presets (`hermes` first, `helm` and `manifests` as the custom escape hatch) over provider-kubernetes and provider-helm | Phase 3, after the cluster XRD |

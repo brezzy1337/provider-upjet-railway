@@ -1,0 +1,36 @@
+# Harness fixture for hack/native-cluster.sh verify (Phase 3, item 1). Not a
+# product API. The opt-in live round trip (VERIFY_LIVE_RAILWAY=1): one pipeline
+# step renders a namespaced Railway Project through function-go-templating;
+# function-auto-ready marks the XR Ready once the Project is. The Project relies
+# on the CRD default providerConfigRef (ClusterProviderConfig/default), which
+# the supervisor writes at boot. This path reaches the real Railway API.
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: xspike-railway-project
+spec:
+  compositeTypeRef:
+    apiVersion: harness.railway.crossplane.io/v1alpha1
+    kind: XSpike
+  mode: Pipeline
+  pipeline:
+  - step: render
+    functionRef:
+      name: function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      kind: GoTemplate
+      source: Inline
+      inline:
+        template: |
+          apiVersion: railway.m.crossplane.io/v1alpha1
+          kind: Project
+          metadata:
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: project
+          spec:
+            forProvider:
+              name: {{ .observed.composite.resource.spec.name | quote }}
+  - step: ready
+    functionRef:
+      name: function-auto-ready
